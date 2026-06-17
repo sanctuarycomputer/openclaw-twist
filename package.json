@@ -1,0 +1,53 @@
+{
+  "name": "openclaw-twist",
+  "version": "0.1.0",
+  "description": "OpenCLAW Twist (Doist) channel plugin — poll-based DM and @mention routing for a bot account.",
+  "license": "MIT",
+  "author": "Sanctuary Computer",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sanctuarycomputer/openclaw-twist"
+  },
+  "homepage": "https://github.com/sanctuarycomputer/openclaw-twist#readme",
+  "bugs": {
+    "url": "https://github.com/sanctuarycomputer/openclaw-twist/issues"
+  },
+  "keywords": ["openclaw", "openclaw-plugin", "openclaw-channel", "twist", "doist", "chatops"],
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "files": ["index.js", "setup-entry.js", "configured-state.js", "src", "openclaw.plugin.json", "README.md", "LICENSE"],
+  "openclaw": {
+    "extensions": ["./index.js"],
+    "setupEntry": "./setup-entry.js",
+    "install": {
+      "minHostVersion": ">=2026.6.6"
+    },
+    "compat": {
+      "pluginApi": ">=2026.6.6"
+    },
+    "channel": {
+      "id": "twist",
+      "label": "Twist",
+      "selectionLabel": "Twist (Workspace + Token)",
+      "detailLabel": "Twist",
+      "docsPath": "/channels/twist",
+      "docsLabel": "twist",
+      "blurb": "Twist threads/conversations with DM and @mention routing.",
+      "order": 90,
+      "quickstartAllowFrom": true,
+      "configuredState": {
+        "env": { "allOf": ["TWIST_TOKEN", "TWIST_WORKSPACE_ID"] },
+        "specifier": "./configured-state.js",
+        "exportName": "hasTwistConfiguredState"
+      }
+    }
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.6.6"
+  }
+}

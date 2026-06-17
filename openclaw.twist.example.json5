@@ -1,0 +1,51 @@
+// Example OpenCLAW config snippet for the Twist channel.
+// Merge these keys into your ~/.openclaw/openclaw.json.
+//
+// SECURITY: do NOT commit a real token. Prefer the TWIST_TOKEN env var (leave
+// `token` unset), or `${TWIST_TOKEN}` substitution, or `tokenFile`.
+{
+  channels: {
+    twist: {
+      enabled: true,
+      // token: "${TWIST_TOKEN}",        // or set TWIST_TOKEN in the gateway env, or use tokenFile
+      // tokenFile: "/run/secrets/twist_token",
+      workspaceId: 133876,               // or set TWIST_WORKSPACE_ID
+      botUserId: 634870,                 // the bot account's Twist user id (or TWIST_BOT_USER_ID)
+      pollIntervalMs: 15000,
+
+      // DM access. "open" lets any workspace member DM the bot (requires allowFrom ["*"]).
+      dmPolicy: "open",
+      allowFrom: ["*"],
+
+      // Group DMs and channel threads only respond when the bot is @mentioned.
+      groupPolicy: "open",
+      groups: {
+        "*": { requireMention: true },
+      },
+    },
+  },
+
+  // Register the plugin (local checkout). Prefer `openclaw plugins install --link .`
+  plugins: {
+    load: {
+      paths: ["/absolute/path/to/openclaw-twist"],
+    },
+    entries: {
+      twist: { enabled: true },
+    },
+  },
+
+  // OPTIONAL: give the agent richer Twist tools (search, inbox, react, links)
+  // via Doist's official MCP server. Run: openclaw mcp add twist-ai \
+  //   --command npx --arg -y --arg @doist/twist-ai --env TWIST_API_KEY=$TWIST_TOKEN
+  mcp: {
+    servers: {
+      "twist-ai": {
+        command: "npx",
+        args: ["-y", "@doist/twist-ai"],
+        env: { TWIST_API_KEY: "${TWIST_TOKEN}" },
+        supportsParallelToolCalls: true,
+      },
+    },
+  },
+}

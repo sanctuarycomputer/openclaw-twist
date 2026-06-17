@@ -1,0 +1,87 @@
+{
+  "id": "twist",
+  "kind": "channel",
+  "name": "Twist",
+  "description": "Twist (Doist) channel plugin for OpenCLAW — poll-based DM and @mention routing.",
+  "activation": {
+    "onStartup": false
+  },
+  "channels": ["twist"],
+  "channelEnvVars": {
+    "twist": ["TWIST_TOKEN", "TWIST_WORKSPACE_ID", "TWIST_BOT_USER_ID", "TWIST_POLL_INTERVAL_MS"]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  },
+  "channelConfigs": {
+    "twist": {
+      "label": "Twist",
+      "description": "Twist (Doist) channel for a bot account with DM/mention routing.",
+      "schema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "token": { "type": "string" },
+          "tokenFile": { "type": "string" },
+          "workspaceId": { "type": ["integer", "string"] },
+          "botUserId": { "type": ["integer", "string"] },
+          "pollIntervalMs": { "type": "integer", "minimum": 2000, "maximum": 600000 },
+          "dmPolicy": { "type": "string", "enum": ["pairing", "allowlist", "open", "disabled"] },
+          "groupPolicy": { "type": "string", "enum": ["open", "allowlist", "disabled"] },
+          "allowFrom": {
+            "type": "array",
+            "items": { "anyOf": [{ "type": "string" }, { "type": "number" }] }
+          },
+          "groupAllowFrom": {
+            "type": "array",
+            "items": { "anyOf": [{ "type": "string" }, { "type": "number" }] }
+          },
+          "mentionPatterns": { "type": "array", "items": { "type": "string" } },
+          "groups": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "requireMention": { "type": "boolean" },
+                "enabled": { "type": "boolean" },
+                "systemPrompt": { "type": "string" }
+              }
+            }
+          }
+        }
+      },
+      "uiHints": {
+        "": {
+          "label": "Twist",
+          "help": "Twist channel provider configuration. Prefer the TWIST_TOKEN env var over storing the token in config."
+        },
+        "token": {
+          "label": "Twist API token",
+          "help": "Twist OAuth token, including the 'oauth2:' prefix (sensitive). Prefer TWIST_TOKEN env var or tokenFile.",
+          "sensitive": true
+        },
+        "tokenFile": {
+          "label": "Twist token file",
+          "help": "Path to a file containing the Twist token (alternative to inlining it)."
+        },
+        "workspaceId": {
+          "label": "Workspace ID",
+          "help": "Numeric Twist workspace id the bot operates in."
+        },
+        "botUserId": {
+          "label": "Bot user ID",
+          "help": "The bot account's Twist user id, used for @mention detection and self-reply filtering."
+        },
+        "dmPolicy": {
+          "label": "DM policy",
+          "help": "Direct-message access control. \"open\" requires allowFrom to include \"*\"."
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,15 @@
+# dependencies (host provides openclaw/plugin-sdk at runtime; symlink is local-dev only)
+node_modules/
+
+# runtime state (poll cursors) — never commit
+.state/
+
+# secrets — never commit
+.env
+*.token
+*.secret
+
+# local OpenCLAW config / logs
+openclaw.json
+*.local.json5
+*.log
