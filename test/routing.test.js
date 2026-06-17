@@ -38,10 +38,17 @@ test("self-loop guard: Stacksbot's own posts are ignored", () => {
   assert.equal(isSelfAuthored(427360, BOT), false);
 });
 
-test("parseTarget parses thread/conv targets and rejects bad ones", () => {
+test("parseTarget parses thread/conv targets and aliases, rejects bad ones", () => {
   assert.deepEqual(parseTarget("thread:123"), { kind: "thread", id: "123" });
   assert.deepEqual(parseTarget("conv:456"), { kind: "conv", id: "456" });
   assert.deepEqual(parseTarget("twist:thread:789"), { kind: "thread", id: "789" });
+  // aliases for conversations
+  assert.deepEqual(parseTarget("conversation:1367817"), { kind: "conv", id: "1367817" });
+  assert.deepEqual(parseTarget("twist:conversation:1367817"), { kind: "conv", id: "1367817" });
+  assert.deepEqual(parseTarget("dm:42"), { kind: "conv", id: "42" });
+  // bare id defaults to conversation
+  assert.deepEqual(parseTarget("1367817"), { kind: "conv", id: "1367817" });
+  assert.deepEqual(parseTarget("twist:1367817"), { kind: "conv", id: "1367817" });
   assert.throws(() => parseTarget("user:1"));
   assert.throws(() => parseTarget("thread:"));
 });

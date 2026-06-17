@@ -8,14 +8,23 @@ export function mentionMarker(botUserId) {
 }
 
 /**
- * Parse an outbound target string into {kind,id}. Accepts "thread:<id>" or
- * "conv:<id>", optionally prefixed with "twist:".
+ * Parse an outbound target string into {kind,id}. Accepts (optionally prefixed
+ * with "twist:"):
+ *   - "thread:<id>"                          → a channel thread
+ *   - "conv:<id>" / "conversation:<id>" / "dm:<id>" → a conversation (DM/group DM)
+ *   - bare "<id>" (digits)                   → defaults to a conversation
  */
 export function parseTarget(to) {
-  const raw = String(to).replace(/^twist:/, "");
-  const [kind, id] = raw.split(":");
-  if ((kind === "thread" || kind === "conv") && id) return { kind, id };
-  throw new Error(`twist: invalid target "${to}" (expected thread:<id> or conv:<id>)`);
+  const raw = String(to).trim().replace(/^twist:/, "");
+  if (/^\d+$/.test(raw)) return { kind: "conv", id: raw }; // bare id → conversation
+  const sep = raw.indexOf(":");
+  const kindRaw = sep >= 0 ? raw.slice(0, sep) : "";
+  const id = sep >= 0 ? raw.slice(sep + 1) : "";
+  if (id) {
+    if (kindRaw === "thread") return { kind: "thread", id };
+    if (kindRaw === "conv" || kindRaw === "conversation" || kindRaw === "dm") return { kind: "conv", id };
+  }
+  throw new Error(`twist: invalid target "${to}" (expected thread:<id>, conv:<id>, conversation:<id>, dm:<id>, or a bare conversation id)`);
 }
 
 /** Rewrite Twist mention markup `[Name](twist-mention://id)` to readable `@Name`. */
