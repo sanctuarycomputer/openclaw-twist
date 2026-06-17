@@ -17,6 +17,7 @@ import {
   advanceCursor,
   contentMentionsBot,
   routingPeer,
+  buildTranscript,
 } from "./routing.js";
 import { handleTwistInbound } from "./inbound.js";
 import { getTwistRuntime } from "./runtime.js";
@@ -28,15 +29,6 @@ const REACTION_DONE = "✅"; // shown when the turn completes successfully
 const REACTION_ERROR = "❌"; // shown if the turn errors
 
 const toTimestamp = (item) => (item.posted_ts ? item.posted_ts * 1000 : Date.now());
-
-// Build a transcript of prior items (chronological, excluding the trigger) so
-// the agent gets the surrounding Twist discussion, not just the mention.
-function buildTranscript(items, triggerId, limit = 15) {
-  return items
-    .filter((it) => String(it.id) !== String(triggerId))
-    .slice(-limit)
-    .map((it) => ({ name: it.creator_name, content: it.content }));
-}
 
 function buildMessage({ kind, item, conversationId, threadId, groupId, directMention, context = {} }) {
   const peer = routingPeer({ kind, conversationId, threadId });
@@ -148,7 +140,12 @@ export function monitorTwistProvider({ accountId, config, runtime, abortSignal, 
     await cursors.setCursor("conversations", convId, advanceCursor(cursor, messages)); // at-most-once
     if (fresh.length && shouldRespondToConversation({ kind, directMention: c.direct_mention })) {
       const trigger = fresh[fresh.length - 1];
-      const context = kind === "groupdm" ? { transcript: buildTranscript(messages, trigger.id) } : {};
+      // Never drop the other new messages from this cycle: group DMs get the full
+      // recent transcript; 1:1 DMs get the OTHER fresh messages in this batch
+      // (so e.g. a link sent just before a question still reaches the agent).
+      const context = {
+        transcript: buildTranscript(kind === "groupdm" ? messages : fresh, trigger.id),
+      };
       fireDispatch(buildMessage({ kind, item: trigger, conversationId: convId, directMention: Boolean(c.direct_mention), context }));
     }
   }

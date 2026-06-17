@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   parseTarget,
   cleanTwistMarkup,
+  buildTranscript,
   classifyConversation,
   shouldRespondToConversation,
   shouldRespondToThread,
@@ -51,6 +52,21 @@ test("parseTarget parses thread/conv targets and aliases, rejects bad ones", () 
   assert.deepEqual(parseTarget("twist:1367817"), { kind: "conv", id: "1367817" });
   assert.throws(() => parseTarget("user:1"));
   assert.throws(() => parseTarget("thread:"));
+});
+
+test("buildTranscript excludes the trigger and keeps the other items in order", () => {
+  const items = [
+    { id: 1, creator_name: "Hugh", content: "https://github.com/org/repo" },
+    { id: 2, creator_name: "Hugh", content: "need creds, how?" },
+  ];
+  // trigger = the latest (id 2) → transcript carries the earlier link message
+  assert.deepEqual(buildTranscript(items, 2), [{ name: "Hugh", content: "https://github.com/org/repo" }]);
+  // single message (only the trigger) → empty transcript
+  assert.deepEqual(buildTranscript([{ id: 2, creator_name: "Hugh", content: "x" }], 2), []);
+  // respects the limit (last N excluding trigger)
+  const many = Array.from({ length: 20 }, (_, i) => ({ id: i, creator_name: "U", content: String(i) }));
+  assert.equal(buildTranscript(many, 19, 5).length, 5);
+  assert.deepEqual(buildTranscript(undefined, 1), []);
 });
 
 test("cleanTwistMarkup rewrites mention markup to @Name", () => {

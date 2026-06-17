@@ -73,6 +73,19 @@ export function shouldRespondToThread({ directMention }) {
   return Boolean(directMention);
 }
 
+/**
+ * Build a transcript (chronological, excluding the trigger item) of recent items
+ * so the agent gets surrounding context, not just the single trigger message.
+ * @param {Array<{id:any,creator_name?:string,content?:string}>} items
+ * @param {string|number} triggerId  id of the item being dispatched (excluded)
+ */
+export function buildTranscript(items, triggerId, limit = 15) {
+  return (items ?? [])
+    .filter((it) => String(it.id) !== String(triggerId))
+    .slice(-limit)
+    .map((it) => ({ name: it.creator_name, content: it.content }));
+}
+
 /** True when a message/comment was authored by Stacksbot itself (self-loop guard). */
 export function isSelfAuthored(creatorId, botUserId) {
   return String(creatorId) === String(botUserId);
