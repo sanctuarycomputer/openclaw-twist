@@ -4,8 +4,9 @@
 // Returns a { stop } handle for runStoppablePassiveMonitor.
 //
 // Two important properties:
-//  - Baseline-on-first-sight uses the ACTUAL latest obj_index (fetched), not
-//    get_unread's stale read-marker, so pre-existing backlog is never answered.
+//  - Baseline-on-first-sight uses posted_ts vs. the poller boot time (see
+//    firstSightCursor), so pre-existing backlog is never answered BUT the first
+//    @mention in a brand-new thread (posted after boot) still is.
 //  - Dispatch is NON-BLOCKING (fire-and-forget with a per-peer in-flight guard
 //    and timeout) so one slow agent turn never starves the rest of the poll.
 import { createTwistClient, conversationParticipantCount } from "./twist-client.js";
@@ -15,6 +16,7 @@ import {
   shouldRespondToConversation,
   newInboundItems,
   advanceCursor,
+  firstSightCursor,
   contentMentionsBot,
   routingPeer,
   buildTranscript,
@@ -27,6 +29,10 @@ const DISPATCH_TIMEOUT_MS = 180000;
 const REACTION_PROCESSING = "⏳"; // shown while a turn is in progress
 const REACTION_DONE = "✅"; // shown when the turn completes successfully
 const REACTION_ERROR = "❌"; // shown if the turn errors
+// On first sight of a thread/conv, items posted within this window before boot still
+// count as "fresh" (answerable) — covers an @mention sent during a deploy/restart.
+// Older items are backlog and stay baselined.
+const FIRST_SIGHT_GRACE_MS = 10 * 60 * 1000;
 
 const toTimestamp = (item) => (item.posted_ts ? item.posted_ts * 1000 : Date.now());
 
@@ -63,6 +69,8 @@ export function monitorTwistProvider({ accountId, config, runtime, abortSignal, 
   const client = createTwistClient({ token: account.token, workspaceId: account.workspaceId });
   const botUserId = account.botUserId;
   const log = (m) => runtime.log?.(`[twist] ${m}`);
+  // Anything posted at/after this (seconds) is "fresh" on first sight; older is backlog.
+  const freshSinceTs = Math.floor((Date.now() - FIRST_SIGHT_GRACE_MS) / 1000);
 
   let stopped = false;
   let timer = null;
@@ -129,12 +137,10 @@ export function monitorTwistProvider({ accountId, config, runtime, abortSignal, 
   async function processConversation(c, cache) {
     const convId = c.conversation_id;
     const messages = await client.getConversationMessages(convId, { limit: ITEM_FETCH_LIMIT, signal: abortSignal });
-    if (cursors.isFirstSight("conversations", convId)) {
-      await cursors.setCursor("conversations", convId, advanceCursor(c.obj_index ?? 0, messages)); // baseline to latest
-      return;
-    }
     const kind = await participantKind(convId, cache);
-    const cursor = cursors.getCursor("conversations", convId);
+    const cursor = cursors.isFirstSight("conversations", convId)
+      ? firstSightCursor(messages, c.obj_index ?? 0, freshSinceTs)
+      : cursors.getCursor("conversations", convId);
     let fresh = newInboundItems(messages, cursor, botUserId);
     if (kind === "groupdm") fresh = fresh.filter((m) => contentMentionsBot(m.content, botUserId));
     await cursors.setCursor("conversations", convId, advanceCursor(cursor, messages)); // at-most-once
@@ -170,11 +176,9 @@ export function monitorTwistProvider({ accountId, config, runtime, abortSignal, 
   async function processThread(t) {
     const threadId = t.thread_id;
     const comments = await client.getThreadComments(threadId, { limit: ITEM_FETCH_LIMIT, signal: abortSignal });
-    if (cursors.isFirstSight("threads", threadId)) {
-      await cursors.setCursor("threads", threadId, advanceCursor(t.obj_index ?? 0, comments)); // baseline to latest
-      return;
-    }
-    const cursor = cursors.getCursor("threads", threadId);
+    const cursor = cursors.isFirstSight("threads", threadId)
+      ? firstSightCursor(comments, t.obj_index ?? 0, freshSinceTs)
+      : cursors.getCursor("threads", threadId);
     const fresh = newInboundItems(comments, cursor, botUserId).filter((c) => contentMentionsBot(c.content, botUserId));
     await cursors.setCursor("threads", threadId, advanceCursor(cursor, comments)); // at-most-once
     if (fresh.length) {
