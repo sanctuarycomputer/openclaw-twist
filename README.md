@@ -12,6 +12,10 @@ Built and used in production at [Sanctuary Computer](https://sanctuary.computer)
 | **Group DM** (multi-person) | Replies **only** when the bot is `@mentioned` | Per-conversation |
 | **Channel thread** | Replies **only** when the bot is `@mentioned` | Separate per thread |
 
+### Outbound thread notifications
+
+When the bot posts a comment to a channel thread, it notifies the channel's **default participants** (the "Set default participants" setting in Twist's channel settings) instead of all thread subscribers. This is automatically read from the channel's `default_recipients` and `use_default_recipients` fields — no extra configuration required. If a channel has no default recipients configured, Twist's own default notification behavior applies. Direct messages and group DMs are unaffected.
+
 While a turn runs, the triggering message gets an **⏳** reaction, which becomes **✅** on success or **❌** on error — so you can see at a glance that the bot picked your message up and whether it's settled.
 
 The agent receives full Twist context, not just the bare mention: the **thread title**, **channel name**, and a **transcript** of the surrounding discussion (Twist `[Name](twist-mention://id)` markup is cleaned to readable `@Name`).

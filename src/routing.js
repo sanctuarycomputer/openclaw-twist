@@ -99,6 +99,14 @@ export function buildTranscript(items, triggerId, limit = 15) {
     .map((it) => ({ name: it.creator_name, content: it.content }));
 }
 
+/** Channel default recipients to notify, or null to use Twist's default. */
+export function channelDefaultRecipients(channel) {
+  if (channel && channel.use_default_recipients && Array.isArray(channel.default_recipients) && channel.default_recipients.length) {
+    return channel.default_recipients;
+  }
+  return null;
+}
+
 /** True when a message/comment was authored by Stacksbot itself (self-loop guard). */
 export function isSelfAuthored(creatorId, botUserId) {
   return String(creatorId) === String(botUserId);

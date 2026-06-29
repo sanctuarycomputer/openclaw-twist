@@ -13,6 +13,7 @@ import {
   newInboundItems,
   advanceCursor,
   routingPeer,
+  channelDefaultRecipients,
 } from "../src/routing.js";
 
 const BOT = 634870; // Stacksbot
@@ -112,6 +113,14 @@ test("resolveOutboundTarget: explicit target wins, else falls back to defaultTo,
   assert.deepEqual(resolveOutboundTarget(undefined, "conv:9"), { kind: "conv", id: "9" });
   assert.throws(() => resolveOutboundTarget("", ""));
   assert.throws(() => resolveOutboundTarget(undefined, undefined));
+});
+
+test("channelDefaultRecipients: honors use_default_recipients + non-empty list", () => {
+  assert.deepEqual(channelDefaultRecipients({ use_default_recipients: true, default_recipients: [427360] }), [427360]);
+  assert.equal(channelDefaultRecipients({ use_default_recipients: false, default_recipients: [427360] }), null);
+  assert.equal(channelDefaultRecipients({ use_default_recipients: true, default_recipients: [] }), null);
+  assert.equal(channelDefaultRecipients({}), null);
+  assert.equal(channelDefaultRecipients(null), null);
 });
 
 test("routingPeer produces the documented session-key peer shapes", () => {

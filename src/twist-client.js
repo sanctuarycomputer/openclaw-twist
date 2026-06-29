@@ -111,8 +111,16 @@ export function createTwistClient({ token, workspaceId, fetchImpl = fetch }) {
     // ---- mutating ----
 
     /** Post a reply comment to a thread. */
-    addThreadComment: (threadId, content, signal) =>
-      request("comments/add", { method: "POST", body: { thread_id: threadId, content }, signal }),
+    addThreadComment: (threadId, content, { recipients, signal } = {}) =>
+      request("comments/add", {
+        method: "POST",
+        body: {
+          thread_id: threadId,
+          content,
+          ...(Array.isArray(recipients) && recipients.length ? { recipients: JSON.stringify(recipients) } : {}),
+        },
+        signal,
+      }),
 
     /** Post a reply message to a conversation (DM / group DM). */
     addConversationMessage: (conversationId, content, signal) =>
