@@ -12,6 +12,7 @@ import {
   contentMentionsBot,
   newInboundItems,
   advanceCursor,
+  firstSightCursor,
   routingPeer,
   channelDefaultRecipients,
 } from "../src/routing.js";
@@ -105,6 +106,43 @@ test("advanceCursor takes the highest obj_index seen (including self posts)", ()
   assert.equal(advanceCursor(6, items), 8);
   assert.equal(advanceCursor(10, items), 10); // never goes backwards
   assert.equal(advanceCursor(-Infinity, []), -Infinity);
+});
+
+test("firstSightCursor: pre-boot backlog is baselined, post-boot mention stays fresh", () => {
+  const items = [
+    { obj_index: 5, creator: 427360, posted_ts: 900, content: "old chatter" },
+    { obj_index: 6, creator: 427360, posted_ts: 950, content: "more old chatter" },
+    { obj_index: 7, creator: 427360, posted_ts: 1100, content: "[Stacksbot](twist-mention://634870) u there?" },
+  ];
+  // boot/cutoff at 1000 → baseline to the last pre-boot item (6); the live mention (7) stays fresh
+  const cursor = firstSightCursor(items, 0, 1000);
+  assert.equal(cursor, 6);
+  assert.deepEqual(newInboundItems(items, cursor, BOT).map((i) => i.obj_index), [7]);
+});
+
+test("firstSightCursor: all items pre-boot → baseline to latest, nothing fresh (backlog never answered)", () => {
+  const items = [
+    { obj_index: 5, creator: 427360, posted_ts: 900 },
+    { obj_index: 6, creator: 427360, posted_ts: 950 },
+  ];
+  const cursor = firstSightCursor(items, 0, 1000);
+  assert.equal(cursor, 6);
+  assert.deepEqual(newInboundItems(items, cursor, BOT), []);
+});
+
+test("firstSightCursor: items with no usable posted_ts are treated as backlog", () => {
+  const items = [
+    { obj_index: 5, creator: 427360 }, // no timestamp → backlog (safe default)
+    { obj_index: 6, creator: 427360, posted_ts: 1100 }, // post-boot → fresh
+  ];
+  const cursor = firstSightCursor(items, 0, 1000);
+  assert.equal(cursor, 5);
+  assert.deepEqual(newInboundItems(items, cursor, BOT).map((i) => i.obj_index), [6]);
+});
+
+test("firstSightCursor: empty/undefined items fall back to the read-marker index", () => {
+  assert.equal(firstSightCursor([], 4, 1000), 4);
+  assert.equal(firstSightCursor(undefined, 4, 1000), 4);
 });
 
 test("resolveOutboundTarget: explicit target wins, else falls back to defaultTo, else throws", () => {

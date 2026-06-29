@@ -136,6 +136,23 @@ export function advanceCursor(prevCursor, items) {
 }
 
 /**
+ * Cursor to seed on the FIRST sight of a thread/conversation. A thread is only polled
+ * once it has a direct @mention, so naively baselining to the latest obj_index swallows
+ * that very first mention (it gets treated as backlog and is never answered). Instead,
+ * baseline only over items that predate the poller coming online — everything posted at
+ * or after `freshSinceTs` stays above the returned cursor and is processed normally, so
+ * the first mention in a brand-new thread IS answered. Older backlog (and items with no
+ * usable posted_ts, treated as backlog for safety) is still baselined away, so a fresh
+ * boot never replies to a pile of historical mentions.
+ */
+export function firstSightCursor(items, fallbackObjIndex, freshSinceTs) {
+  const backlog = (items || []).filter(
+    (it) => !(typeof it.posted_ts === "number" && it.posted_ts >= freshSinceTs),
+  );
+  return advanceCursor(fallbackObjIndex, backlog);
+}
+
+/**
  * Build the OpenCLAW routing peer for the envelope/session-key builder.
  * Session-key shapes (per channel-routing docs):
  *   dm       → direct  : agent:<id>:twist:dm:<convId>      (persistent, option A)
