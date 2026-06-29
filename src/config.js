@@ -6,7 +6,7 @@ export const SECTION_KEY = "twist";
 export const DEFAULT_ACCOUNT_ID = "default";
 export const DEFAULT_POLL_INTERVAL_MS = 15000;
 
-/** @typedef {{accountId:string, config:any, token?:string, workspaceId?:number|string, botUserId?:number|string, pollIntervalMs:number, configured:boolean}} TwistAccount */
+/** @typedef {{accountId:string, config:any, token?:string, workspaceId?:number|string, botUserId?:number|string, pollIntervalMs:number, configured:boolean, defaultTo?:string}} TwistAccount */
 
 const firstNonEmpty = (...vals) => {
   for (const v of vals) {
@@ -46,6 +46,7 @@ export function resolveTwistAccount(cfg) {
   const botUserId = firstNonEmpty(section.botUserId, process.env.TWIST_BOT_USER_ID);
   const pollIntervalMs =
     Number(section.pollIntervalMs ?? process.env.TWIST_POLL_INTERVAL_MS) || DEFAULT_POLL_INTERVAL_MS;
+  const defaultTo = firstNonEmpty(section.defaultTo, process.env.TWIST_DEFAULT_TO);
   return {
     accountId: DEFAULT_ACCOUNT_ID,
     config: section,
@@ -53,6 +54,7 @@ export function resolveTwistAccount(cfg) {
     workspaceId,
     botUserId,
     pollIntervalMs,
+    defaultTo,
     configured: Boolean(token && workspaceId && botUserId),
   };
 }
@@ -71,6 +73,7 @@ export const twistConfigAdapter = createTopLevelChannelConfigAdapter({
     "mentionPatterns",
     "dmPolicy",
     "groupPolicy",
+    "defaultTo",
   ],
   resolveAllowFrom: (account) => account.config.allowFrom,
   formatAllowFrom: (allowFrom) => (allowFrom ?? []).map((e) => String(e)),

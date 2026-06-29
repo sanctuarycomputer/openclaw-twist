@@ -3,7 +3,7 @@
 // "thread:<id>" or "conv:<id>" (optionally prefixed "twist:").
 import { createTwistClient } from "./twist-client.js";
 import { resolveTwistAccount } from "./config.js";
-import { parseTarget } from "./routing.js";
+import { parseTarget, resolveOutboundTarget } from "./routing.js";
 
 export { parseTarget };
 
@@ -34,8 +34,8 @@ export const twistOutbound = {
   attachedResults: {
     channel: "twist",
     sendText: async ({ cfg, to, text }) => {
-      const { client } = clientFromConfig(cfg);
-      const { kind, id } = parseTarget(to);
+      const { client, account } = clientFromConfig(cfg);
+      const { kind, id } = resolveOutboundTarget(to, account.defaultTo);
       return await postToTwist({ client, kind, id, text });
     },
   },

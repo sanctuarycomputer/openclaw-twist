@@ -8,7 +8,7 @@
   },
   "channels": ["twist"],
   "channelEnvVars": {
-    "twist": ["TWIST_TOKEN", "TWIST_WORKSPACE_ID", "TWIST_BOT_USER_ID", "TWIST_POLL_INTERVAL_MS"]
+    "twist": ["TWIST_TOKEN", "TWIST_WORKSPACE_ID", "TWIST_BOT_USER_ID", "TWIST_POLL_INTERVAL_MS", "TWIST_DEFAULT_TO"]
   },
   "configSchema": {
     "type": "object",
@@ -52,7 +52,8 @@
                 "systemPrompt": { "type": "string" }
               }
             }
-          }
+          },
+          "defaultTo": { "type": "string" }
         }
       },
       "uiHints": {
@@ -80,6 +81,10 @@
         "dmPolicy": {
           "label": "DM policy",
           "help": "Direct-message access control. \"open\" requires allowFrom to include \"*\"."
+        },
+        "defaultTo": {
+          "label": "Default delivery target",
+          "help": "Where cron/proactive messages go when no explicit target is given, e.g. \"thread:7882650\" or \"conv:123\"."
         }
       }
     }

@@ -93,6 +93,7 @@ See [`openclaw.twist.example.json5`](./openclaw.twist.example.json5) for a fully
 | `allowFrom` | string[] | — | DM allowlist (`["*"]` for open) |
 | `groupPolicy` | enum | `open` | `open` \| `allowlist` \| `disabled` |
 | `groups."*".requireMention` | boolean | `true` | Require `@mention` in groups/threads |
+| `defaultTo` | string | — | Default delivery target for cron/proactive messages (e.g. `"thread:7882650"` or `"conv:123"`). Falls back to `TWIST_DEFAULT_TO` env var. |
 
 ## Optional: richer Twist tools via MCP
 

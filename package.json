@@ -1,6 +1,6 @@
 {
   "name": "openclaw-twist",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "OpenCLAW Twist (Doist) channel plugin — poll-based DM and @mention routing for a bot account.",
   "license": "MIT",
   "author": "Sanctuary Computer",

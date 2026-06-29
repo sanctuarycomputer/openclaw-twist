@@ -27,6 +27,19 @@ export function parseTarget(to) {
   throw new Error(`twist: invalid target "${to}" (expected thread:<id>, conv:<id>, conversation:<id>, dm:<id>, or a bare conversation id)`);
 }
 
+/**
+ * Resolve the outbound target: an explicit `to` wins; otherwise fall back to the
+ * channel's configured `defaultTo`. Throws if neither is present.
+ * @returns {{kind:"thread"|"conv", id:string}}
+ */
+export function resolveOutboundTarget(to, defaultTo) {
+  const raw = to == null ? "" : String(to).trim();
+  if (raw) return parseTarget(raw);
+  const fallback = defaultTo == null ? "" : String(defaultTo).trim();
+  if (fallback) return parseTarget(fallback);
+  throw new Error("twist: no delivery target and no channels.twist.defaultTo configured");
+}
+
 /** Rewrite Twist mention markup `[Name](twist-mention://id)` to readable `@Name`. */
 export function cleanTwistMarkup(text) {
   if (!text) return "";

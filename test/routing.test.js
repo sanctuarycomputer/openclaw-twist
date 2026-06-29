@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   parseTarget,
+  resolveOutboundTarget,
   cleanTwistMarkup,
   buildTranscript,
   classifyConversation,
@@ -103,6 +104,14 @@ test("advanceCursor takes the highest obj_index seen (including self posts)", ()
   assert.equal(advanceCursor(6, items), 8);
   assert.equal(advanceCursor(10, items), 10); // never goes backwards
   assert.equal(advanceCursor(-Infinity, []), -Infinity);
+});
+
+test("resolveOutboundTarget: explicit target wins, else falls back to defaultTo, else throws", () => {
+  assert.deepEqual(resolveOutboundTarget("thread:5", "conv:9"), { kind: "thread", id: "5" });
+  assert.deepEqual(resolveOutboundTarget("", "thread:7882650"), { kind: "thread", id: "7882650" });
+  assert.deepEqual(resolveOutboundTarget(undefined, "conv:9"), { kind: "conv", id: "9" });
+  assert.throws(() => resolveOutboundTarget("", ""));
+  assert.throws(() => resolveOutboundTarget(undefined, undefined));
 });
 
 test("routingPeer produces the documented session-key peer shapes", () => {
