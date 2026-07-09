@@ -1,6 +1,9 @@
 // Cursor persistence for the Twist channel. The cursor (last processed
 // obj_index per thread / conversation) is the source of truth for dedup, so we
-// never re-reply across restarts and never mutate Twist's own read state.
+// never re-reply across restarts. For threads the monitor ALSO advances the bot's
+// own Twist read marker after processing (a scale bound so the unread-threads list
+// can't grow unbounded — see monitor.js processThread); this cursor store remains
+// the authoritative dedup even if that server-side read state is lost.
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 
