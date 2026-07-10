@@ -132,7 +132,7 @@ export function createTwistClient({ token, workspaceId, fetchImpl = fetch }) {
 
     /** Mark a thread read up to obj_index so we stop re-processing it. */
     markThreadRead: (threadId, objIndex, signal) =>
-      request("threads/mark_as_read", {
+      request("threads/mark_read", {
         method: "POST",
         body: { id: threadId, obj_index: objIndex },
         signal,
@@ -140,7 +140,7 @@ export function createTwistClient({ token, workspaceId, fetchImpl = fetch }) {
 
     /** Mark a conversation read up to obj_index. */
     markConversationRead: (conversationId, objIndex, signal) =>
-      request("conversations/mark_as_read", {
+      request("conversations/mark_read", {
         method: "POST",
         body: { id: conversationId, obj_index: objIndex },
         signal,
