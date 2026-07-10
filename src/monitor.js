@@ -9,6 +9,9 @@
 //    @mention in a brand-new thread (posted after boot) still is.
 //  - Dispatch is NON-BLOCKING (fire-and-forget with a per-peer in-flight guard
 //    and timeout) so one slow agent turn never starves the rest of the poll.
+//  - After processing a thread we advance the bot's own Twist read marker so the
+//    unread-threads list stays bounded (it would otherwise grow forever, since the
+//    bot is @mentioned in ever more threads and re-scans them all every poll).
 import { createTwistClient, conversationParticipantCount } from "./twist-client.js";
 import { resolveTwistAccount } from "./config.js";
 import {
@@ -30,9 +33,11 @@ const REACTION_PROCESSING = "⏳"; // shown while a turn is in progress
 const REACTION_DONE = "✅"; // shown when the turn completes successfully
 const REACTION_ERROR = "❌"; // shown if the turn errors
 // On first sight of a thread/conv, items posted within this window before boot still
-// count as "fresh" (answerable) — covers an @mention sent during a deploy/restart.
-// Older items are backlog and stay baselined.
-const FIRST_SIGHT_GRACE_MS = 10 * 60 * 1000;
+// count as "fresh" (answerable) — covers an @mention sent while the bot was down for a
+// deploy/restart/short outage. Older items are backlog and stay baselined. Sized to
+// span a realistic outage (not just a deploy): a 10-minute window silently swallowed
+// thread mentions that landed during longer downtime.
+const FIRST_SIGHT_GRACE_MS = 2 * 60 * 60 * 1000;
 
 const toTimestamp = (item) => (item.posted_ts ? item.posted_ts * 1000 : Date.now());
 
@@ -180,7 +185,22 @@ export function monitorTwistProvider({ accountId, config, runtime, abortSignal, 
       ? firstSightCursor(comments, t.obj_index ?? 0, freshSinceTs)
       : cursors.getCursor("threads", threadId);
     const fresh = newInboundItems(comments, cursor, botUserId).filter((c) => contentMentionsBot(c.content, botUserId));
-    await cursors.setCursor("threads", threadId, advanceCursor(cursor, comments)); // at-most-once
+    const nextCursor = advanceCursor(cursor, comments);
+    await cursors.setCursor("threads", threadId, nextCursor); // at-most-once
+    // Advance the BOT's own Twist read marker past everything we've now processed.
+    // This is the scale bound: getUnreadThreads only returns threads with genuinely
+    // new comments, instead of every thread the bot was ever mentioned in growing
+    // unbounded and getting re-fetched every poll. It's the bot's own per-user read
+    // state (invisible to humans) and survives /data volume resets, so it also acts as
+    // server-side dedup on top of the local cursor store. Best-effort: on failure the
+    // local cursor still prevents re-dispatch, so we just re-scan next poll.
+    if (Number.isFinite(nextCursor)) {
+      try {
+        await client.markThreadRead(threadId, nextCursor, abortSignal);
+      } catch (err) {
+        log(`markThreadRead ${threadId} failed: ${String(err)}`);
+      }
+    }
     if (fresh.length) {
       const trigger = fresh[fresh.length - 1];
       const context = await fetchThreadContext(threadId, t.channel_id, comments, trigger.id);
