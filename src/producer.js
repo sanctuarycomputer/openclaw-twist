@@ -55,6 +55,13 @@ export function createProducer({ client, queue, cursors, botUserId, freshSinceTs
         await cursors.setCursor(...label, next);
         cur = next;
       }
+      if (stalled && batch.length === ITEM_FETCH_LIMIT) {
+        // A FULL page carrying nothing above the cursor is the signature of the API having
+        // ignored order_by=asc (we asked to page forward and got the newest window back).
+        // Breaking here is the safe move — but it silently stops draining a real backlog,
+        // so it must never be quiet.
+        log(`sweep ${label.join(":")} pagination STALLED at cursor ${cur}: a full page of ${ITEM_FETCH_LIMIT} carried nothing above the cursor — ordering regression (order_by=asc ignored)?`);
+      }
       if (batch.length < ITEM_FETCH_LIMIT || stalled) break; // short page = caught up
       if (page === MAX_PAGES_PER_POLL - 1) {
         log(`sweep ${label.join(":")} hit the ${MAX_PAGES_PER_POLL}-page cap at cursor ${cur} — resuming next poll`);

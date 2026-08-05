@@ -7,6 +7,13 @@ export const MAX_ATTEMPTS = 6;
 export const MAX_GLOBAL_TURNS = 3;
 export const HIGH_WATER = 50;
 export const HUNG_TURN_ALERT_MS = 30 * 60_000;
+// Replay horizon: an item older than this WHEN IT IS CLAIMED is never answered, only
+// recorded as skipped:stale. Forward pagination means a lagging cursor (or a long outage)
+// now drains its entire gap instead of silently truncating it — correct for delivery, but
+// without a horizon it would also mean publicly answering day-old mentions after a deploy.
+// Distinct from firstSightBacklog (the 2h grace applied once, when a thread/conversation is
+// first seen): this guard applies at every encounter, however the item got queued.
+export const REPLAY_HORIZON_MS = 24 * 3600 * 1000;
 
 // Permanent = the message/target is gone; retrying can never help. Generic 400s (bad
 // request) are NOT included — they may be transient (rate-limit-shaped, malformed by a
@@ -54,6 +61,9 @@ export function createConsumer({ queue, botUserId, now, log, classifyPeer, admis
 
   async function policyVerdict(item) {
     if (item.firstSightBacklog) return { skip: "backlog" };
+    // Checked BEFORE the (network-hitting) peer classification and the mention test: a stale
+    // item costs nothing to drop. postedTs is in seconds.
+    if (now() - (item.postedTs ?? 0) * 1000 > REPLAY_HORIZON_MS) return { skip: "stale" };
     const kind = item.kind === "conv" ? await classifyPeer(item) : "thread";
     if (kind !== "dm" && !contentMentionsBot(item.content, botUserId)) return { skip: "no-mention" };
     const adm = await admission(item);

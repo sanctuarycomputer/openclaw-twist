@@ -6,6 +6,13 @@ import { dirname } from "node:path";
 
 const TERMINAL = new Set(["done", "skipped", "failed"]);
 const PRUNE_AFTER_MS = 30 * 24 * 3600 * 1000;
+// Every write gets its OWN tmp file. A shared `${filePath}.tmp` is a tearing hazard the
+// moment two stores write the same path (a second process, or two live stores during an
+// in-process restart): writer B truncates the tmp file that writer A is about to rename,
+// and the rename publishes a partial snapshot. Unique names make the rename the only
+// interleaving point, and rename is atomic.
+let tmpCounter = 0;
+const tmpName = (filePath) => `${filePath}.${process.pid}.${tmpCounter++}.tmp`;
 
 export function createQueueStore(filePath, { log } = {}) {
   let data = { items: {}, tombstones: [] };
@@ -59,7 +66,7 @@ export function createQueueStore(filePath, { log } = {}) {
     // rejects to its caller.
     const p = writeChain.catch(() => {}).then(async () => {
       await mkdir(dirname(filePath), { recursive: true });
-      const tmp = `${filePath}.tmp`;
+      const tmp = tmpName(filePath);
       const fh = await open(tmp, "w");
       try {
         await fh.writeFile(snapshot);

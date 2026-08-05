@@ -37,6 +37,7 @@ Skip reasons (all logged, none silent):
 | Reason | Meaning |
 |---|---|
 | `backlog` | Item was already older than the 2h first-sight grace window when its thread/conversation was first seen. The only sanctioned non-answer — in steady-state production it should never fire. |
+| `stale` | Item was already older than the 24h **replay horizon** when the consumer claimed it. Paging forward from the cursor drains an entire outage gap, so this is the guard that stops the bot publicly answering day-old mentions on its way back up. |
 | `no-mention` | Group DM / channel thread item without a bot `@mention` (1:1 DMs are open). |
 | `admission:<verdict>` | OpenCLAW's ingress gate returned a non-dispatch verdict. |
 | `gone` | The trigger no longer exists on Twist (deleted message, permanent 4xx). Non-retryable. |

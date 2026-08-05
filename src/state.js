@@ -7,6 +7,12 @@
 import { readFile, rename, mkdir, open } from "node:fs/promises";
 import { dirname } from "node:path";
 
+// Unique tmp file per write — see queue.js. The cursor store is NOT memoized per path, so
+// an in-process channel restart really can have two live stores over one file; a shared
+// `${filePath}.tmp` would let one truncate the other's staged snapshot mid-rename.
+let tmpCounter = 0;
+const tmpName = (filePath) => `${filePath}.${process.pid}.${tmpCounter++}.tmp`;
+
 export function createCursorStore(filePath, { log } = {}) {
   /** @type {{threads:Record<string,number>, conversations:Record<string,number>}} */
   let data = { threads: {}, conversations: {} };
@@ -58,7 +64,7 @@ export function createCursorStore(filePath, { log } = {}) {
     // persist by leaving writeChain permanently rejected.
     const p = writeChain.catch(() => {}).then(async () => {
       await mkdir(dirname(filePath), { recursive: true });
-      const tmp = `${filePath}.tmp`;
+      const tmp = tmpName(filePath);
       const fh = await open(tmp, "w");
       try {
         await fh.writeFile(snapshot);

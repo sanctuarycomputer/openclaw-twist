@@ -4,10 +4,11 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createQueueStore } from "../src/queue.js";
-import { createConsumer, BACKOFF_MS, MAX_ATTEMPTS, MAX_GLOBAL_TURNS, HIGH_WATER, HUNG_TURN_ALERT_MS, isPermanentError } from "../src/consumer.js";
+import { createConsumer, BACKOFF_MS, MAX_ATTEMPTS, MAX_GLOBAL_TURNS, HIGH_WATER, HUNG_TURN_ALERT_MS, REPLAY_HORIZON_MS, isPermanentError } from "../src/consumer.js";
 
 const BOT = 634870;
 const T0 = 1_785_900_000_000;
+const SEC = T0 / 1000; // "now" in Twist's seconds — items are dated relative to this
 const MENTION = `[Bot](twist-mention://${BOT}) hello`;
 
 function baseItem(id, over = {}) {
@@ -67,6 +68,24 @@ test("policy skips are terminal and reasoned: no-mention / backlog / admission",
   assert.equal(calls.turns.length, 0); // none of these should ever have reached runTurn
 });
 
+// Forward pagination drains a whole cursor gap, so a long outage can enqueue day-old
+// mentions. Answering those publicly on the way back up would be worse than not answering:
+// anything older than the replay horizon when it is CLAIMED is recorded skipped:stale.
+test("replay horizon: items older than 24h at claim time are skipped, fresher ones dispatch", async () => {
+  const { queue, consumer, calls } = await harness({
+    items: [
+      baseItem("conv-msg:old", { peerId: "conv:old", postedTs: SEC - 25 * 3600 }),
+      baseItem("conv-msg:recent", { peerId: "conv:recent", postedTs: SEC - 23 * 3600 }),
+    ],
+  });
+  await drain(consumer); await drain(consumer);
+  assert.equal(queue.get("conv-msg:old").state, "skipped");
+  assert.equal(queue.get("conv-msg:old").reason, "stale");
+  assert.deepEqual(calls.turns, ["conv-msg:recent"]); // the 25h item never reached runTurn
+  assert.equal(queue.get("conv-msg:recent").state, "done");
+  assert.equal(REPLAY_HORIZON_MS, 24 * 3600 * 1000);
+});
+
 test("dms bypass the mention requirement", async () => {
   const { queue, consumer, calls } = await harness({
     items: [baseItem("conv-msg:9", { content: "plain question" })],
@@ -115,7 +134,7 @@ test("per-peer serialization: second item in same peer waits, then runs", async 
   const gate = new Promise((r) => { release = r; });
   const { queue, consumer, calls } = await harness({
     runTurn: async (item) => { calls.turns.push(item.id); if (item.id === "conv-msg:1") await gate; },
-    items: [baseItem("conv-msg:1", { postedTs: 100 }), baseItem("conv-msg:2", { postedTs: 200 })],
+    items: [baseItem("conv-msg:1", { postedTs: SEC - 200 }), baseItem("conv-msg:2", { postedTs: SEC - 100 })],
   });
   await consumer.tick();
   await flushMicrotasks();
@@ -218,7 +237,7 @@ test("restart overlap: a second consumer sharing queue+inFlight respects per-pee
   // Instance A ("outgoing"): claims peer P's oldest item; its turn never settles.
   const a = await harness({
     inFlight, calls, runTurn,
-    items: [baseItem("conv-msg:1", { peerId: "conv:P", postedTs: 100 }), baseItem("conv-msg:2", { peerId: "conv:P", postedTs: 200 })],
+    items: [baseItem("conv-msg:1", { peerId: "conv:P", postedTs: SEC - 200 }), baseItem("conv-msg:2", { peerId: "conv:P", postedTs: SEC - 100 })],
   });
   await a.consumer.tick();
   await flushMicrotasks();
