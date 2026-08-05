@@ -47,7 +47,7 @@ Skip reasons (all logged, none silent):
 
 **Backpressure:** if the non-terminal queue depth exceeds 50, a one-shot alert fires to the ops thread — a wedged consumer must not be silent.
 
-**Corrupt store:** if the queue file is unreadable (half-written crash, hand-edited, wrong shape), it's quarantined to `queue.json.corrupt-<timestamp>` and the queue starts empty rather than boot-looping the account; cursors still bound what gets refetched, so this can't cause old messages to be re-answered.
+**Corrupt store:** if the queue file is unreadable (half-written crash, hand-edited, wrong shape), it's quarantined to `queue.json.corrupt-<timestamp>` and the queue starts empty rather than boot-looping the account; cursors still bound what gets refetched, so this can't cause old messages to be re-answered. The cursor file gets the same treatment (`cursors.json.corrupt-<timestamp>`), and both files are written tmp-file + fsync + atomic rename, so neither is ever partial at rest. Losing cursors is safe: every thread/conversation reads as first sight again, and the 2h grace window baselines the backlog away.
 
 ### State files
 
@@ -145,10 +145,10 @@ This channel does **not** require the MCP server — it handles inbound routing 
 ## Development
 
 ```bash
-npm test          # routing/parsing/markup unit tests (no network, no SDK needed)
+npm test          # routing + queue + producer + consumer + cursor-store suites (no network, no SDK needed)
 ```
 
-The pure logic (routing rules, mention/self-filtering, cursor advancement, target parsing, markup cleaning) lives in `src/routing.js` and is fully unit-tested. SDK-coupled code (`src/channel.js`, `src/inbound.js`, `src/monitor.js`) is validated by loading in a running gateway.
+`node --test` covers the whole ingestion pipeline without touching the network: routing rules and markup (`routing.test.js`), the durable store's persistence/dedup/pruning/quarantine (`queue.test.js`), forward pagination and first-sight baselining (`producer.test.js`), the delivery state machine — retries, dead-lettering, per-peer and global concurrency, crash recovery (`consumer.test.js`), and cursor durability (`state.test.js`). The pure logic (routing rules, mention/self-filtering, cursor advancement, target parsing, markup cleaning) lives in `src/routing.js`. SDK-coupled code (`src/channel.js`, `src/inbound.js`, `src/monitor.js`) is validated by loading in a running gateway.
 
 For local iteration against your own gateway, you can symlink the host SDK so standalone `node` imports resolve (gitignored):
 ```bash

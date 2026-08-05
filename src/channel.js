@@ -46,8 +46,8 @@ async function startTwistAccount(ctx) {
   const statusSink = ctx.setStatus
     ? createAccountStatusSink({ accountId: ctx.accountId, setStatus: ctx.setStatus })
     : undefined;
-  const cursors = createCursorStore(STATE_FILE);
-  await cursors.load();
+  const cursors = createCursorStore(STATE_FILE, { log: (m) => ctx.log?.info?.(`[${ctx.accountId}] twist: ${m}`) });
+  await cursors.load(Date.now());
   ctx.log?.info?.(`[${ctx.accountId}] starting Twist poller (workspace ${account.workspaceId})`);
   await runStoppablePassiveMonitor({
     abortSignal: ctx.abortSignal,
