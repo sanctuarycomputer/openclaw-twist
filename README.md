@@ -16,7 +16,7 @@ Built and used in production at [Sanctuary Computer](https://sanctuary.computer)
 
 When the bot posts a comment to a channel thread, it notifies the channel's **default participants** (the "Set default participants" setting in Twist's channel settings) instead of all thread subscribers. This is automatically read from the channel's `default_recipients` and `use_default_recipients` fields — no extra configuration required. If a channel has no default recipients configured, Twist's own default notification behavior applies. Direct messages and group DMs are unaffected.
 
-While a turn runs, the triggering message gets an **⏳** reaction, which becomes **✅** on success or **❌** on error — so you can see at a glance that the bot picked your message up and whether it's settled.
+While a turn runs, the triggering message gets an **⏳** reaction, which becomes **✅** on success, or **❌** only once the item has *finally* failed (retries exhausted) — a retryable error just clears the ⏳ and tries again later. This works for thread comments, DMs, and a thread's opening post alike. So you can see at a glance that the bot picked your message up and whether it's settled.
 
 The agent receives full Twist context, not just the bare mention: the **thread title**, **channel name**, and a **transcript** of the surrounding discussion (Twist `[Name](twist-mention://id)` markup is cleaned to readable `@Name`).
 
@@ -43,7 +43,7 @@ Skip reasons (all logged, none silent):
 
 **Retries:** a failed turn rides a backoff ladder — 30s, 2m, 10m, 1h, 1h — up to 6 attempts. Once retries are exhausted the item goes `failed` **loudly**: a ❌ reaction, an in-place reply telling the sender it hit an error, and an alert to the ops thread. Nobody is left wondering if they were ignored.
 
-**Crash recovery:** on boot only, any item still `processing` (the process died mid-turn) is an orphan. The consumer probes Twist: if the bot posted in that peer after the item's `claimedAt`, the reply already went out → `done`; otherwise the item goes back to `queued` (attempts preserved). A live turn is never re-probed or re-dispatched while the process is running — only at boot.
+**Crash recovery:** on boot only, any item still `processing` (the process died mid-turn) is an orphan. The consumer probes Twist: if the bot posted in that peer after the item's `claimedAt`, the reply already went out → `done`; otherwise the item goes back to `queued` (attempts preserved) — unless it has already burned all 6 attempts, in which case it's dead-lettered rather than re-claimed on every boot forever (a poison message must not become a crash loop). A live turn is never re-probed or re-dispatched while the process is running — only at boot.
 
 **Backpressure:** if the non-terminal queue depth exceeds 50, a one-shot alert fires to the ops thread — a wedged consumer must not be silent.
 

@@ -229,7 +229,7 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
   // Boot recovery: did the bot already answer this item before the crash? True when a
   // post of ours landed at/after the claim. Twist timestamps are seconds.
   const probe = async (item) => {
-    const since = (item.claimedAt ?? 0) / 1000;
+    const since = Math.floor((item.claimedAt ?? 0) / 1000);
     const posts =
       (item.kind === "conv"
         ? await client.getConversationMessages(item.conversationId, { limit: ITEM_FETCH_LIMIT, signal: abortSignal })
@@ -237,26 +237,17 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
     return posts.some((p) => String(p.creator) === String(botUserId) && (p.posted_ts ?? 0) >= since);
   };
 
-  // Twist's reactions API only addresses a thread COMMENT or a conversation MESSAGE
-  // (see twist-client.addReaction). A "thread-post" item is the thread's opening post,
-  // which is neither — reacting to it would mean sending the thread id as a comment id
-  // and hitting the wrong (or a nonexistent) object, so we no-op instead, once loudly.
-  let threadPostReactionLogged = false;
+  // Twist's reactions API addresses a conversation MESSAGE, a thread COMMENT, or a
+  // thread's OPENING POST (reactions/add|remove take thread_id as a first-class target),
+  // so every item kind we queue is reactable.
   function reactionTarget(item) {
     if (item.kind === "conv") return { messageId: Number(item.messageId) };
     if (item.kind === "thread") return { commentId: Number(item.messageId) };
-    return null;
+    return { threadId: Number(item.threadId) }; // "thread-post": the opening post
   }
   // Best-effort: a reaction is cosmetic and must never fail (and thus retry) a turn.
   async function react(item, verb, reaction) {
     const target = reactionTarget(item);
-    if (!target) {
-      if (!threadPostReactionLogged) {
-        threadPostReactionLogged = true;
-        log("thread-post items carry no reactable target (Twist reacts to comments/messages only) — skipping reactions for them");
-      }
-      return;
-    }
     try {
       if (verb === "add") await client.addReaction({ ...target, reaction });
       else await client.removeReaction({ ...target, reaction });

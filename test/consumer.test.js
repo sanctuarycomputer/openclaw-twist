@@ -141,6 +141,44 @@ test("boot recovery: orphan with reply-after-claim is done; silent orphan requeu
   assert.equal(queue.get("conv-msg:2").attempts, 2); // attempts preserved
 });
 
+// The reply is already on Twist by the time we mark the item done. If THAT write fails and
+// the generic failure path requeues the item, the turn re-runs and the human gets a second
+// answer. Recording success is therefore not retryable — the item is left "processing" for
+// boot recovery, which probes Twist, sees our reply, and settles it without re-dispatching.
+test("recorded-success failure does not re-dispatch the turn (no duplicate reply)", async () => {
+  const { queue, consumer, calls } = await harness({ items: [baseItem("conv-msg:500")] });
+  const realTransition = queue.transition.bind(queue);
+  let failed = false;
+  queue.transition = async (id, patch, now) => {
+    if (patch.state === "done" && !failed) { failed = true; throw new Error("ENOSPC recording done"); }
+    return realTransition(id, patch, now);
+  };
+  await drain(consumer);
+  assert.deepEqual(calls.turns, ["conv-msg:500"]);   // ran exactly once
+  assert.equal(queue.get("conv-msg:500").state, "processing"); // NOT requeued
+  assert.equal(calls.alerts.length, 1);
+  assert.match(calls.alerts[0], /could not be recorded done/);
+
+  await drain(consumer); // a later tick must not pick it up either
+  assert.deepEqual(calls.turns, ["conv-msg:500"]);
+});
+
+// An item whose turn kills the process is poison: recoverOrphans requeuing it
+// unconditionally means it re-claims (and re-crashes) on every single boot, forever.
+test("boot recovery dead-letters a poison orphan instead of requeueing it forever", async () => {
+  const { queue, consumer, calls } = await harness({
+    items: [baseItem("conv-msg:1", { attempts: MAX_ATTEMPTS })],
+    probe: async () => false,
+  });
+  await queue.transition("conv-msg:1", { state: "processing", claimedAt: T0, attempts: MAX_ATTEMPTS });
+  await consumer.recoverOrphans();
+  assert.equal(queue.get("conv-msg:1").state, "failed"); // not "queued"
+  assert.equal(calls.alerts.length, 1);
+  assert.match(calls.alerts[0], /failed after 6 attempts/);
+  assert.equal(calls.replies.length, 1);                 // in-place apology
+  assert.ok(calls.reacts.some((r) => r[2] === "❌"));
+});
+
 test("recoverOrphans: a rejecting probe requeues the item rather than throwing", async () => {
   const { queue, consumer } = await harness({
     items: [baseItem("conv-msg:1")],

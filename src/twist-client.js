@@ -167,24 +167,25 @@ export function createTwistClient({ token, workspaceId, fetchImpl = fetch }) {
       }),
 
     /**
-     * Add an emoji reaction. Target a thread comment with {commentId} or a
-     * conversation message with {messageId}.
+     * Add an emoji reaction. Targets are mutually exclusive: a thread comment
+     * ({commentId}), a conversation message ({messageId}), or a thread's OPENING POST
+     * ({threadId}) — reactions/add|remove accept `thread_id` as a first-class target, so
+     * an opening post is reactable just like a comment.
      */
-    addReaction: ({ commentId, messageId, reaction }, signal) =>
-      request("reactions/add", {
-        method: "POST",
-        body: commentId != null ? { comment_id: commentId, reaction } : { message_id: messageId, reaction },
-        signal,
-      }),
+    addReaction: (target, signal) =>
+      request("reactions/add", { method: "POST", body: reactionBody(target), signal }),
 
     /** Remove an emoji reaction (same targeting as addReaction). */
-    removeReaction: ({ commentId, messageId, reaction }, signal) =>
-      request("reactions/remove", {
-        method: "POST",
-        body: commentId != null ? { comment_id: commentId, reaction } : { message_id: messageId, reaction },
-        signal,
-      }),
+    removeReaction: (target, signal) =>
+      request("reactions/remove", { method: "POST", body: reactionBody(target), signal }),
   };
+}
+
+/** reactions/add|remove body for exactly one target: comment, message, or thread post. */
+function reactionBody({ commentId, messageId, threadId, reaction }) {
+  if (commentId != null) return { comment_id: commentId, reaction };
+  if (messageId != null) return { message_id: messageId, reaction };
+  return { thread_id: threadId, reaction };
 }
 
 /** Extract participant count from a conversation object (handles field variants). */
