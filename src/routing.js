@@ -144,12 +144,19 @@ export function advanceCursor(prevCursor, items) {
  * the first mention in a brand-new thread IS answered. Older backlog (and items with no
  * usable posted_ts, treated as backlog for safety) is still baselined away, so a fresh
  * boot never replies to a pile of historical mentions.
+ *
+ * `fallbackObjIndex` (the conversation's read-marker index) applies ONLY when no items
+ * were fetched: it points at the latest item, so folding it into the baseline when items
+ * ARE present swallows a fresh message that shares that index — a brand-new conversation's
+ * first message sits at obj_index 0 and must beat the cursor, so the baseline over fetched
+ * items starts below 0.
  */
 export function firstSightCursor(items, fallbackObjIndex, freshSinceTs) {
-  const backlog = (items || []).filter(
+  if (!items || items.length === 0) return fallbackObjIndex;
+  const backlog = items.filter(
     (it) => !(typeof it.posted_ts === "number" && it.posted_ts >= freshSinceTs),
   );
-  return advanceCursor(fallbackObjIndex, backlog);
+  return advanceCursor(-1, backlog);
 }
 
 /**
