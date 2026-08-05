@@ -22,9 +22,41 @@ The agent receives full Twist context, not just the bare mention: the **thread t
 
 ## How it works
 
-Twist's API can't deliver webhooks to a loopback-bound gateway, so this channel **polls** Twist's unread endpoints on an interval (default 15s) from **inside the gateway process** — there's no separate service to run or supervise. It registers via the channel `gateway.startAccount` lifecycle (`runStoppablePassiveMonitor`), filters channel threads to mention-only before fetching (so it ignores the noise of every unread thread), dedups via a per-thread/conversation cursor, and **baselines on first sight** so it never replies to pre-existing backlog. Dispatch is non-blocking, so one slow agent turn never stalls polling.
+Twist's API can't deliver webhooks to a loopback-bound gateway, so this channel **polls** Twist's unread endpoints on an interval (default 15s) from **inside the gateway process** — there's no separate service to run or supervise. It registers via the channel `gateway.startAccount` lifecycle (`runStoppablePassiveMonitor`), filters channel threads to mention-only before fetching (so it ignores the noise of every unread thread), and **baselines on first sight** so it never replies to pre-existing backlog. Fetching and dispatch are decoupled by a durable job queue, so every message reaches a terminal outcome — even across crashes — and one slow agent turn never stalls polling.
 
-Cursors persist to `./.state/cursors.json`; Twist's own read state is never mutated.
+### Ingestion queue
+
+A producer/queue/consumer pipeline replaces a single fetch-decide-dispatch pass:
+
+- **Producer** (transport only): every poll, enqueues every new message/comment by Twist's globally-unique id. Enqueue is idempotent — an id already in the queue, live or tombstoned, is a no-op — so a cursor bug now causes a harmless refetch, not lost messages. No policy at this layer, only self-post exclusion. A thread's opening post is enqueued too (id `thread-post:<threadId>`), so a thread created by @mentioning the bot gets answered.
+- **Queue**: a persistent state machine, one record per message. States: `queued → processing → done | skipped | failed`. Every transition is durably persisted (tmp-file + fsync + atomic rename) before its side effects proceed.
+- **Consumer**: claims `queued` items oldest-first, at most **one turn per peer** at a time (keeps a thread/DM's turns ordered and its session coherent — a busy peer's next mention waits instead of being dropped) and at most **3 turns globally** (box/spend protection). Policy — mention check, admission gate — is evaluated at claim time and recorded as a terminal `skipped` state, never silently dropped.
+
+Skip reasons (all logged, none silent):
+
+| Reason | Meaning |
+|---|---|
+| `backlog` | Item was already older than the 2h first-sight grace window when its thread/conversation was first seen. The only sanctioned non-answer — in steady-state production it should never fire. |
+| `no-mention` | Group DM / channel thread item without a bot `@mention` (1:1 DMs are open). |
+| `admission:<verdict>` | OpenCLAW's ingress gate returned a non-dispatch verdict. |
+| `gone` | The trigger no longer exists on Twist (deleted message, permanent 4xx). Non-retryable. |
+
+**Retries:** a failed turn rides a backoff ladder — 30s, 2m, 10m, 1h, 1h — up to 6 attempts. Once retries are exhausted the item goes `failed` **loudly**: a ❌ reaction, an in-place reply telling the sender it hit an error, and an alert to the ops thread. Nobody is left wondering if they were ignored.
+
+**Crash recovery:** on boot only, any item still `processing` (the process died mid-turn) is an orphan. The consumer probes Twist: if the bot posted in that peer after the item's `claimedAt`, the reply already went out → `done`; otherwise the item goes back to `queued` (attempts preserved). A live turn is never re-probed or re-dispatched while the process is running — only at boot.
+
+**Backpressure:** if the non-terminal queue depth exceeds 50, a one-shot alert fires to the ops thread — a wedged consumer must not be silent.
+
+**Corrupt store:** if the queue file is unreadable (half-written crash, hand-edited, wrong shape), it's quarantined to `queue.json.corrupt-<timestamp>` and the queue starts empty rather than boot-looping the account; cursors still bound what gets refetched, so this can't cause old messages to be re-answered.
+
+### State files
+
+- `.state/cursors.json` — per-thread/conversation fetch cursor. A refetch-bound optimization only, not a dedup source of truth. Twist's own read state is never mutated by it.
+- `.state/queue.json` — the durable queue. Source of truth for what's been seen and its outcome.
+
+### Migration
+
+On first boot with a version that has the queue, the existing `cursors.json` is imported unchanged as the fetch baseline (everything at-or-below a cursor is treated as already seen); the queue itself starts empty and fills from the next poll onward. Rollback = repin the previous plugin version — the queue file is additive and ignored by old code.
 
 ## Requirements
 
