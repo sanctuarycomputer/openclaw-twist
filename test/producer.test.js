@@ -76,3 +76,15 @@ test("second poll is a no-op (idempotent), cursor bounds refetch", async () => {
   await producer.pollOnce();
   assert.equal(queue.itemsInState("queued").length, 1);
 });
+
+test("first-sight thread with no comments does not mark as read", async () => {
+  const state = {
+    threads: [{ thread_id: 7, channel_id: 3, direct_mention: true }],
+    threadObjs: { 7: { id: 7, title: "Empty thread", content: "No comments yet", creator: 427360, posted_ts: FRESH_TS + 50 } },
+    threadComments: { 7: [] },
+  };
+  const { queue, producer } = await build(state);
+  await producer.pollOnce();
+  assert.equal(state.marked, undefined);
+  assert.equal(queue.has("thread-post:7"), true);
+});

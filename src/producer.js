@@ -53,7 +53,7 @@ export function createProducer({ client, queue, cursors, botUserId, freshSinceTs
     await queue.enqueueAll(items, now());
     const nextCursor = advanceCursor(cursor, comments);
     await cursors.setCursor("threads", threadId, nextCursor);
-    if (Number.isFinite(nextCursor)) {
+    if (Number.isFinite(nextCursor) && nextCursor >= 0) {
       try { await client.markThreadRead(threadId, nextCursor); } catch (err) { log(`markThreadRead ${threadId} failed: ${String(err)}`); }
     }
   }
