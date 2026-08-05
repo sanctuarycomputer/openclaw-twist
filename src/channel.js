@@ -15,7 +15,11 @@ import { monitorTwistProvider } from "./monitor.js";
 import { createCursorStore } from "./state.js";
 
 const PLUGIN_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-const STATE_FILE = join(PLUGIN_ROOT, ".state", "cursors.json");
+const STATE_DIR = join(PLUGIN_ROOT, ".state");
+const STATE_FILE = join(STATE_DIR, "cursors.json");
+// Durable ingestion queue — lives alongside the cursors file so both survive (or are
+// lost) together; the cursor is only a refetch bound, the queue is the delivery record.
+const QUEUE_FILE = join(STATE_DIR, "queue.json");
 
 export const meta = {
   id: "twist",
@@ -55,6 +59,7 @@ async function startTwistAccount(ctx) {
         abortSignal: ctx.abortSignal,
         statusSink,
         cursors,
+        queuePath: QUEUE_FILE,
       }),
   });
 }

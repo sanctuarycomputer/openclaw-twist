@@ -1,9 +1,9 @@
-// Cursor persistence for the Twist channel. The cursor (last processed
-// obj_index per thread / conversation) is the source of truth for dedup, so we
-// never re-reply across restarts. For threads the monitor ALSO advances the bot's
-// own Twist read marker after processing (a scale bound so the unread-threads list
-// can't grow unbounded — see monitor.js processThread); this cursor store remains
-// the authoritative dedup even if that server-side read state is lost.
+// Cursor persistence for the Twist channel. The cursor (highest obj_index swept per
+// thread / conversation) is a REFETCH BOUND only — dedup and the delivery guarantee
+// live in the queue store (queue.js), which records every item id ever enqueued. The
+// cursor advances only after a sweep's items are durably enqueued (see producer.js).
+// For threads the producer ALSO advances the bot's own Twist read marker after
+// sweeping (a scale bound so the unread-threads list can't grow unbounded).
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 
