@@ -4,7 +4,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createQueueStore } from "../src/queue.js";
-import { createConsumer, BACKOFF_MS, MAX_ATTEMPTS, isPermanentError } from "../src/consumer.js";
+import { createConsumer, BACKOFF_MS, MAX_ATTEMPTS, MAX_GLOBAL_TURNS, HIGH_WATER, HUNG_TURN_ALERT_MS, isPermanentError } from "../src/consumer.js";
 
 const BOT = 634870;
 const T0 = 1_785_900_000_000;
@@ -50,7 +50,7 @@ test("happy path: mention dispatched, reactions cycled, item done", async () => 
 });
 
 test("policy skips are terminal and reasoned: no-mention / backlog / admission", async () => {
-  const { queue, consumer } = await harness({
+  const { queue, consumer, calls } = await harness({
     items: [
       baseItem("conv-msg:1", { content: "no mention here" }),
       baseItem("conv-msg:2", { peerId: "conv:2", firstSightBacklog: true }),
@@ -63,6 +63,7 @@ test("policy skips are terminal and reasoned: no-mention / backlog / admission",
   assert.equal(queue.get("conv-msg:2").reason, "backlog");
   assert.equal(queue.get("conv-msg:3").reason, "admission:deny");
   for (const id of ["conv-msg:1", "conv-msg:2", "conv-msg:3"]) assert.equal(queue.get(id).state, "skipped");
+  assert.equal(calls.turns.length, 0); // none of these should ever have reached runTurn
 });
 
 test("dms bypass the mention requirement", async () => {
@@ -104,6 +105,8 @@ test("permanent errors classify to skipped:gone without retries", async () => {
   assert.equal(queue.get("conv-msg:500").state, "skipped");
   assert.equal(queue.get("conv-msg:500").reason, "gone");
   assert.equal(isPermanentError(err), true);
+  // Ruling: generic 400s are NOT permanent — they ride the retry ladder like anything else.
+  assert.equal(isPermanentError(Object.assign(new Error("bad request"), { status: 400 })), false);
 });
 
 test("per-peer serialization: second item in same peer waits, then runs", async () => {
@@ -135,4 +138,67 @@ test("boot recovery: orphan with reply-after-claim is done; silent orphan requeu
   assert.equal(queue.get("conv-msg:1").state, "done");
   assert.equal(queue.get("conv-msg:2").state, "queued");
   assert.equal(queue.get("conv-msg:2").attempts, 2); // attempts preserved
+});
+
+test("recoverOrphans: a rejecting probe requeues the item rather than throwing", async () => {
+  const { queue, consumer } = await harness({
+    items: [baseItem("conv-msg:1")],
+    probe: async () => { throw new Error("probe blew up"); },
+  });
+  await queue.transition("conv-msg:1", { state: "processing", claimedAt: T0, attempts: 1 });
+  await assert.doesNotReject(() => consumer.recoverOrphans());
+  assert.equal(queue.get("conv-msg:1").state, "queued");
+});
+
+test("MAX_GLOBAL_TURNS caps concurrent claims across distinct peers", async () => {
+  const gates = [];
+  const items = [1, 2, 3, 4].map((n) => baseItem(`g-${n}`, { peerId: `conv:g-${n}` }));
+  const { consumer, calls } = await harness({
+    items,
+    runTurn: async (item) => { calls.turns.push(item.id); await new Promise((resolve) => gates.push(resolve)); },
+  });
+  await consumer.tick();
+  await flushMicrotasks();
+  assert.equal(calls.turns.length, MAX_GLOBAL_TURNS); // only 3 of the 4 distinct-peer items started
+  assert.equal(consumer.inFlightCount(), MAX_GLOBAL_TURNS);
+  gates.forEach((g) => g());
+  await consumer.idle();
+});
+
+test("HIGH_WATER alert fires once when queue depth exceeds the threshold, not again next tick", async () => {
+  const gates = [];
+  const items = Array.from({ length: HIGH_WATER + 1 }, (_, i) => baseItem(`hw-${i}`, { peerId: `conv:hw-${i}` }));
+  const { consumer, calls } = await harness({
+    items,
+    runTurn: async () => new Promise((resolve) => gates.push(resolve)), // never settles: items stay non-terminal
+  });
+  await consumer.tick();
+  await flushMicrotasks();
+  assert.equal(calls.alerts.filter((a) => a.includes("high-water")).length, 1);
+  await consumer.tick();
+  await flushMicrotasks();
+  assert.equal(calls.alerts.filter((a) => a.includes("high-water")).length, 1); // no re-alert
+  gates.forEach((g) => g());
+  await consumer.idle();
+});
+
+test("hung-turn alert fires once after HUNG_TURN_ALERT_MS, not again next tick", async () => {
+  const clock = { t: T0 };
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const { consumer, calls } = await harness({
+    clock, items: [baseItem("conv-msg:1")],
+    runTurn: async () => { await gate; },
+  });
+  await consumer.tick();
+  await flushMicrotasks();
+  clock.t += HUNG_TURN_ALERT_MS + 1;
+  await consumer.tick();
+  await flushMicrotasks();
+  assert.equal(calls.alerts.filter((a) => a.includes("running >")).length, 1);
+  await consumer.tick();
+  await flushMicrotasks();
+  assert.equal(calls.alerts.filter((a) => a.includes("running >")).length, 1); // no re-alert
+  release();
+  await consumer.idle();
 });

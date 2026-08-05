@@ -28,7 +28,12 @@ export function createQueueStore(filePath) {
   }
   function persist() {
     const snapshot = JSON.stringify(data, null, 1);
-    writeChain = writeChain.then(async () => {
+    // A rejected write must not permanently poison writeChain — otherwise every later
+    // persist() chains off the same rejected promise and returns it rejected forever, even
+    // though the underlying condition (e.g. a transient ENOSPC) may have cleared. Swallow
+    // the previous failure for chaining purposes only; this call's own promise (`p`) still
+    // rejects to its caller.
+    const p = writeChain.catch(() => {}).then(async () => {
       await mkdir(dirname(filePath), { recursive: true });
       const tmp = `${filePath}.tmp`;
       const fh = await open(tmp, "w");
@@ -40,7 +45,8 @@ export function createQueueStore(filePath) {
       }
       await rename(tmp, filePath);
     });
-    return writeChain;
+    writeChain = p.catch(() => {});
+    return p;
   }
 
   return {
