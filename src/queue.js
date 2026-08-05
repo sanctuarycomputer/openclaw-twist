@@ -7,18 +7,42 @@ import { dirname } from "node:path";
 const TERMINAL = new Set(["done", "skipped", "failed"]);
 const PRUNE_AFTER_MS = 30 * 24 * 3600 * 1000;
 
-export function createQueueStore(filePath) {
+export function createQueueStore(filePath, { log } = {}) {
   let data = { items: {}, tombstones: [] };
   let tombstoneSet = new Set();
   let loaded = false;
   let writeChain = Promise.resolve();
 
-  async function load() {
+  /**
+   * @param {number} [now] epoch ms, used only to name a quarantined corrupt file.
+   *   Passed in (never read from the clock here) so this module stays deterministic.
+   */
+  async function load(now = 0) {
+    let raw;
     try {
-      const parsed = JSON.parse(await readFile(filePath, "utf8"));
-      data = { items: parsed.items ?? {}, tombstones: parsed.tombstones ?? [] };
+      raw = await readFile(filePath, "utf8");
     } catch (err) {
-      if (err.code !== "ENOENT") throw err;
+      if (err.code !== "ENOENT") throw err; // real IO fault: fail loudly, don't invent an empty queue
+    }
+    if (raw !== undefined) {
+      try {
+        const parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("queue file is not an object");
+        data = { items: parsed.items ?? {}, tombstones: parsed.tombstones ?? [] };
+      } catch (err) {
+        // The file exists but is unreadable — e.g. half-written before a hard crash, or
+        // hand-edited. Throwing here would boot-loop the account forever, so quarantine it
+        // and start empty. This cannot re-answer old messages: cursors still bound the
+        // refetch, so only genuinely-unread items get re-enqueued.
+        const quarantine = `${filePath}.corrupt-${now}`;
+        try {
+          await rename(filePath, quarantine);
+          log?.(`queue store at ${filePath} is corrupt (${String(err)}) — quarantined to ${quarantine}, starting empty`);
+        } catch (renameErr) {
+          log?.(`queue store at ${filePath} is corrupt (${String(err)}) and could not be quarantined (${String(renameErr)}) — starting empty; it will be overwritten on the next write`);
+        }
+        data = { items: {}, tombstones: [] };
+      }
     }
     tombstoneSet = new Set(data.tombstones);
     loaded = true;

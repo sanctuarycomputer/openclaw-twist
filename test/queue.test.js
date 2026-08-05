@@ -1,7 +1,7 @@
 // test/queue.test.js
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createQueueStore } from "../src/queue.js";
@@ -73,6 +73,33 @@ test("crash simulation: a reload at any point sees a consistent store", async ()
   assert.equal(q2.nonTerminalCount(), 2);
   // file is valid JSON at rest (atomic rename, never partial)
   JSON.parse(readFileSync(path, "utf8"));
+});
+
+test("corrupt queue file is quarantined, not fatal: store loads empty and stays usable", async () => {
+  const { path } = freshStore();
+  writeFileSync(path, '{"items": {"conv-msg:1": {"state": "que'); // half-written before a hard crash
+  const logs = [];
+  const q = createQueueStore(path, { log: (m) => logs.push(m) });
+  await q.load(T0); // must NOT throw — a throw here boot-loops the account forever
+  assert.equal(q.nonTerminalCount(), 0);
+  assert.equal(q.has("conv-msg:1"), false);
+  assert.equal(existsSync(`${path}.corrupt-${T0}`), true);
+  assert.equal(existsSync(path), false); // moved aside, not left to poison the next load
+  assert.match(logs.join("\n"), /corrupt/i);
+  // still writable afterwards
+  assert.equal(await q.enqueueAll([item("conv-msg:2")], T0), 1);
+  const reloaded = createQueueStore(path);
+  await reloaded.load(T0);
+  assert.equal(reloaded.get("conv-msg:2").state, "queued");
+});
+
+test("valid-JSON-but-wrong-shape queue file is also quarantined", async () => {
+  const { path } = freshStore();
+  writeFileSync(path, "[1,2,3]");
+  const q = createQueueStore(path);
+  await q.load(T0);
+  assert.equal(q.nonTerminalCount(), 0);
+  assert.equal(existsSync(`${path}.corrupt-${T0}`), true);
 });
 
 test("nonTerminalCount counts queued+processing only", async () => {

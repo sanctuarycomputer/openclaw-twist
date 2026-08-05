@@ -5,7 +5,7 @@ import { newInboundItems, advanceCursor } from "./routing.js";
 
 const ITEM_FETCH_LIMIT = 30;
 
-export function createProducer({ client, queue, cursors, botUserId, freshSinceTs, now, log }) {
+export function createProducer({ client, queue, cursors, botUserId, freshSinceTs, now, log, abortSignal }) {
   const isBacklog = (firstSight, postedTs) => firstSight && !(typeof postedTs === "number" && postedTs >= freshSinceTs);
 
   function toItem({ raw, kind, peerId, conversationId, threadId, channelId, firstSight }) {
@@ -24,7 +24,7 @@ export function createProducer({ client, queue, cursors, botUserId, freshSinceTs
     const convId = c.conversation_id;
     const firstSight = cursors.isFirstSight("conversations", convId);
     const cursor = firstSight ? -1 : cursors.getCursor("conversations", convId);
-    const messages = await client.getConversationMessages(convId, { limit: ITEM_FETCH_LIMIT });
+    const messages = await client.getConversationMessages(convId, { limit: ITEM_FETCH_LIMIT, signal: abortSignal });
     const fresh = newInboundItems(messages, cursor, botUserId)
       .filter((m) => !queue.has(`conv-msg:${m.id}`))
       .map((raw) => toItem({ raw, kind: "conv", peerId: `conv:${convId}`, conversationId: convId, firstSight }));
@@ -36,13 +36,13 @@ export function createProducer({ client, queue, cursors, botUserId, freshSinceTs
     const threadId = t.thread_id;
     const firstSight = cursors.isFirstSight("threads", threadId);
     const cursor = firstSight ? -1 : cursors.getCursor("threads", threadId);
-    const comments = await client.getThreadComments(threadId, { limit: ITEM_FETCH_LIMIT });
+    const comments = await client.getThreadComments(threadId, { limit: ITEM_FETCH_LIMIT, signal: abortSignal });
     const items = newInboundItems(comments, cursor, botUserId)
       .filter((cm) => !queue.has(`thread-comment:${cm.id}`))
       .map((raw) => toItem({ raw, kind: "thread", peerId: `thread:${threadId}`, threadId, channelId: t.channel_id, firstSight }));
     if (firstSight && !queue.has(`thread-post:${threadId}`)) {
       try {
-        const post = await client.getThread(threadId);
+        const post = await client.getThread(threadId, abortSignal);
         if (post && String(post.creator) !== String(botUserId)) {
           items.push(toItem({ raw: { ...post, id: post.id, obj_index: 0 }, kind: "thread-post", peerId: `thread:${threadId}`, threadId, channelId: t.channel_id, firstSight }));
         }
@@ -54,17 +54,17 @@ export function createProducer({ client, queue, cursors, botUserId, freshSinceTs
     const nextCursor = advanceCursor(cursor, comments);
     await cursors.setCursor("threads", threadId, nextCursor);
     if (Number.isFinite(nextCursor) && nextCursor >= 0) {
-      try { await client.markThreadRead(threadId, nextCursor); } catch (err) { log(`markThreadRead ${threadId} failed: ${String(err)}`); }
+      try { await client.markThreadRead(threadId, nextCursor, abortSignal); } catch (err) { log(`markThreadRead ${threadId} failed: ${String(err)}`); }
     }
   }
 
   return {
     async pollOnce() {
-      const convs = await client.getUnreadConversations();
+      const convs = await client.getUnreadConversations(abortSignal);
       for (const c of convs) {
         try { await sweepConversation(c); } catch (err) { log(`conv sweep ${c.conversation_id} failed: ${String(err)}`); }
       }
-      const threads = (await client.getUnreadThreads()).filter((t) => t.direct_mention);
+      const threads = (await client.getUnreadThreads(abortSignal)).filter((t) => t.direct_mention);
       for (const t of threads) {
         try { await sweepThread(t); } catch (err) { log(`thread sweep ${t.thread_id} failed: ${String(err)}`); }
       }

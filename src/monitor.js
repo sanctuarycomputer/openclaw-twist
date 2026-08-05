@@ -32,7 +32,58 @@ const ITEM_FETCH_LIMIT = 30;
 // skipped by the consumer. Sized to span a realistic outage (not just a deploy): a
 // 10-minute window silently swallowed thread mentions that landed during longer downtime.
 const FIRST_SIGHT_GRACE_MS = 2 * 60 * 60 * 1000;
-const TERMINAL_STATES = new Set(["done", "skipped", "failed"]);
+
+/**
+ * One queue store per queue file per PROCESS, and one boot recovery per store.
+ *
+ * OpenCLAW hot-reload (`channels.twist` → restart-channel:twist) calls stopChannel()
+ * then startChannel() in the same process, and stop() does not drain in-flight settle()
+ * work. Without this memo the restarted account would build a SECOND store over the same
+ * file — two independent in-memory snapshots clobbering each other's writes — and re-run
+ * recoverOrphans over an item a still-live turn is mid-way through, requeueing it for a
+ * duplicate agent turn and a double reply.
+ *
+ * Sharing the store makes the restart safe. Producer and consumer ARE rebuilt per start
+ * (they hold no durable state), which gives the new consumer an empty `inFlight` map while
+ * the old consumer's settle() calls are still running — safe, because:
+ *   - the old turn's item sits in state "processing" in the SHARED store, and
+ *     selectClaimable only ever returns state === "queued", so the new consumer cannot
+ *     claim it (per-peer inFlight tracking is not what protects it — the state does);
+ *   - the old settle() finishes by transitioning that same shared store, so its verdict
+ *     (done / retry / failed) is not lost;
+ *   - recovery is skipped on restart, so the mid-flight item is never requeued while the
+ *     process lives. Genuine orphans can only come from a process crash, which by
+ *     definition drops this Map, so the next process does recover them.
+ * The single-writer property still holds: `writeChain` inside the one shared store
+ * serializes every persist.
+ *
+ * One hole that argument does NOT close: stop() can land while the OLD monitor is inside
+ * consumer.tick(). Claim reservation is per-consumer and in-memory (inFlight), and the
+ * "processing" state only lands after an awaited persist — so two consumers running claim
+ * passes concurrently could both select the same still-"queued" item. `tickChain` closes
+ * it by serializing claim passes across every monitor instance sharing this store, the
+ * cross-instance twin of the consumer's own `ticking` guard. It chains tick() only — not
+ * settle() — so turns still run concurrently up to MAX_GLOBAL_TURNS.
+ */
+const QUEUE_STORES = new Map(); // queuePath -> { store, ready, recovery, tickChain, log }
+
+function acquireQueueStore(queuePath, log) {
+  let entry = QUEUE_STORES.get(queuePath);
+  if (entry) {
+    entry.log = log; // a restart brings a fresh logger; the store keeps writing to the live one
+    return entry;
+  }
+  entry = { log, store: null, ready: null, recovery: null, tickChain: Promise.resolve() };
+  entry.store = createQueueStore(queuePath, { log: (m) => entry.log?.(m) });
+  // Cache the load PROMISE (not its result) so two concurrent starts share one load; evict
+  // on failure so a transient IO fault doesn't wedge the account until process restart.
+  entry.ready = entry.store.load(Date.now()).catch((err) => {
+    QUEUE_STORES.delete(queuePath);
+    throw err;
+  });
+  QUEUE_STORES.set(queuePath, entry);
+  return entry;
+}
 
 /**
  * @param {object} p
@@ -58,10 +109,11 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
   let timer = null;
   let cycle = 0;
 
-  const queue = createQueueStore(queuePath);
-  await queue.load();
+  const queueEntry = acquireQueueStore(queuePath, log);
+  await queueEntry.ready;
+  const queue = queueEntry.store;
 
-  const producer = createProducer({ client, queue, cursors, botUserId, freshSinceTs, now: Date.now, log });
+  const producer = createProducer({ client, queue, cursors, botUserId, freshSinceTs, now: Date.now, log, abortSignal });
 
   // ---------------------------------------------------------------- helpers
 
@@ -105,24 +157,22 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
     return { threadTitle, channelName, transcript: buildTranscript(comments, triggerId) };
   }
 
-  // A queued sibling still awaiting (or mid-) delivery. Used to reproduce the old DM
-  // behaviour: a 1:1 DM's transcript carries the OTHER messages from this batch (so a
-  // link sent just before a question still reaches the agent) but NOT messages the
-  // session already saw — those are terminal in the queue.
-  const isPendingSibling = (id) => {
-    const q = queue.get(id);
-    return Boolean(q) && !TERMINAL_STATES.has(q.state);
-  };
+  // "Conversation so far" must be STRICTLY PRIOR to the trigger. selectClaimable claims the
+  // OLDEST queued item, so same-peer siblings still in the queue are FUTURE messages — each
+  // gets its own turn, in order, with its own prior context. Already-answered earlier items
+  // are fine to include (they come from the same fresh fetch and are what the human sees);
+  // the trigger itself is dropped by buildTranscript.
+  const strictlyPrior = (items, item) => items.filter((it) => (it.obj_index ?? 0) < item.objIndex);
 
-  async function buildContext(item, kind) {
+  async function buildContext(item) {
     if (item.kind === "conv") {
       const messages = (await client.getConversationMessages(item.conversationId, { limit: ITEM_FETCH_LIMIT, signal: abortSignal })) ?? [];
-      // Group DMs are not per-peer sessions, so they get the full recent transcript.
-      const source = kind === "groupdm" ? messages : messages.filter((m) => isPendingSibling(`conv-msg:${m.id}`));
-      return { transcript: buildTranscript(source, item.messageId) };
+      return { transcript: buildTranscript(strictlyPrior(messages, item), item.messageId) };
     }
+    // A thread-post item has objIndex 0 (it IS the opening post), so it correctly gets no
+    // prior comments.
     const comments = (await client.getThreadComments(item.threadId, { limit: ITEM_FETCH_LIMIT, signal: abortSignal })) ?? [];
-    return await fetchThreadContext(item.threadId, item.channelId, comments, item.messageId);
+    return await fetchThreadContext(item.threadId, item.channelId, strictlyPrior(comments, item), item.messageId);
   }
 
   /**
@@ -135,7 +185,7 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
   async function toNormalizedMessage(item, { withContext = false } = {}) {
     const kind = item.kind === "conv" ? await participantKind(item.conversationId) : "thread";
     const peer = routingPeer({ kind, conversationId: item.conversationId, threadId: item.threadId });
-    const context = withContext ? await buildContext(item, kind) : {};
+    const context = withContext ? await buildContext(item) : {};
     return {
       messageId: String(item.messageId),
       kind,
@@ -161,12 +211,18 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
 
   const classifyPeer = (item) => participantKind(item.conversationId);
 
-  const admission = async (item) =>
-    await admissionVerdict({
+  // Denials used to be logged by handleTwistInbound's drop path; now they short-circuit
+  // before dispatch, so log them here — a silently skipped message is exactly the failure
+  // mode this pipeline exists to make visible.
+  const admission = async (item) => {
+    const verdict = await admissionVerdict({
       message: await toNormalizedMessage(item),
       account,
       cfg: core.config.current() ?? cfg,
     });
+    if (!verdict.admit) log(`skip ${item.id} (${item.peerId}): admission=${verdict.admission}`);
+    return verdict;
+  };
 
   const runTurn = async (item, { commandAuthorized }) => {
     const message = await toNormalizedMessage(item, { withContext: true });
@@ -245,11 +301,20 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
 
   // ------------------------------------------------------------------ poll loop
 
+  // Claim passes are serialized across every monitor instance sharing this queue store
+  // (see QUEUE_STORES): during an in-process restart the outgoing monitor can still be
+  // inside a tick(), and two independent claim passes could double-claim one item.
+  function tick() {
+    const next = queueEntry.tickChain.then(() => consumer.tick());
+    queueEntry.tickChain = next.catch(() => {}); // a failed tick must not poison the chain
+    return next;
+  }
+
   async function pollOnce() {
     cycle++;
     await producer.pollOnce();
     if (stopped) return;
-    await consumer.tick();
+    await tick();
     await queue.prune(Date.now());
     if (core.logging?.shouldLogVerbose?.()) {
       log(`poll #${cycle}: queue depth ${queue.nonTerminalCount()}, ${consumer.inFlightCount()} turn(s) in flight`);
@@ -272,9 +337,17 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
     if (timer) clearTimeout(timer);
   });
 
-  // Boot-only: items left "processing" by a crashed process are probed and either
-  // marked done (the reply landed) or requeued. MUST complete before the first tick().
-  await consumer.recoverOrphans();
+  // Boot-only: items left "processing" by a CRASHED process are probed and either marked
+  // done (the reply landed) or requeued. MUST complete before the first tick(), and must
+  // run at most once per queue file per process — see QUEUE_STORES above for why an
+  // in-process channel restart must NOT re-recover.
+  if (!queueEntry.recovery) {
+    queueEntry.recovery = consumer.recoverOrphans().catch((err) => {
+      queueEntry.recovery = null; // let a later start retry recovery
+      throw err;
+    });
+  }
+  await queueEntry.recovery;
 
   log(`polling workspace ${account.workspaceId} every ${account.pollIntervalMs}ms (bot ${botUserId})`);
   void loop();
