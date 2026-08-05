@@ -84,3 +84,19 @@ test("nonTerminalCount counts queued+processing only", async () => {
   await q.transition("conv-msg:2", { state: "processing", claimedAt: T0, attempts: 1 });
   assert.equal(q.nonTerminalCount(), 2);
 });
+
+test("selectClaimable: oldest first, skips busy peers, honors backoff and slots", async () => {
+  const { path } = freshStore();
+  const q = createQueueStore(path);
+  await q.load();
+  await q.enqueueAll([
+    item("conv-msg:1", { peerId: "conv:1", postedTs: 100 }),
+    item("conv-msg:2", { peerId: "conv:1", postedTs: 50 }),
+    item("conv-msg:3", { peerId: "conv:2", postedTs: 200, nextAttemptAt: T0 + 999_999 }),
+    item("conv-msg:4", { peerId: "conv:3", postedTs: 300 }),
+  ], T0);
+  assert.equal(q.selectClaimable(T0, new Set(), 3).id, "conv-msg:2");       // oldest overall
+  assert.equal(q.selectClaimable(T0, new Set(["conv:1"]), 3).id, "conv-msg:4"); // conv:1 busy, 3 backing off
+  assert.equal(q.selectClaimable(T0 + 1_000_000, new Set(["conv:1", "conv:3"]), 3).id, "conv-msg:3"); // backoff elapsed
+  assert.equal(q.selectClaimable(T0, new Set(), 0), null);                   // no slots
+});

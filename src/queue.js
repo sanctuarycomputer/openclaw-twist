@@ -1,7 +1,7 @@
 // Persistent job-queue store for Twist ingestion. Single-process, single JSON
 // file. Correctness contract: an item id, once seen (live or tombstoned), is
 // never re-enqueued; every transition persists before callers proceed.
-import { readFile, writeFile, rename, mkdir, open } from "node:fs/promises";
+import { readFile, rename, mkdir, open } from "node:fs/promises";
 import { dirname } from "node:path";
 
 const TERMINAL = new Set(["done", "skipped", "failed"]);
@@ -70,6 +70,16 @@ export function createQueueStore(filePath) {
     },
     itemsInState: (state) => (ensure(), Object.values(data.items).filter((i) => i.state === state)),
     nonTerminalCount: () => (ensure(), Object.values(data.items).filter((i) => !TERMINAL.has(i.state)).length),
+    selectClaimable(now, busyPeerIds, slotsFree) {
+      ensure();
+      if (slotsFree <= 0) return null;
+      let best = null;
+      for (const it of Object.values(data.items)) {
+        if (it.state !== "queued" || it.nextAttemptAt > now || busyPeerIds.has(it.peerId)) continue;
+        if (!best || it.postedTs < best.postedTs || (it.postedTs === best.postedTs && it.objIndex < best.objIndex)) best = it;
+      }
+      return best;
+    },
     async prune(now) {
       ensure();
       let changed = false;
