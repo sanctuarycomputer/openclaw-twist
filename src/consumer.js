@@ -17,8 +17,17 @@ export function isPermanentError(err) {
   return /not found|does not exist|deleted/i.test(String(err?.message ?? ""));
 }
 
-export function createConsumer({ queue, botUserId, now, log, classifyPeer, admission, runTurn, probe, react, alert, replyInPlace }) {
-  const inFlight = new Map(); // peerId -> { id, startedAt, hungAlerted }
+/**
+ * @param {object} deps
+ * @param {Map<string, {id:string, startedAt:number, hungAlerted:boolean}>} [deps.inFlight]
+ *   peerId -> live turn. Injectable because per-peer exclusion and MAX_GLOBAL_TURNS must
+ *   hold across CONSUMER INSTANCES, not just within one: an in-process channel restart
+ *   builds a new consumer over the same queue file while the outgoing instance's settle()
+ *   calls are still running. Sharing the store alone is not enough — a claimed item is
+ *   `processing` in the store, but OTHER queued items on that same peer would still look
+ *   claimable to a consumer whose own inFlight map is empty. Defaults to a private Map.
+ */
+export function createConsumer({ queue, botUserId, now, log, classifyPeer, admission, runTurn, probe, react, alert, replyInPlace, inFlight = new Map() }) {
   const settlePromises = new Set(); // test-only visibility into in-flight settle() work; see idle()
   let highWaterAlerted = false;
   let ticking = false; // reentrancy guard: tick() must never run two claim passes concurrently
@@ -46,6 +55,9 @@ export function createConsumer({ queue, botUserId, now, log, classifyPeer, admis
     try {
       const verdict = await policyVerdict(item);
       if (verdict.skip) {
+        // Every silently-dropped message is a support ticket waiting to happen: log the
+        // reason (backlog / no-mention / admission:<verdict>) for ALL skips, not just denials.
+        log(`skip ${item.id} (${item.peerId}): ${verdict.skip}`);
         await queue.transition(item.id, { state: "skipped", reason: verdict.skip }, now());
         return;
       }
