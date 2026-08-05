@@ -145,6 +145,29 @@ test("firstSightCursor: empty/undefined items fall back to the read-marker index
   assert.equal(firstSightCursor(undefined, 4, 1000), 4);
 });
 
+test("firstSightCursor: brand-new conversation — fresh first message at obj_index 0 is answered", () => {
+  // Regression (2026-08-05): a just-created group DM's only message sits at obj_index 0,
+  // which equals the conversation's read-marker. Folding that marker into the baseline
+  // swallowed the very mention that created the conversation.
+  const items = [
+    { obj_index: 0, creator: 427360, posted_ts: 1100, content: "[Stacksbot](twist-mention://634870) financial state?" },
+  ];
+  const cursor = firstSightCursor(items, 0, 1000);
+  assert.equal(cursor, -1);
+  assert.deepEqual(newInboundItems(items, cursor, BOT).map((i) => i.obj_index), [0]);
+});
+
+test("firstSightCursor: read-marker above backlog does not swallow fresh items when items are present", () => {
+  const items = [
+    { obj_index: 5, creator: 427360, posted_ts: 900 }, // backlog
+    { obj_index: 6, creator: 427360, posted_ts: 1100, content: "[Stacksbot](twist-mention://634870) hi" }, // fresh
+  ];
+  // read-marker points at the latest item (6); baseline must still stop at the backlog (5)
+  const cursor = firstSightCursor(items, 6, 1000);
+  assert.equal(cursor, 5);
+  assert.deepEqual(newInboundItems(items, cursor, BOT).map((i) => i.obj_index), [6]);
+});
+
 test("resolveOutboundTarget: explicit target wins, else falls back to defaultTo, else throws", () => {
   assert.deepEqual(resolveOutboundTarget("thread:5", "conv:9"), { kind: "thread", id: "5" });
   assert.deepEqual(resolveOutboundTarget("", "thread:7882650"), { kind: "thread", id: "7882650" });
