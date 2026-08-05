@@ -5,30 +5,44 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createQueueStore } from "../src/queue.js";
 import { createCursorStore } from "../src/state.js";
-import { createProducer } from "../src/producer.js";
+import { createProducer, MAX_PAGES_PER_POLL } from "../src/producer.js";
 
 const BOT = 634870;
 const NOW_MS = 1_785_900_000_000;
 const FRESH_TS = 1_785_890_000; // seconds; poller "boot minus grace"
 
+// Mirrors the real API's ordering contract: a bare {limit} call returns the NEWEST `limit`
+// items (Twist defaults to order_by=desc); passing fromObjIndex returns the OLDEST `limit`
+// items at/above that index (order_by=asc + from_obj_index).
 function fakeClient(state) {
+  const page = (id, all, opts = {}) => {
+    const limit = opts.limit ?? 30;
+    (state.fetches ??= []).push({ id, limit, fromObjIndex: opts.fromObjIndex ?? null });
+    if (opts.fromObjIndex == null) return all.slice(-limit);
+    return all.filter((it) => (it.obj_index ?? 0) >= opts.fromObjIndex).slice(0, limit);
+  };
   return {
     getUnreadConversations: async () => state.convs ?? [],
     getUnreadThreads: async () => state.threads ?? [],
-    getConversationMessages: async (id) => state.convMsgs?.[id] ?? [],
-    getThreadComments: async (id) => state.threadComments?.[id] ?? [],
+    getConversationMessages: async (id, opts) => page(id, state.convMsgs?.[id] ?? [], opts),
+    getThreadComments: async (id, opts) => page(id, state.threadComments?.[id] ?? [], opts),
     getThread: async (id) => state.threadObjs?.[id],
     markThreadRead: async (id, idx) => { (state.marked ??= []).push([id, idx]); },
   };
 }
-async function build(state) {
+async function build(state, { logs } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "twistp-"));
   const queue = createQueueStore(join(dir, "queue.json"));
   const cursors = createCursorStore(join(dir, "cursors.json"));
   await queue.load(); await cursors.load();
-  const producer = createProducer({ client: fakeClient(state), queue, cursors, botUserId: BOT, freshSinceTs: FRESH_TS, now: () => NOW_MS, log: () => {} });
+  const producer = createProducer({ client: fakeClient(state), queue, cursors, botUserId: BOT, freshSinceTs: FRESH_TS, now: () => NOW_MS, log: (m) => logs?.push(m) });
   return { queue, cursors, producer };
 }
+// Ascending run of messages, all fresh and all from a human.
+const msgRun = (from, to) =>
+  Array.from({ length: to - from + 1 }, (_, i) => ({
+    id: 1000 + from + i, obj_index: from + i, creator: 427360, posted_ts: FRESH_TS + from + i, content: `m${from + i}`,
+  }));
 
 test("enqueues fresh conversation messages incl. obj_index 0; excludes self; advances cursor", async () => {
   const { queue, cursors, producer } = await build({
@@ -75,6 +89,56 @@ test("second poll is a no-op (idempotent), cursor bounds refetch", async () => {
   await producer.pollOnce();
   await producer.pollOnce();
   assert.equal(queue.itemsInState("queued").length, 1);
+});
+
+// A burst larger than one fetch window used to be lost forever: the newest-N fetch never
+// saw the older items, but the cursor jumped past them anyway. The producer now pages
+// FORWARD from the cursor, so the cursor only crosses items it actually enqueued.
+test("burst above the cursor is paged forward, not truncated to the newest window", async () => {
+  const state = { convs: [{ conversation_id: 9 }], convMsgs: { 9: msgRun(1, 75) } };
+  const { queue, cursors, producer } = await build(state);
+  await cursors.setCursor("conversations", 9, 30); // not first sight: swept up to obj_index 30
+
+  await producer.pollOnce();
+
+  const enqueued = queue.itemsInState("queued");
+  assert.equal(enqueued.length, 45); // 31..75 — all of them, not just the newest 30
+  assert.deepEqual(enqueued.map((i) => i.objIndex).sort((a, b) => a - b), msgRun(31, 75).map((m) => m.obj_index));
+  assert.equal(cursors.getCursor("conversations", 9), 75);
+  // every fetch was an ascending page anchored at the live cursor + 1
+  assert.deepEqual(state.fetches.map((f) => f.fromObjIndex), [31, 61]);
+});
+
+test("pagination stops at MAX_PAGES_PER_POLL and the next poll resumes exactly where it stopped", async () => {
+  const total = 30 * MAX_PAGES_PER_POLL + 10; // one poll's worth of pages, plus a remainder
+  const state = { convs: [{ conversation_id: 9 }], convMsgs: { 9: msgRun(1, total) } };
+  const logs = [];
+  const { queue, cursors, producer } = await build(state, { logs });
+  await cursors.setCursor("conversations", 9, 0);
+
+  await producer.pollOnce();
+  assert.equal(queue.itemsInState("queued").length, 30 * MAX_PAGES_PER_POLL);
+  assert.equal(cursors.getCursor("conversations", 9), 30 * MAX_PAGES_PER_POLL); // only over what was fetched
+  assert.match(logs.join("\n"), /page cap/);
+
+  await producer.pollOnce();
+  assert.equal(queue.itemsInState("queued").length, total); // remainder picked up, nothing skipped
+  assert.equal(cursors.getCursor("conversations", 9), total);
+});
+
+test("first sight still baselines on the newest window (backlog flags intact)", async () => {
+  const old = msgRun(1, 20).map((m) => ({ ...m, posted_ts: FRESH_TS - 9000 })); // pre-boot backlog
+  const state = { convs: [{ conversation_id: 9 }], convMsgs: { 9: [...old, ...msgRun(21, 40)] } };
+  const { queue, cursors, producer } = await build(state);
+
+  await producer.pollOnce();
+
+  assert.deepEqual(state.fetches.map((f) => f.fromObjIndex), [null]); // desc window, no pagination
+  assert.equal(queue.itemsInState("queued").length, 30);             // newest window only
+  assert.equal(queue.has("conv-msg:1011"), true);                    // obj_index 11 (oldest of the window)
+  assert.equal(queue.get("conv-msg:1011").firstSightBacklog, true);  // posted before the grace window
+  assert.equal(queue.get("conv-msg:1040").firstSightBacklog, false); // fresh
+  assert.equal(cursors.getCursor("conversations", 9), 40);
 });
 
 test("first-sight thread with no comments does not mark as read", async () => {

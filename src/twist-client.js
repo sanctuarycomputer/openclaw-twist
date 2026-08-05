@@ -91,14 +91,34 @@ export function createTwistClient({ token, workspaceId, fetchImpl = fetch }) {
     getConversation: (id, signal) =>
       request("conversations/getone", { query: { id }, signal }),
 
-    /** Comments on a thread, chronological by obj_index. */
-    getThreadComments: (threadId, { limit = 30, signal } = {}) =>
-      request("comments/get", { query: { thread_id: threadId, limit }, signal }),
+    /**
+     * Comments on a thread.
+     *
+     * DEFAULT (no `fromObjIndex`): Twist orders `comments/get` **descending**, so a bare
+     * `{limit}` call returns the NEWEST `limit` comments — a backlog baseline, not a page.
+     * Pass `fromObjIndex` to page FORWARD from a cursor instead: that switches the call to
+     * `order_by=asc` + `from_obj_index`, returning the OLDEST `limit` comments at/after that
+     * index. VERIFIED LIVE: `from_obj_index` without `order_by=asc` is silently ignored (you
+     * get the newest window back), so the two parameters are always sent together.
+     */
+    getThreadComments: (threadId, { limit = 30, fromObjIndex = null, signal } = {}) =>
+      request("comments/get", {
+        query: {
+          thread_id: threadId,
+          limit,
+          ...(fromObjIndex != null ? { order_by: "asc", from_obj_index: fromObjIndex } : {}),
+        },
+        signal,
+      }),
 
-    /** Messages in a conversation, chronological by obj_index. */
-    getConversationMessages: (conversationId, { limit = 30, signal } = {}) =>
+    /** Messages in a conversation. Same ordering contract as getThreadComments. */
+    getConversationMessages: (conversationId, { limit = 30, fromObjIndex = null, signal } = {}) =>
       request("conversation_messages/get", {
-        query: { conversation_id: conversationId, limit },
+        query: {
+          conversation_id: conversationId,
+          limit,
+          ...(fromObjIndex != null ? { order_by: "asc", from_obj_index: fromObjIndex } : {}),
+        },
         signal,
       }),
 
