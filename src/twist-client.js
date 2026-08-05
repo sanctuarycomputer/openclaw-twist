@@ -91,14 +91,34 @@ export function createTwistClient({ token, workspaceId, fetchImpl = fetch }) {
     getConversation: (id, signal) =>
       request("conversations/getone", { query: { id }, signal }),
 
-    /** Comments on a thread, chronological by obj_index. */
-    getThreadComments: (threadId, { limit = 30, signal } = {}) =>
-      request("comments/get", { query: { thread_id: threadId, limit }, signal }),
+    /**
+     * Comments on a thread.
+     *
+     * DEFAULT (no `fromObjIndex`): Twist orders `comments/get` **descending**, so a bare
+     * `{limit}` call returns the NEWEST `limit` comments — a backlog baseline, not a page.
+     * Pass `fromObjIndex` to page FORWARD from a cursor instead: that switches the call to
+     * `order_by=asc` + `from_obj_index`, returning the OLDEST `limit` comments at/after that
+     * index. VERIFIED LIVE: `from_obj_index` without `order_by=asc` is silently ignored (you
+     * get the newest window back), so the two parameters are always sent together.
+     */
+    getThreadComments: (threadId, { limit = 30, fromObjIndex = null, signal } = {}) =>
+      request("comments/get", {
+        query: {
+          thread_id: threadId,
+          limit,
+          ...(fromObjIndex != null ? { order_by: "asc", from_obj_index: fromObjIndex } : {}),
+        },
+        signal,
+      }),
 
-    /** Messages in a conversation, chronological by obj_index. */
-    getConversationMessages: (conversationId, { limit = 30, signal } = {}) =>
+    /** Messages in a conversation. Same ordering contract as getThreadComments. */
+    getConversationMessages: (conversationId, { limit = 30, fromObjIndex = null, signal } = {}) =>
       request("conversation_messages/get", {
-        query: { conversation_id: conversationId, limit },
+        query: {
+          conversation_id: conversationId,
+          limit,
+          ...(fromObjIndex != null ? { order_by: "asc", from_obj_index: fromObjIndex } : {}),
+        },
         signal,
       }),
 
@@ -147,24 +167,25 @@ export function createTwistClient({ token, workspaceId, fetchImpl = fetch }) {
       }),
 
     /**
-     * Add an emoji reaction. Target a thread comment with {commentId} or a
-     * conversation message with {messageId}.
+     * Add an emoji reaction. Targets are mutually exclusive: a thread comment
+     * ({commentId}), a conversation message ({messageId}), or a thread's OPENING POST
+     * ({threadId}) — reactions/add|remove accept `thread_id` as a first-class target, so
+     * an opening post is reactable just like a comment.
      */
-    addReaction: ({ commentId, messageId, reaction }, signal) =>
-      request("reactions/add", {
-        method: "POST",
-        body: commentId != null ? { comment_id: commentId, reaction } : { message_id: messageId, reaction },
-        signal,
-      }),
+    addReaction: (target, signal) =>
+      request("reactions/add", { method: "POST", body: reactionBody(target), signal }),
 
     /** Remove an emoji reaction (same targeting as addReaction). */
-    removeReaction: ({ commentId, messageId, reaction }, signal) =>
-      request("reactions/remove", {
-        method: "POST",
-        body: commentId != null ? { comment_id: commentId, reaction } : { message_id: messageId, reaction },
-        signal,
-      }),
+    removeReaction: (target, signal) =>
+      request("reactions/remove", { method: "POST", body: reactionBody(target), signal }),
   };
+}
+
+/** reactions/add|remove body for exactly one target: comment, message, or thread post. */
+function reactionBody({ commentId, messageId, threadId, reaction }) {
+  if (commentId != null) return { comment_id: commentId, reaction };
+  if (messageId != null) return { message_id: messageId, reaction };
+  return { thread_id: threadId, reaction };
 }
 
 /** Extract participant count from a conversation object (handles field variants). */

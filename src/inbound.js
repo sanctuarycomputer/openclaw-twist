@@ -44,19 +44,21 @@ const twistIngressIdentity = defineStableChannelIngressIdentity({
 });
 
 /**
+ * Runs OpenCLAW's ingress gate (DM policy / group mention / command auth) for
+ * a normalized Twist message, without side effects beyond the resolver's own
+ * reads. Self-contained given ({message, account, cfg}) so it can be invoked
+ * ahead of dispatch (e.g. to record a denial) or inline within
+ * handleTwistInbound.
+ *
  * @param {object} p
  * @param {object} p.message normalized: {messageId,kind,conversationId,threadId,groupId,peerKind,peerId,isGroup,senderId,senderName,text,timestamp,directMention}
  * @param {object} p.account resolved Twist account
  * @param {object} p.cfg     live OpenCLAW config
- * @param {object} p.runtime logger-backed runtime
- * @param {object} p.client  TwistClient (for delivery)
- * @param {(u:object)=>void} [p.statusSink]
+ * @returns {Promise<{admit: boolean, admission: string, commandAuthorized: boolean}>}
  */
-export async function handleTwistInbound({ message, account, cfg, runtime, client, statusSink }) {
+export async function admissionVerdict({ message, account, cfg }) {
   const core = getTwistRuntime();
   const rawBody = cleanTwistMarkup((message.text ?? "").trim());
-  if (!rawBody) return;
-  statusSink?.({ lastInboundAt: message.timestamp });
 
   const dmPolicy = account.config.dmPolicy ?? "open";
   const groupPolicy = account.config.groupPolicy ?? "open";
@@ -91,13 +93,39 @@ export async function handleTwistInbound({ message, account, cfg, runtime, clien
     command: { allowTextCommands, hasControlCommand },
   });
 
-  if (access.ingress.admission !== "dispatch") {
+  return {
+    admit: access.ingress.admission === "dispatch",
+    admission: access.ingress.admission,
+    commandAuthorized: access.commandAccess?.authorized ?? false,
+  };
+}
+
+/**
+ * @param {object} p
+ * @param {object} p.message normalized: {messageId,kind,conversationId,threadId,groupId,peerKind,peerId,isGroup,senderId,senderName,text,timestamp,directMention}
+ * @param {object} p.account resolved Twist account
+ * @param {object} p.cfg     live OpenCLAW config
+ * @param {object} p.runtime logger-backed runtime
+ * @param {object} p.client  TwistClient (for delivery)
+ * @param {(u:object)=>void} [p.statusSink]
+ * @param {{admit: boolean, admission: string, commandAuthorized: boolean}} [p.verdict] pre-computed admission verdict; when omitted, computed internally
+ */
+export async function handleTwistInbound({ message, account, cfg, runtime, client, statusSink, verdict }) {
+  const core = getTwistRuntime();
+  const rawBody = cleanTwistMarkup((message.text ?? "").trim());
+  if (!rawBody) return;
+  statusSink?.({ lastInboundAt: message.timestamp });
+
+  if (!verdict) verdict = await admissionVerdict({ message, account, cfg });
+
+  if (!verdict.admit) {
     runtime.log?.(
-      `twist: drop ${message.kind} ${message.peerId} (admission=${access.ingress.admission})`,
+      `twist: drop ${message.kind} ${message.peerId} (admission=${verdict.admission})`,
     );
     return;
   }
-  const commandAuthorized = access.commandAccess?.authorized ?? false;
+  const commandAuthorized = verdict.commandAuthorized;
+  const wasMentioned = Boolean(message.directMention) || contentMentionsBot(rawBody, account.botUserId);
 
   const { route, buildEnvelope } = resolveInboundRouteEnvelopeBuilderWithRuntime({
     cfg,

@@ -1,76 +1,95 @@
-// Poll-based monitor. Replaces IRC's socket monitor: every pollIntervalMs it
-// scans Twist unread conversations (DM always, group DM on mention) and unread
-// threads (mention-only), then dispatches new items through handleTwistInbound.
-// Returns a { stop } handle for runStoppablePassiveMonitor.
+// Poll-based monitor. Thin wiring layer over the durable ingestion pipeline:
 //
-// Two important properties:
-//  - Baseline-on-first-sight uses posted_ts vs. the poller boot time (see
-//    firstSightCursor), so pre-existing backlog is never answered BUT the first
-//    @mention in a brand-new thread (posted after boot) still is.
-//  - Dispatch is NON-BLOCKING (fire-and-forget with a per-peer in-flight guard
-//    and timeout) so one slow agent turn never starves the rest of the poll.
-//  - After processing a thread we advance the bot's own Twist read marker so the
-//    unread-threads list stays bounded (it would otherwise grow forever, since the
-//    bot is @mentioned in ever more threads and re-scans them all every poll).
+//   producer.pollOnce()  → sweeps Twist unreads and ENQUEUES everything new (transport only)
+//   consumer.tick()      → claims queued items, applies policy, runs the agent turn
+//   queue.prune(now)     → tombstones long-finished items
+//
+// The old at-most-once path (cursor advanced before dispatch, fire-and-forget
+// dispatch, no retry) lived here and lost messages six different ways. It is gone:
+// the cursor is now only a refetch bound, and the queue file is the delivery record.
+// This module owns nothing but the effects the consumer needs (network, config,
+// SDK) — all decision logic lives in producer.js / consumer.js / routing.js.
 import { createTwistClient, conversationParticipantCount } from "./twist-client.js";
 import { resolveTwistAccount } from "./config.js";
 import {
   classifyConversation,
-  shouldRespondToConversation,
-  newInboundItems,
-  advanceCursor,
-  firstSightCursor,
   contentMentionsBot,
   routingPeer,
   buildTranscript,
+  resolveOutboundTarget,
 } from "./routing.js";
-import { handleTwistInbound } from "./inbound.js";
+import { admissionVerdict, handleTwistInbound } from "./inbound.js";
+import { postToTwist } from "./outbound.js";
+import { createQueueStore } from "./queue.js";
+import { createProducer } from "./producer.js";
+import { createConsumer } from "./consumer.js";
 import { getTwistRuntime } from "./runtime.js";
 
 const ITEM_FETCH_LIMIT = 30;
-const DISPATCH_TIMEOUT_MS = 180000;
-const REACTION_PROCESSING = "⏳"; // shown while a turn is in progress
-const REACTION_DONE = "✅"; // shown when the turn completes successfully
-const REACTION_ERROR = "❌"; // shown if the turn errors
 // On first sight of a thread/conv, items posted within this window before boot still
 // count as "fresh" (answerable) — covers an @mention sent while the bot was down for a
-// deploy/restart/short outage. Older items are backlog and stay baselined. Sized to
-// span a realistic outage (not just a deploy): a 10-minute window silently swallowed
-// thread mentions that landed during longer downtime.
+// deploy/restart/short outage. Older items are enqueued but marked firstSightBacklog and
+// skipped by the consumer. Sized to span a realistic outage (not just a deploy): a
+// 10-minute window silently swallowed thread mentions that landed during longer downtime.
 const FIRST_SIGHT_GRACE_MS = 2 * 60 * 60 * 1000;
 
-const toTimestamp = (item) => (item.posted_ts ? item.posted_ts * 1000 : Date.now());
+/**
+ * Per-process, per-queue-file ingestion state: one store, one in-flight map, one boot
+ * recovery. Keyed by queue path because that is what identifies the durable queue.
+ *
+ * OpenCLAW hot-reload (`channels.twist` → restart-channel:twist) calls stopChannel() then
+ * startChannel() in the SAME process, and stop() does not drain in-flight settle() work.
+ * So an outgoing monitor's turns keep running against the queue while the incoming monitor
+ * builds a fresh producer and consumer. Three things must therefore outlive a restart:
+ *
+ *   - `store` — STATE VISIBILITY + single-writer. Two stores over one file would keep two
+ *     independent in-memory snapshots and clobber each other's writes; one store means the
+ *     outgoing settle()'s verdict (done / retry / failed) lands where the incoming consumer
+ *     reads it, and `writeChain` still serializes every persist.
+ *   - `inFlight` — CONCURRENCY ACCOUNTING. This is the one the store cannot cover: a live
+ *     turn's own item is `processing` (so selectClaimable skips it), but OTHER queued items
+ *     on that same peer still look claimable to a consumer with an empty in-flight map.
+ *     Sharing it keeps per-peer exclusion AND MAX_GLOBAL_TURNS process-wide, instead of
+ *     letting a restart run two turns in one conversation and 2× the global cap.
+ *   - `recovery` — recoverOrphans() must run ONCE per process. Re-running it on a restart
+ *     would probe items a live turn is mid-way through and requeue them: duplicate turn,
+ *     double reply. Genuine orphans come only from a process crash, which by definition
+ *     drops this Map, so the next process does recover them.
+ */
+const QUEUE_STORES = new Map(); // queuePath -> { store, ready, recovery, inFlight, log }
 
-function buildMessage({ kind, item, conversationId, threadId, groupId, directMention, context = {} }) {
-  const peer = routingPeer({ kind, conversationId, threadId });
-  return {
-    messageId: String(item.id),
-    kind,
-    conversationId,
-    threadId,
-    groupId,
-    peerKind: peer.peerKind,
-    peerId: peer.peerId,
-    isGroup: peer.isGroup,
-    senderId: item.creator,
-    senderName: item.creator_name,
-    text: item.content,
-    timestamp: toTimestamp(item),
-    directMention,
-    // Twist context for the agent:
-    threadTitle: context.threadTitle,
-    channelName: context.channelName,
-    transcript: context.transcript,
-  };
+function acquireQueueStore(queuePath, log) {
+  let entry = QUEUE_STORES.get(queuePath);
+  if (entry) {
+    entry.log = log; // a restart brings a fresh logger; the store keeps writing to the live one
+    return entry;
+  }
+  entry = { log, store: null, ready: null, recovery: null, inFlight: new Map() };
+  entry.store = createQueueStore(queuePath, { log: (m) => entry.log?.(m) });
+  // Cache the load PROMISE (not its result) so two concurrent starts share one load; evict
+  // on failure so a transient IO fault doesn't wedge the account until process restart.
+  entry.ready = entry.store.load(Date.now()).catch((err) => {
+    QUEUE_STORES.delete(queuePath);
+    throw err;
+  });
+  QUEUE_STORES.set(queuePath, entry);
+  return entry;
 }
 
-export function monitorTwistProvider({ accountId, config, runtime, abortSignal, statusSink, cursors }) {
+/**
+ * @param {object} p
+ * @param {object} p.cursors  loaded cursor store (refetch bound only)
+ * @param {string} p.queuePath  path to the durable queue file (sibling of the cursors file)
+ * @returns {Promise<{stop: () => void}>}
+ */
+export async function monitorTwistProvider({ accountId, config, runtime, abortSignal, statusSink, cursors, queuePath }) {
   const core = getTwistRuntime();
   const cfg = config ?? core.config.current();
   const account = resolveTwistAccount(cfg);
   if (!account.configured) {
     throw new Error("twist: not configured (need token, workspaceId, botUserId in channels.twist)");
   }
+  if (!queuePath) throw new Error("twist: queuePath is required (durable ingestion queue)");
   const client = createTwistClient({ token: account.token, workspaceId: account.workspaceId });
   const botUserId = account.botUserId;
   const log = (m) => runtime.log?.(`[twist] ${m}`);
@@ -80,85 +99,36 @@ export function monitorTwistProvider({ accountId, config, runtime, abortSignal, 
   let stopped = false;
   let timer = null;
   let cycle = 0;
-  const inFlight = new Set(); // peerId currently running an agent turn
 
-  // Reaction target for the triggering message: comment_id for threads,
-  // message_id for conversation (DM / group DM) messages. Best-effort.
-  function reactionTarget(message) {
-    const id = Number(message.messageId);
-    return message.kind === "thread" ? { commentId: id } : { messageId: id };
-  }
-  async function safeReact(verb, message, reaction) {
+  const queueEntry = acquireQueueStore(queuePath, log);
+  await queueEntry.ready;
+  const queue = queueEntry.store;
+
+  const producer = createProducer({ client, queue, cursors, botUserId, freshSinceTs, now: Date.now, log, abortSignal });
+
+  // ---------------------------------------------------------------- helpers
+
+  // Conversation kind never changes for a given conversation, so this cache is
+  // process-lived (not per-cycle): classifyPeer is called per item, and refetching
+  // the conversation for every queued message would multiply poll cost.
+  // Only SUCCESSFUL lookups are cached — a transient failure must not poison the
+  // classification forever — and a failed lookup THROWS so the consumer requeues the
+  // item with backoff instead of guessing a kind and mis-routing (a wrong "dm" would
+  // bypass the group mention requirement; a wrong "groupdm" would drop a real DM).
+  const peerKindCache = new Map();
+  async function participantKind(convId) {
+    const key = String(convId);
+    if (peerKindCache.has(key)) return peerKindCache.get(key);
+    let conv;
     try {
-      const target = { ...reactionTarget(message), reaction };
-      if (verb === "add") await client.addReaction(target);
-      else await client.removeReaction(target);
-    } catch (err) {
-      log(`reaction ${verb} ${reaction} failed for ${message.peerId}: ${String(err)}`);
-    }
-  }
-
-  // Fire an agent turn without blocking the poll loop. Reaction lifecycle on the
-  // triggering message: 🕰️ on pickup -> removed on success / replaced with ❌ on error.
-  function fireDispatch(message) {
-    if (inFlight.has(message.peerId)) {
-      log(`skip ${message.peerId}: turn already in flight`);
-      return;
-    }
-    inFlight.add(message.peerId);
-    log(`dispatching ${message.kind} ${message.peerId} from ${message.senderName}`);
-    const watchdog = setTimeout(() => log(`dispatch ${message.peerId} still running >${DISPATCH_TIMEOUT_MS}ms`), DISPATCH_TIMEOUT_MS);
-    void (async () => {
-      await safeReact("add", message, REACTION_PROCESSING);
-      try {
-        await handleTwistInbound({ message, account, cfg: core.config.current() ?? cfg, runtime, client, statusSink });
-        await safeReact("remove", message, REACTION_PROCESSING);
-        await safeReact("add", message, REACTION_DONE);
-      } catch (err) {
-        log(`dispatch ${message.peerId} failed: ${String(err)}`);
-        await safeReact("remove", message, REACTION_PROCESSING);
-        await safeReact("add", message, REACTION_ERROR);
-      } finally {
-        clearTimeout(watchdog);
-        inFlight.delete(message.peerId);
-      }
-    })();
-  }
-
-  // Cache participant-derived kind within a cycle to avoid refetching.
-  async function participantKind(convId, cache) {
-    if (cache.has(convId)) return cache.get(convId);
-    let kind = "dm";
-    try {
-      const conv = await client.getConversation(convId, abortSignal);
-      kind = classifyConversation(conversationParticipantCount(conv));
+      conv = await client.getConversation(convId, abortSignal);
     } catch (err) {
       log(`participant lookup failed for conv ${convId}: ${String(err)}`);
+      throw err;
     }
-    cache.set(convId, kind);
+    const kind = classifyConversation(conversationParticipantCount(conv));
+    peerKindCache.set(key, kind);
     return kind;
-  }
-
-  async function processConversation(c, cache) {
-    const convId = c.conversation_id;
-    const messages = await client.getConversationMessages(convId, { limit: ITEM_FETCH_LIMIT, signal: abortSignal });
-    const kind = await participantKind(convId, cache);
-    const cursor = cursors.isFirstSight("conversations", convId)
-      ? firstSightCursor(messages, c.obj_index ?? 0, freshSinceTs)
-      : cursors.getCursor("conversations", convId);
-    let fresh = newInboundItems(messages, cursor, botUserId);
-    if (kind === "groupdm") fresh = fresh.filter((m) => contentMentionsBot(m.content, botUserId));
-    await cursors.setCursor("conversations", convId, advanceCursor(cursor, messages)); // at-most-once
-    if (fresh.length && shouldRespondToConversation({ kind, directMention: c.direct_mention })) {
-      const trigger = fresh[fresh.length - 1];
-      // Never drop the other new messages from this cycle: group DMs get the full
-      // recent transcript; 1:1 DMs get the OTHER fresh messages in this batch
-      // (so e.g. a link sent just before a question still reaches the agent).
-      const context = {
-        transcript: buildTranscript(kind === "groupdm" ? messages : fresh, trigger.id),
-      };
-      fireDispatch(buildMessage({ kind, item: trigger, conversationId: convId, directMention: Boolean(c.direct_mention), context }));
-    }
   }
 
   // Fetch thread title + channel name + prior-comment transcript for agent context.
@@ -178,61 +148,147 @@ export function monitorTwistProvider({ accountId, config, runtime, abortSignal, 
     return { threadTitle, channelName, transcript: buildTranscript(comments, triggerId) };
   }
 
-  async function processThread(t) {
-    const threadId = t.thread_id;
-    const comments = await client.getThreadComments(threadId, { limit: ITEM_FETCH_LIMIT, signal: abortSignal });
-    const cursor = cursors.isFirstSight("threads", threadId)
-      ? firstSightCursor(comments, t.obj_index ?? 0, freshSinceTs)
-      : cursors.getCursor("threads", threadId);
-    const fresh = newInboundItems(comments, cursor, botUserId).filter((c) => contentMentionsBot(c.content, botUserId));
-    const nextCursor = advanceCursor(cursor, comments);
-    await cursors.setCursor("threads", threadId, nextCursor); // at-most-once
-    // Advance the BOT's own Twist read marker past everything we've now processed.
-    // This is the scale bound: getUnreadThreads only returns threads with genuinely
-    // new comments, instead of every thread the bot was ever mentioned in growing
-    // unbounded and getting re-fetched every poll. It's the bot's own per-user read
-    // state (invisible to humans) and survives /data volume resets, so it also acts as
-    // server-side dedup on top of the local cursor store. Best-effort: on failure the
-    // local cursor still prevents re-dispatch, so we just re-scan next poll.
-    if (Number.isFinite(nextCursor)) {
-      try {
-        await client.markThreadRead(threadId, nextCursor, abortSignal);
-      } catch (err) {
-        log(`markThreadRead ${threadId} failed: ${String(err)}`);
-      }
+  // "Conversation so far" must be STRICTLY PRIOR to the trigger. selectClaimable claims the
+  // OLDEST queued item, so same-peer siblings still in the queue are FUTURE messages — each
+  // gets its own turn, in order, with its own prior context. Already-answered earlier items
+  // are fine to include (they come from the same fresh fetch and are what the human sees);
+  // the trigger itself is dropped by buildTranscript.
+  const strictlyPrior = (items, item) => items.filter((it) => (it.obj_index ?? 0) < item.objIndex);
+
+  async function buildContext(item) {
+    if (item.kind === "conv") {
+      const messages = (await client.getConversationMessages(item.conversationId, { limit: ITEM_FETCH_LIMIT, signal: abortSignal })) ?? [];
+      return { transcript: buildTranscript(strictlyPrior(messages, item), item.messageId) };
     }
-    if (fresh.length) {
-      const trigger = fresh[fresh.length - 1];
-      const context = await fetchThreadContext(threadId, t.channel_id, comments, trigger.id);
-      fireDispatch(buildMessage({ kind: "thread", item: trigger, threadId, groupId: t.channel_id, directMention: true, context }));
+    // A thread-post item has objIndex 0 (it IS the opening post), so it correctly gets no
+    // prior comments.
+    const comments = (await client.getThreadComments(item.threadId, { limit: ITEM_FETCH_LIMIT, signal: abortSignal })) ?? [];
+    return await fetchThreadContext(item.threadId, item.channelId, strictlyPrior(comments, item), item.messageId);
+  }
+
+  /**
+   * Queue item → the normalized message `handleTwistInbound` documents.
+   * `kind` is "thread" for both thread comments and the thread's opening post.
+   * NOTE: `message.peerId` is the SESSION routing key from routingPeer (dm:<id> /
+   * conv:<id> / thread:<id>) — deliberately not `item.peerId`, which is the queue's
+   * coarser per-peer concurrency key.
+   */
+  async function toNormalizedMessage(item, { withContext = false } = {}) {
+    const kind = item.kind === "conv" ? await participantKind(item.conversationId) : "thread";
+    const peer = routingPeer({ kind, conversationId: item.conversationId, threadId: item.threadId });
+    const context = withContext ? await buildContext(item) : {};
+    return {
+      messageId: String(item.messageId),
+      kind,
+      conversationId: item.conversationId,
+      threadId: item.threadId,
+      groupId: item.channelId,
+      peerKind: peer.peerKind,
+      peerId: peer.peerId,
+      isGroup: peer.isGroup,
+      senderId: item.senderId,
+      senderName: item.senderName,
+      text: item.content,
+      timestamp: item.postedTs ? item.postedTs * 1000 : Date.now(),
+      directMention: contentMentionsBot(item.content, botUserId),
+      // Twist context for the agent:
+      threadTitle: context.threadTitle,
+      channelName: context.channelName,
+      transcript: context.transcript,
+    };
+  }
+
+  // ---------------------------------------------------- injected consumer effects
+
+  const classifyPeer = (item) => participantKind(item.conversationId);
+
+  // Denials used to be logged by handleTwistInbound's drop path; now they short-circuit
+  // before dispatch. The logging lives in ONE place — the consumer's skip branch — which
+  // reports admission denials alongside backlog/no-mention skips in the same format.
+  const admission = async (item) =>
+    await admissionVerdict({
+      message: await toNormalizedMessage(item),
+      account,
+      cfg: core.config.current() ?? cfg,
+    });
+
+  const runTurn = async (item, { commandAuthorized }) => {
+    const message = await toNormalizedMessage(item, { withContext: true });
+    log(`dispatching ${message.kind} ${message.peerId} from ${message.senderName}`);
+    await handleTwistInbound({
+      message,
+      account,
+      cfg: core.config.current() ?? cfg,
+      runtime,
+      client,
+      statusSink,
+      verdict: { admit: true, admission: "dispatch", commandAuthorized },
+    });
+  };
+
+  // Boot recovery: did the bot already answer this item before the crash? True when a
+  // post of ours landed at/after the claim. Twist timestamps are seconds.
+  const probe = async (item) => {
+    const since = Math.floor((item.claimedAt ?? 0) / 1000);
+    const posts =
+      (item.kind === "conv"
+        ? await client.getConversationMessages(item.conversationId, { limit: ITEM_FETCH_LIMIT, signal: abortSignal })
+        : await client.getThreadComments(item.threadId, { limit: ITEM_FETCH_LIMIT, signal: abortSignal })) ?? [];
+    return posts.some((p) => String(p.creator) === String(botUserId) && (p.posted_ts ?? 0) >= since);
+  };
+
+  // Twist's reactions API addresses a conversation MESSAGE, a thread COMMENT, or a
+  // thread's OPENING POST (reactions/add|remove take thread_id as a first-class target),
+  // so every item kind we queue is reactable.
+  function reactionTarget(item) {
+    if (item.kind === "conv") return { messageId: Number(item.messageId) };
+    if (item.kind === "thread") return { commentId: Number(item.messageId) };
+    return { threadId: Number(item.threadId) }; // "thread-post": the opening post
+  }
+  // Best-effort: a reaction is cosmetic and must never fail (and thus retry) a turn.
+  async function react(item, verb, reaction) {
+    const target = reactionTarget(item);
+    try {
+      if (verb === "add") await client.addReaction({ ...target, reaction });
+      else await client.removeReaction({ ...target, reaction });
+    } catch (err) {
+      log(`reaction ${verb} ${reaction} failed for ${item.id}: ${String(err)}`);
     }
   }
 
-  async function pollOnce() {
-    const convs = await client.getUnreadConversations(abortSignal);
-    const threads = await client.getUnreadThreads(abortSignal);
-    const mentionThreads = threads.filter((t) => t.direct_mention);
-    cycle++;
-    if (core.logging?.shouldLogVerbose?.()) {
-      log(`poll #${cycle}: ${convs.length} unread convs, ${threads.length} unread threads (${mentionThreads.length} mention), ${inFlight.size} in flight`);
+  const alert = async (text) => {
+    try {
+      const { kind, id } = resolveOutboundTarget(null, account.defaultTo);
+      await postToTwist({ client, kind, id, text });
+    } catch (err) {
+      log(`alert delivery failed: ${String(err)}`);
     }
+  };
 
-    const cache = new Map();
-    for (const c of convs) {
-      if (stopped) return;
-      try {
-        await processConversation(c, cache);
-      } catch (err) {
-        log(`conversation ${c.conversation_id} failed: ${String(err)}`);
-      }
-    }
-    for (const t of mentionThreads) {
-      if (stopped) return;
-      try {
-        await processThread(t);
-      } catch (err) {
-        log(`thread ${t.thread_id} failed: ${String(err)}`);
-      }
+  const replyInPlace = (item, text) =>
+    postToTwist({
+      client,
+      kind: item.kind === "conv" ? "conv" : "thread",
+      id: item.kind === "conv" ? item.conversationId : item.threadId,
+      text,
+    });
+
+  const consumer = createConsumer({
+    queue, botUserId, now: Date.now, log,
+    classifyPeer, admission, runTurn, probe, react, alert, replyInPlace,
+    inFlight: queueEntry.inFlight, // shared across restarts — see QUEUE_STORES
+  });
+
+  // ------------------------------------------------------------------ poll loop
+
+  async function pollOnce() {
+    cycle++;
+    await producer.pollOnce();
+    if (stopped) return;
+    await consumer.tick();
+    await queue.prune(Date.now());
+    if (core.logging?.shouldLogVerbose?.()) {
+      log(`poll #${cycle}: queue depth ${queue.nonTerminalCount()}, ${consumer.inFlightCount()} turn(s) in flight`);
     }
   }
 
@@ -251,6 +307,18 @@ export function monitorTwistProvider({ accountId, config, runtime, abortSignal, 
     stopped = true;
     if (timer) clearTimeout(timer);
   });
+
+  // Boot-only: items left "processing" by a CRASHED process are probed and either marked
+  // done (the reply landed) or requeued. MUST complete before the first tick(), and must
+  // run at most once per queue file per process — see QUEUE_STORES above for why an
+  // in-process channel restart must NOT re-recover.
+  if (!queueEntry.recovery) {
+    queueEntry.recovery = consumer.recoverOrphans().catch((err) => {
+      queueEntry.recovery = null; // let a later start retry recovery
+      throw err;
+    });
+  }
+  await queueEntry.recovery;
 
   log(`polling workspace ${account.workspaceId} every ${account.pollIntervalMs}ms (bot ${botUserId})`);
   void loop();
