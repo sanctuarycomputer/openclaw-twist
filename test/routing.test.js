@@ -5,6 +5,7 @@ import {
   resolveOutboundTarget,
   cleanTwistMarkup,
   buildTranscript,
+  stripPreHeaderNarration,
   classifyConversation,
   shouldRespondToConversation,
   shouldRespondToThread,
@@ -70,6 +71,32 @@ test("buildTranscript excludes the trigger and keeps the other items in order", 
   const many = Array.from({ length: 20 }, (_, i) => ({ id: i, creator_name: "U", content: String(i) }));
   assert.equal(buildTranscript(many, 19, 5).length, 5);
   assert.deepEqual(buildTranscript(undefined, 1), []);
+});
+
+test("stripPreHeaderNarration drops leaked run narration before a report header", () => {
+  const header = "# Observations Digest Job via [Stacksbot](https://app.notion.com/p/390131fea2c7811c9557cda134dccd30)";
+  const body = `${header}\n\n*last 24h*\n\n- item one`;
+
+  // Leaked preamble before the header is dropped; report survives intact.
+  const leaked = `I now have the observations data. Let me compose the digest.\n\nBased on the query results, I have 20 observations.\n\n${body}`;
+  assert.equal(stripPreHeaderNarration(leaked), body);
+
+  // Header already first → untouched.
+  assert.equal(stripPreHeaderNarration(body), body);
+
+  // No report header at all (ordinary conversational reply) → untouched.
+  const chat = "Sounds good — I'll get that vetting run started now.";
+  assert.equal(stripPreHeaderNarration(chat), chat);
+
+  // Header inside a fenced code block does not count as a report header.
+  const quoted = "Here's what the report format looks like:\n```\n# Recall Skill via [Stacksbot](https://x)\n```\ndone";
+  assert.equal(stripPreHeaderNarration(quoted), quoted);
+
+  // Only whitespace before the header → normalized to header-first.
+  assert.equal(stripPreHeaderNarration(`\n\n${body}`), body);
+
+  // Empty/nullish input passes through.
+  assert.equal(stripPreHeaderNarration(""), "");
 });
 
 test("cleanTwistMarkup rewrites mention markup to @Name", () => {

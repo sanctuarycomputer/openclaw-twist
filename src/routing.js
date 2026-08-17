@@ -99,6 +99,35 @@ export function buildTranscript(items, triggerId, limit = 15) {
     .map((it) => ({ name: it.creator_name, content: it.content }));
 }
 
+/**
+ * Enforce the report-delivery contract: generated posts must OPEN with their
+ * `# <Producer> … via [Stacksbot](<url>)` header. Models routinely leak run
+ * narration ("I now have the data. Let me compose…") before that header, and
+ * prompt discipline has not stopped it — so the outbound path drops anything
+ * preceding the first report-header line. Messages with no such header (ordinary
+ * conversational replies) pass through untouched, as does a header quoted inside
+ * a fenced code block.
+ */
+export function stripPreHeaderNarration(text) {
+  if (!text) return text;
+  const lines = text.split("\n");
+  let inFence = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^\s*(```|~~~)/.test(line)) {
+      inFence = !inFence;
+      continue;
+    }
+    if (!inFence && /^#\s.*via \[Stacksbot\]\(/.test(line)) {
+      if (i === 0) return text;
+      const before = lines.slice(0, i).join("\n");
+      if (!before.trim()) return lines.slice(i).join("\n"); // whitespace-only preamble
+      return lines.slice(i).join("\n");
+    }
+  }
+  return text;
+}
+
 /** Channel default recipients to notify, or null to use Twist's default. */
 export function channelDefaultRecipients(channel) {
   if (channel && channel.use_default_recipients && Array.isArray(channel.default_recipients) && channel.default_recipients.length) {

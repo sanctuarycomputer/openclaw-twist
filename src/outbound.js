@@ -3,7 +3,7 @@
 // "thread:<id>" or "conv:<id>" (optionally prefixed "twist:").
 import { createTwistClient } from "./twist-client.js";
 import { resolveTwistAccount } from "./config.js";
-import { parseTarget, resolveOutboundTarget, channelDefaultRecipients } from "./routing.js";
+import { parseTarget, resolveOutboundTarget, channelDefaultRecipients, stripPreHeaderNarration } from "./routing.js";
 
 export { parseTarget };
 
@@ -36,12 +36,13 @@ async function resolveThreadRecipients(client, threadId) {
 
 /** Post text to a Twist thread or conversation. Returns { messageId }. */
 export async function postToTwist({ client, kind, id, text, recipients }) {
+  const body = stripPreHeaderNarration(text);
   if (kind === "thread") {
     const resolved = recipients !== undefined ? recipients : await resolveThreadRecipients(client, id);
-    const res = await client.addThreadComment(id, text, { recipients: resolved });
+    const res = await client.addThreadComment(id, body, { recipients: resolved });
     return { messageId: res?.id != null ? String(res.id) : undefined };
   }
-  const res = await client.addConversationMessage(id, text);
+  const res = await client.addConversationMessage(id, body);
   return { messageId: res?.id != null ? String(res.id) : undefined };
 }
 
