@@ -3,7 +3,7 @@
 // "thread:<id>" or "conv:<id>" (optionally prefixed "twist:").
 import { createTwistClient } from "./twist-client.js";
 import { resolveTwistAccount } from "./config.js";
-import { parseTarget, resolveOutboundTarget, channelDefaultRecipients, stripPreHeaderNarration } from "./routing.js";
+import { parseTarget, resolveOutboundTarget, channelDefaultRecipients, stripPreHeaderNarration, isBareCronFailureAlert } from "./routing.js";
 
 export { parseTarget };
 
@@ -34,8 +34,13 @@ async function resolveThreadRecipients(client, threadId) {
   }
 }
 
-/** Post text to a Twist thread or conversation. Returns { messageId }. */
+/**
+ * Post text to a Twist thread or conversation. Returns { messageId } — or
+ * { messageId: undefined, suppressed: true } for the redundant bare cron
+ * failure alert (see isBareCronFailureAlert).
+ */
 export async function postToTwist({ client, kind, id, text, recipients }) {
+  if (isBareCronFailureAlert(text)) return { messageId: undefined, suppressed: true };
   const body = stripPreHeaderNarration(text);
   if (kind === "thread") {
     const resolved = recipients !== undefined ? recipients : await resolveThreadRecipients(client, id);

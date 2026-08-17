@@ -6,6 +6,7 @@ import {
   cleanTwistMarkup,
   buildTranscript,
   stripPreHeaderNarration,
+  isBareCronFailureAlert,
   classifyConversation,
   shouldRespondToConversation,
   shouldRespondToThread,
@@ -97,6 +98,25 @@ test("stripPreHeaderNarration drops leaked run narration before a report header"
 
   // Empty/nullish input passes through.
   assert.equal(stripPreHeaderNarration(""), "");
+});
+
+test("isBareCronFailureAlert matches the gateway's bare cron alert and nothing else", () => {
+  // The redundant bare alert observed in the thread (duplicates the reconciler's
+  // formatted Job Failure Alert ~13 min later).
+  assert.equal(
+    isBareCronFailureAlert('⚠️ Cron job "notion:3ac131fea2c7812f92e1fdc1f7b5de02" failed: ⚠️ 🛠️ Exec failed: `ntn api …`'),
+    true,
+  );
+  assert.equal(isBareCronFailureAlert('⚠️ Cron job "stacksbot-resync" failed: boom'), true);
+  // The reconciler's formatted alert opens with the report header — never matched.
+  assert.equal(
+    isBareCronFailureAlert('# Job Failure Alert via [Stacksbot](https://x)\n\n⚠️ Job **"Observe: Twist"** failed — …'),
+    false,
+  );
+  // Auto-disable notices and conversational mentions pass through.
+  assert.equal(isBareCronFailureAlert('⚠️ Cron job "x" has been auto-disabled after 5 consecutive schedule errors.'), false);
+  assert.equal(isBareCronFailureAlert('fyi: ⚠️ Cron job "x" failed: y'), false);
+  assert.equal(isBareCronFailureAlert(""), false);
 });
 
 test("cleanTwistMarkup rewrites mention markup to @Name", () => {

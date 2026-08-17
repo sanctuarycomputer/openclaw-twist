@@ -128,6 +128,18 @@ export function stripPreHeaderNarration(text) {
   return text;
 }
 
+/**
+ * The gateway's bare per-occurrence cron failure alert (`⚠️ Cron job "<name>"
+ * failed: <error>`). It is fully redundant: the jobs-status reconciler posts a
+ * formatted, deduped `# Job Failure Alert` for the same failure (with job name,
+ * link, and transition-based dedup), and repeat failures are already surfaced via
+ * the Jobs DB status fields, the Logs ledger, and the daily health review. The
+ * outbound path drops this shape so every failure alerts exactly once.
+ */
+export function isBareCronFailureAlert(text) {
+  return /^⚠️ Cron job "[^"]+" failed: /.test(text ?? "");
+}
+
 /** Channel default recipients to notify, or null to use Twist's default. */
 export function channelDefaultRecipients(channel) {
   if (channel && channel.use_default_recipients && Array.isArray(channel.default_recipients) && channel.default_recipients.length) {
