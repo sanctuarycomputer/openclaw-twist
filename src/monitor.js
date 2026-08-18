@@ -104,8 +104,6 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
   await queueEntry.ready;
   const queue = queueEntry.store;
 
-  const producer = createProducer({ client, queue, cursors, botUserId, freshSinceTs, now: Date.now, log, abortSignal });
-
   // ---------------------------------------------------------------- helpers
 
   // Conversation kind never changes for a given conversation, so this cache is
@@ -256,6 +254,36 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
     }
   }
 
+  // ---------------------------------------------------- injected producer effects
+
+  /**
+   * Fast ack: the ⏳ that tells a human "seen" is added at INGESTION, not at claim.
+   *
+   * The claim-time ⏳ is only as fast as the consumer reaches the item, and the consumer
+   * takes one item per peer per tick — so a mention landing in a thread with 15 unprocessed
+   * comments in front of it went unacknowledged for 15 ticks (over a minute at the default
+   * cadence). The product contract is ⏳ within ~5s of the mention, so it moves here.
+   *
+   * Only messages the bot would actually answer get one — an ack we don't honor is worse
+   * than none: any container where the bot is @mentioned, plus EVERY message in a 1:1 DM
+   * (DMs need no mention). A group DM message without a mention gets nothing.
+   *
+   * The consumer still adds ⏳ when it claims (safeReact tolerates the duplicate — Twist
+   * treats a repeated reaction from the same user as a no-op), and its normal remove-⏳ →
+   * ✅ / ❌ lifecycle clears this reaction with no extra bookkeeping. The one outcome with
+   * no reaction step of its own is a SKIP, so the consumer clears the ack there explicitly
+   * (see `wasFastAcked`) — an acknowledged mention must never be left wearing ⏳ forever.
+   */
+  async function shouldFastAck(item) {
+    if (contentMentionsBot(item.content, botUserId)) return true;
+    if (item.kind !== "conv") return false; // threads are mention-only
+    return (await participantKind(item.conversationId)) === "dm";
+  }
+  async function fastAck(item) {
+    if (!(await shouldFastAck(item))) return;
+    await react(item, "add", "⏳"); // react() is already best-effort; the producer contains throws anyway
+  }
+
   const alert = async (text) => {
     try {
       const { kind, id } = resolveOutboundTarget(null, account.defaultTo);
@@ -272,6 +300,10 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
       id: item.kind === "conv" ? item.conversationId : item.threadId,
       text,
     });
+
+  // Built here rather than at the top of the function so `fastAck` (and the helpers it
+  // leans on) are already in scope.
+  const producer = createProducer({ client, queue, cursors, botUserId, freshSinceTs, now: Date.now, log, abortSignal, fastAck });
 
   const consumer = createConsumer({
     queue, botUserId, now: Date.now, log,

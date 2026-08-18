@@ -30,14 +30,15 @@ function fakeClient(state) {
     markThreadRead: async (id, idx) => { (state.marked ??= []).push([id, idx]); },
   };
 }
-async function build(state, { logs } = {}) {
+async function build(state, { logs, fastAck } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "twistp-"));
   const queue = createQueueStore(join(dir, "queue.json"));
   const cursors = createCursorStore(join(dir, "cursors.json"));
   await queue.load(); await cursors.load();
-  const producer = createProducer({ client: fakeClient(state), queue, cursors, botUserId: BOT, freshSinceTs: FRESH_TS, now: () => NOW_MS, log: (m) => logs?.push(m) });
+  const producer = createProducer({ client: fakeClient(state), queue, cursors, botUserId: BOT, freshSinceTs: FRESH_TS, now: () => NOW_MS, log: (m) => logs?.push(m), fastAck });
   return { queue, cursors, producer };
 }
+const MENTION = `[Bot](twist-mention://${BOT}) ping`;
 // Ascending run of messages, all fresh and all from a human.
 const msgRun = (from, to) =>
   Array.from({ length: to - from + 1 }, (_, i) => ({
@@ -139,6 +140,60 @@ test("first sight still baselines on the newest window (backlog flags intact)", 
   assert.equal(queue.get("conv-msg:1011").firstSightBacklog, true);  // posted before the grace window
   assert.equal(queue.get("conv-msg:1040").firstSightBacklog, false); // fresh
   assert.equal(cursors.getCursor("conversations", 9), 40);
+});
+
+// The ⏳ used to be added when the CONSUMER claimed an item, which is queue-depth dependent:
+// a mention behind 15 unprocessed comments waited 15 ticks for any sign of life. The ack is
+// now fired at ingestion — but only ever AFTER the batch is durably persisted.
+test("fast-ack fires once per newly-enqueued item, after it is persisted", async () => {
+  const acked = [];
+  const state = {
+    threads: [{ thread_id: 7, channel_id: 3, direct_mention: true }],
+    threadComments: { 7: [{ id: 88, obj_index: 1, creator: 427360, posted_ts: FRESH_TS + 60, content: MENTION }] },
+  };
+  const { producer, queue } = await build(state, { fastAck: async (item) => { acked.push([item.id, queue.has(item.id)]); } });
+  await producer.pollOnce();
+  assert.deepEqual(acked, [["thread-comment:88", true]]); // durable before acknowledged
+});
+
+test("fast-ack is never fired for first-sight backlog items", async () => {
+  const acked = [];
+  const { queue, producer } = await build({
+    convs: [{ conversation_id: 9 }],
+    convMsgs: { 9: [
+      { id: 501, obj_index: 0, creator: 427360, posted_ts: FRESH_TS - 5000, content: MENTION },
+      { id: 502, obj_index: 1, creator: 427360, posted_ts: FRESH_TS + 10, content: MENTION },
+    ] },
+  }, { fastAck: async (item) => { acked.push(item.id); } });
+  await producer.pollOnce();
+  assert.equal(queue.get("conv-msg:501").firstSightBacklog, true);
+  assert.deepEqual(acked, ["conv-msg:502"]); // the backlog mention is enqueued, never acknowledged
+});
+
+// The ack is cosmetic; ingestion is not. A reaction API blip must not cost a message.
+test("a rejecting fast-ack is logged and never derails the sweep", async () => {
+  const logs = [];
+  const { queue, cursors, producer } = await build(
+    { convs: [{ conversation_id: 9 }], convMsgs: { 9: msgRun(1, 3) } },
+    { logs, fastAck: async (item) => { throw new Error(`reactions down for ${item.id}`); } },
+  );
+  await producer.pollOnce();
+  assert.equal(queue.itemsInState("queued").length, 3);   // every item still enqueued
+  assert.equal(cursors.getCursor("conversations", 9), 3); // sweep ran to completion
+  assert.equal(logs.filter((m) => m.includes("fast-ack failed")).length, 3);
+});
+
+test("re-seen items are not re-acked (at most one ack per item, ever)", async () => {
+  const acked = [];
+  const state = { convs: [{ conversation_id: 9 }], convMsgs: { 9: msgRun(1, 2) } };
+  const { cursors, producer } = await build(state, { fastAck: async (item) => { acked.push(item.id); } });
+  await producer.pollOnce();
+  assert.deepEqual(acked, ["conv-msg:1001", "conv-msg:1002"]);
+  // Rewind the cursor so the SAME messages are refetched and re-offered to the queue: the
+  // enqueue is a no-op (dedup by id) and so is the ack.
+  await cursors.setCursor("conversations", 9, 0);
+  await producer.pollOnce();
+  assert.deepEqual(acked, ["conv-msg:1001", "conv-msg:1002"]);
 });
 
 test("first-sight thread with no comments does not mark as read", async () => {
