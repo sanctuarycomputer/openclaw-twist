@@ -118,6 +118,32 @@ test("transient failure rides the backoff ladder then dead-letters loudly", asyn
   assert.ok(calls.reacts.some((r) => r[2] === "❌"));
 });
 
+// A suppressed incomplete_turn placeholder makes runTurn throw so the item retries instead
+// of being recorded answered. That failure lands while the ⏳ is on the message, and the
+// next attempt can be an hour out — clearing it in the meantime tells the human "nothing is
+// happening here" and then flickers it back. It stays until the item is genuinely terminal.
+test("retryable failure keeps the ⏳ on the message; only a terminal outcome clears it", async () => {
+  const clock = { t: T0 };
+  const { queue, consumer, calls } = await harness({
+    clock,
+    runTurn: async () => { throw new Error("incomplete-turn fallback suppressed — retrying"); },
+    items: [baseItem("conv-msg:500")],
+  });
+  await drain(consumer);
+  assert.equal(queue.get("conv-msg:500").state, "queued");
+  assert.equal(queue.get("conv-msg:500").nextAttemptAt, T0 + BACKOFF_MS[0]);
+  assert.deepEqual(calls.reacts.map((r) => `${r[1]}:${r[2]}`), ["add:⏳"]); // nothing removed
+
+  for (let attempt = 2; attempt <= MAX_ATTEMPTS; attempt++) {
+    clock.t = queue.get("conv-msg:500").nextAttemptAt;
+    await drain(consumer);
+  }
+  assert.equal(queue.get("conv-msg:500").state, "failed");
+  assert.equal(calls.reacts.filter((r) => r[1] === "remove" && r[2] === "⏳").length, 1); // exactly once, at the end
+  assert.ok(calls.reacts.some((r) => r[2] === "❌"));
+  assert.equal(calls.replies.length, 1); // the sender is told, rather than left with a stale ⏳
+});
+
 test("permanent errors classify to skipped:gone without retries", async () => {
   const err = Object.assign(new Error("Message not found"), { status: 404 });
   const { queue, consumer } = await harness({ runTurn: async () => { throw err; }, items: [baseItem("conv-msg:500")] });

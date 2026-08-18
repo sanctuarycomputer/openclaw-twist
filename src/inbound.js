@@ -9,7 +9,7 @@ import {
 import { resolveInboundRouteEnvelopeBuilderWithRuntime } from "openclaw/plugin-sdk/inbound-envelope";
 import { getTwistRuntime } from "./runtime.js";
 import { resolveRequireMention } from "./config.js";
-import { contentMentionsBot, cleanTwistMarkup } from "./routing.js";
+import { contentMentionsBot, cleanTwistMarkup, isIncompleteTurnFallback } from "./routing.js";
 import { postToTwist } from "./outbound.js";
 
 const CHANNEL_ID = "twist";
@@ -109,8 +109,14 @@ export async function admissionVerdict({ message, account, cfg }) {
  * @param {object} p.client  TwistClient (for delivery)
  * @param {(u:object)=>void} [p.statusSink]
  * @param {{admit: boolean, admission: string, commandAuthorized: boolean}} [p.verdict] pre-computed admission verdict; when omitted, computed internally
+ * @param {(outcome:{delivered?: boolean, suppressed?: string})=>void} [p.onDelivery]
+ *   Called once per non-empty payload the dispatcher produces, AFTER the deliver decision:
+ *   `{delivered:true}` for a real post, `{suppressed:"incomplete-turn"}` for openclaw's
+ *   incomplete_turn placeholder (never posted — see isIncompleteTurnFallback). The caller
+ *   owns what that means for the turn: the queue consumer uses it to fail-and-retry a turn
+ *   whose ONLY output was the placeholder, instead of recording the item answered.
  */
-export async function handleTwistInbound({ message, account, cfg, runtime, client, statusSink, verdict }) {
+export async function handleTwistInbound({ message, account, cfg, runtime, client, statusSink, verdict, onDelivery }) {
   const core = getTwistRuntime();
   const rawBody = cleanTwistMarkup((message.text ?? "").trim());
   if (!rawBody) return;
@@ -183,6 +189,14 @@ export async function handleTwistInbound({ message, account, cfg, runtime, clien
       deliver: async (payload) => {
         const text = typeof payload === "string" ? payload : (payload?.text ?? "");
         if (!text.trim()) return;
+        // openclaw's incomplete_turn placeholder is NOT an answer — posting it burns the
+        // user's request (the item records `done`) over what is usually a transient flake.
+        // Drop it here and tell the caller, which decides whether to retry the whole turn.
+        if (isIncompleteTurnFallback(text)) {
+          runtime.log?.(`twist: suppressed incomplete_turn fallback for ${message.peerId} (not delivered): ${text.slice(0, 120)}`);
+          onDelivery?.({ suppressed: "incomplete-turn" });
+          return;
+        }
         const res = await postToTwist({
           client,
           kind: message.kind === "thread" ? "thread" : "conv",
@@ -190,6 +204,7 @@ export async function handleTwistInbound({ message, account, cfg, runtime, clien
           text,
         });
         if (!res?.suppressed) statusSink?.({ lastOutboundAt: Date.now() });
+        onDelivery?.(res?.suppressed ? { suppressed: "cron-alert" } : { delivered: true });
       },
       onError: (err, info) => {
         runtime.error?.(`twist ${info?.kind ?? "reply"} delivery failed: ${String(err)}`);

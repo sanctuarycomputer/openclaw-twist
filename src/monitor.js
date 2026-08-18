@@ -17,6 +17,7 @@ import {
   routingPeer,
   buildTranscript,
   resolveOutboundTarget,
+  turnDeliveryVerdict,
 } from "./routing.js";
 import { admissionVerdict, handleTwistInbound } from "./inbound.js";
 import { postToTwist } from "./outbound.js";
@@ -213,6 +214,14 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
   const runTurn = async (item, { commandAuthorized }) => {
     const message = await toNormalizedMessage(item, { withContext: true });
     log(`dispatching ${message.kind} ${message.peerId} from ${message.senderName}`);
+    // A turn whose ONLY output was openclaw's incomplete_turn placeholder produced no
+    // answer. Delivery already dropped the placeholder (see handleTwistInbound), so the
+    // human sees nothing — and if we returned normally the consumer would record the item
+    // `done` and the request would be gone. Fail instead: the item goes back on the retry
+    // ladder (30s/2m/10m/1h…) and, only if every attempt burns, dead-letters loudly with
+    // the in-place apology and the ops alert. Observed live: a transient flake consumed a
+    // user's thread mention, with the placeholder posted as if it were the reply.
+    const deliveries = [];
     await handleTwistInbound({
       message,
       account,
@@ -221,7 +230,11 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
       client,
       statusSink,
       verdict: { admit: true, admission: "dispatch", commandAuthorized },
+      onDelivery: (outcome) => deliveries.push(outcome),
     });
+    if (turnDeliveryVerdict(deliveries).retryAsIncompleteTurn) {
+      throw new Error("incomplete-turn fallback suppressed — retrying");
+    }
   };
 
   // Boot recovery: did the bot already answer this item before the crash? True when a

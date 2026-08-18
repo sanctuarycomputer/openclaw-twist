@@ -7,6 +7,8 @@ import {
   buildTranscript,
   stripPreHeaderNarration,
   isBareCronFailureAlert,
+  isIncompleteTurnFallback,
+  turnDeliveryVerdict,
   classifyConversation,
   shouldRespondToConversation,
   shouldRespondToThread,
@@ -116,6 +118,44 @@ test("stripPreHeaderNarration fence tracking: mismatched closers and indented ps
   // A properly closed fence followed by a real header outside it still strips.
   const closedThenHeader = "narration\n```\nquoted stuff\n```\n" + header + "\n\nbody";
   assert.equal(stripPreHeaderNarration(closedThenHeader), `${header}\n\nbody`);
+});
+
+// Delivered live as if it were the answer, which recorded the item `done` — a transient
+// platform flake ate a user's request with no retry. Both openclaw variants share a prefix.
+test("isIncompleteTurnFallback matches openclaw's placeholder, in both variants", () => {
+  assert.equal(
+    isIncompleteTurnFallback("⚠️ Agent couldn't generate a response. Note: some tool actions may have already been executed — please verify before retrying."),
+    true,
+  );
+  assert.equal(isIncompleteTurnFallback("⚠️ Agent couldn't generate a response. Please try again."), true);
+  // Leading whitespace from a block dispatcher, and any future suffix, still match.
+  assert.equal(isIncompleteTurnFallback("\n  ⚠️ Agent couldn't generate a response. Something new here."), true);
+  assert.equal(isIncompleteTurnFallback("⚠️ Agent couldn’t generate a response. Please try again."), true); // typographic apostrophe
+});
+
+test("isIncompleteTurnFallback leaves real replies alone", () => {
+  assert.equal(isIncompleteTurnFallback("Sure — the Q3 number is 41%."), false);
+  assert.equal(isIncompleteTurnFallback("⚠️ I couldn't find that thread — can you link it?"), false);
+  // Only a leading match suppresses: an answer that QUOTES the placeholder must still post.
+  assert.equal(
+    isIncompleteTurnFallback("Here's what the gateway said:\n\n⚠️ Agent couldn't generate a response. Please try again."),
+    false,
+  );
+  assert.equal(isIncompleteTurnFallback(""), false);
+  assert.equal(isIncompleteTurnFallback(undefined), false);
+});
+
+test("turnDeliveryVerdict retries only when the placeholder was the turn's ONLY output", () => {
+  const fallback = { suppressed: "incomplete-turn" };
+  assert.deepEqual(turnDeliveryVerdict([fallback]), { delivered: false, retryAsIncompleteTurn: true });
+  // Answered, then trailed a placeholder block: retrying would post the answer twice.
+  assert.deepEqual(turnDeliveryVerdict([{ delivered: true }, fallback]), { delivered: true, retryAsIncompleteTurn: false });
+  assert.deepEqual(turnDeliveryVerdict([{ delivered: true }]), { delivered: true, retryAsIncompleteTurn: false });
+  // A deliberately suppressed bare cron alert IS the intended outcome, not a failed turn.
+  assert.deepEqual(turnDeliveryVerdict([{ suppressed: "cron-alert" }]), { delivered: true, retryAsIncompleteTurn: false });
+  // No payloads at all (e.g. an empty reply) is not this failure mode — unchanged behavior.
+  assert.deepEqual(turnDeliveryVerdict([]), { delivered: false, retryAsIncompleteTurn: false });
+  assert.deepEqual(turnDeliveryVerdict(undefined), { delivered: false, retryAsIncompleteTurn: false });
 });
 
 test("isBareCronFailureAlert: quoted-alert replies and oversized messages are NOT suppressed", () => {

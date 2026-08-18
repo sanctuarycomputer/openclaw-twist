@@ -122,16 +122,21 @@ export function createConsumer({ queue, botUserId, now, log, classifyPeer, admis
   // Bookkeeping ON TOP OF an already-failed turn: classify the error and record the verdict
   // (gone / dead-letter / retry with backoff). May throw — settle() contains it.
   async function recordFailure(item, err) {
-    await safeReact(item, "remove", "⏳");
     if (isPermanentError(err)) {
+      await safeReact(item, "remove", "⏳"); // terminal: nothing is coming, don't leave it pending
       await queue.transition(item.id, { state: "skipped", reason: "gone", lastError: String(err) }, now());
       return;
     }
     const attempts = queue.get(item.id)?.attempts ?? item.attempts;
     if (attempts >= MAX_ATTEMPTS) {
+      await safeReact(item, "remove", "⏳"); // terminal: deadLetter replaces it with ❌
       await deadLetter(item, String(err), attempts);
       return;
     }
+    // RETRYABLE: the ⏳ deliberately STAYS. The item is still going to be answered — the
+    // next attempt is up to an hour out, and clearing the marker in the meantime tells the
+    // human "nothing is happening here" for the whole gap, then flickers it back. The
+    // reaction is idempotent, so the retry's claim-time add is a no-op.
     const delay = BACKOFF_MS[Math.min(attempts - 1, BACKOFF_MS.length - 1)];
     log(`turn failed for ${item.id} (attempt ${attempts}), retrying in ${delay}ms: ${String(err)}`);
     await queue.transition(item.id, { state: "queued", nextAttemptAt: now() + delay, lastError: String(err) }, now());

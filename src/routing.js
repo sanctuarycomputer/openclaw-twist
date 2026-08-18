@@ -165,6 +165,49 @@ export function isBareCronFailureAlert(text) {
   return /^⚠️ Cron job "[^"]+" failed: /.test(s);
 }
 
+/**
+ * openclaw's `incomplete_turn` fallback — the placeholder it substitutes when an attempt
+ * produced no usable assistant turn (empty response, reasoning-only, length-terminal,
+ * provider error). Source: `resolveIncompleteTurnPayloadText` in openclaw 2026.6.11
+ * (`dist/selection-*.js`), which emits one of two strings sharing this prefix:
+ *
+ *   "⚠️ Agent couldn't generate a response. Note: some tool actions may have already been
+ *    executed — please verify before retrying."   (side effects possible)
+ *   "⚠️ Agent couldn't generate a response. Please try again."
+ *
+ * This is diagnostic scaffolding, not an answer. Delivering it consumes the user's request:
+ * the queue records the item `done` (a payload WAS produced), so a transient platform flake
+ * silently costs a real message. Detecting it lets the channel suppress the post and fail
+ * the turn instead, handing the item to the retry ladder that already exists for every other
+ * transient failure. Matched on the PREFIX so both variants (and any future suffix) are
+ * caught, and tolerant of either apostrophe in case the host's copy is ever typographic.
+ */
+export function isIncompleteTurnFallback(text) {
+  return /^\s*⚠️ Agent couldn['’]t generate a response/.test(String(text ?? ""));
+}
+
+/**
+ * Fold one turn's per-payload delivery outcomes into a verdict.
+ *
+ * The rule that matters: retry ONLY when the incomplete_turn placeholder was the turn's
+ * sole output. A turn that answered and then trailed a placeholder block has already served
+ * the human — retrying it would post the real answer a second time. A payload suppressed
+ * for any OTHER reason (the redundant bare cron alert) counts as delivered: dropping it was
+ * the intended outcome, not a failure.
+ *
+ * @param {Array<{delivered?: boolean, suppressed?: string}>} outcomes
+ * @returns {{delivered: boolean, retryAsIncompleteTurn: boolean}}
+ */
+export function turnDeliveryVerdict(outcomes) {
+  let delivered = false;
+  let sawIncompleteTurn = false;
+  for (const outcome of outcomes ?? []) {
+    if (outcome?.suppressed === "incomplete-turn") sawIncompleteTurn = true;
+    else delivered = true;
+  }
+  return { delivered, retryAsIncompleteTurn: sawIncompleteTurn && !delivered };
+}
+
 /** Channel default recipients to notify, or null to use Twist's default. */
 export function channelDefaultRecipients(channel) {
   if (channel && channel.use_default_recipients && Array.isArray(channel.default_recipients) && channel.default_recipients.length) {
