@@ -17,12 +17,14 @@ import {
   routingPeer,
   buildTranscript,
   resolveOutboundTarget,
+  turnDeliveryVerdict,
+  fastAckDecision,
 } from "./routing.js";
 import { admissionVerdict, handleTwistInbound } from "./inbound.js";
 import { postToTwist } from "./outbound.js";
 import { createQueueStore } from "./queue.js";
 import { createProducer } from "./producer.js";
-import { createConsumer } from "./consumer.js";
+import { createConsumer, REPLAY_HORIZON_MS } from "./consumer.js";
 import { getTwistRuntime } from "./runtime.js";
 
 const ITEM_FETCH_LIMIT = 30;
@@ -103,8 +105,6 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
   const queueEntry = acquireQueueStore(queuePath, log);
   await queueEntry.ready;
   const queue = queueEntry.store;
-
-  const producer = createProducer({ client, queue, cursors, botUserId, freshSinceTs, now: Date.now, log, abortSignal });
 
   // ---------------------------------------------------------------- helpers
 
@@ -215,6 +215,14 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
   const runTurn = async (item, { commandAuthorized }) => {
     const message = await toNormalizedMessage(item, { withContext: true });
     log(`dispatching ${message.kind} ${message.peerId} from ${message.senderName}`);
+    // A turn whose ONLY output was openclaw's incomplete_turn placeholder produced no
+    // answer. Delivery already dropped the placeholder (see handleTwistInbound), so the
+    // human sees nothing — and if we returned normally the consumer would record the item
+    // `done` and the request would be gone. Fail instead: the item goes back on the retry
+    // ladder (30s/2m/10m/1h…) and, only if every attempt burns, dead-letters loudly with
+    // the in-place apology and the ops alert. Observed live: a transient flake consumed a
+    // user's thread mention, with the placeholder posted as if it were the reply.
+    const deliveries = [];
     await handleTwistInbound({
       message,
       account,
@@ -223,7 +231,11 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
       client,
       statusSink,
       verdict: { admit: true, admission: "dispatch", commandAuthorized },
+      onDelivery: (outcome) => deliveries.push(outcome),
     });
+    const { retry } = turnDeliveryVerdict(deliveries);
+    if (retry === "incomplete-turn") throw new Error("incomplete-turn fallback suppressed — retrying");
+    if (retry === "delivery-failed") throw new Error("reply delivery to Twist failed — retrying");
   };
 
   // Boot recovery: did the bot already answer this item before the crash? True when a
@@ -256,6 +268,42 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
     }
   }
 
+  // ---------------------------------------------------- injected producer effects
+
+  /**
+   * Fast ack: the ⏳ that tells a human "seen" is added at INGESTION, not at claim.
+   *
+   * The claim-time ⏳ is only as fast as the consumer reaches the item, and the consumer
+   * takes one item per peer per tick — so a mention landing in a thread with 15 unprocessed
+   * comments in front of it went unacknowledged for 15 ticks (over a minute at the default
+   * cadence). The product contract is ⏳ within ~5s of the mention, so it moves here.
+   *
+   * Only messages the bot would actually answer get one — an ack we don't honor is worse
+   * than none: any container where the bot is @mentioned, plus EVERY message in a 1:1 DM
+   * (DMs need no mention). A group DM message without a mention gets nothing.
+   *
+   * The replay horizon is re-checked HERE, not just at claim time. Paging forward from a
+   * stale cursor after a long outage can enqueue hundreds of items the consumer will
+   * immediately condemn as `stale` — in a 1:1 DM (where no mention is needed) that is a
+   * reaction call each, run sequentially in front of consumer.tick(). Acking them would be
+   * both a lie and a self-inflicted stall.
+   *
+   * The consumer still adds ⏳ when it claims (safeReact tolerates the duplicate — Twist
+   * treats a repeated reaction from the same user as a no-op), and its normal remove-⏳ →
+   * ✅ / ❌ lifecycle clears this reaction with no extra bookkeeping. The one outcome with
+   * no reaction step of its own is a SKIP, so the consumer clears the ack there explicitly
+   * (see `wasFastAcked`) — an acknowledged mention must never be left wearing ⏳ forever.
+   */
+  async function shouldFastAck(item) {
+    const decision = fastAckDecision(item, { botUserId, nowMs: Date.now(), replayHorizonMs: REPLAY_HORIZON_MS });
+    if (decision !== "peer-kind") return decision === "ack";
+    return (await participantKind(item.conversationId)) === "dm";
+  }
+  async function fastAck(item) {
+    if (!(await shouldFastAck(item))) return;
+    await react(item, "add", "⏳"); // react() is already best-effort; the producer contains throws anyway
+  }
+
   const alert = async (text) => {
     try {
       const { kind, id } = resolveOutboundTarget(null, account.defaultTo);
@@ -272,6 +320,10 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
       id: item.kind === "conv" ? item.conversationId : item.threadId,
       text,
     });
+
+  // Built here rather than at the top of the function so `fastAck` (and the helpers it
+  // leans on) are already in scope.
+  const producer = createProducer({ client, queue, cursors, botUserId, freshSinceTs, now: Date.now, log, abortSignal, fastAck });
 
   const consumer = createConsumer({
     queue, botUserId, now: Date.now, log,

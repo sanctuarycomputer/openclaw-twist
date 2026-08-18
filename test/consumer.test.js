@@ -4,7 +4,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createQueueStore } from "../src/queue.js";
-import { createConsumer, BACKOFF_MS, MAX_ATTEMPTS, MAX_GLOBAL_TURNS, HIGH_WATER, HUNG_TURN_ALERT_MS, REPLAY_HORIZON_MS, isPermanentError } from "../src/consumer.js";
+import { createConsumer, BACKOFF_MS, MAX_ATTEMPTS, MAX_GLOBAL_TURNS, HIGH_WATER, HUNG_TURN_ALERT_MS, REPLAY_HORIZON_MS, isPermanentError, syncSkipReason } from "../src/consumer.js";
 
 const BOT = 634870;
 const T0 = 1_785_900_000_000;
@@ -116,6 +116,32 @@ test("transient failure rides the backoff ladder then dead-letters loudly", asyn
   assert.equal(calls.replies.length, 1);            // in-place apology
   assert.equal(calls.alerts.length, 1);             // ops alert
   assert.ok(calls.reacts.some((r) => r[2] === "❌"));
+});
+
+// A suppressed incomplete_turn placeholder makes runTurn throw so the item retries instead
+// of being recorded answered. That failure lands while the ⏳ is on the message, and the
+// next attempt can be an hour out — clearing it in the meantime tells the human "nothing is
+// happening here" and then flickers it back. It stays until the item is genuinely terminal.
+test("retryable failure keeps the ⏳ on the message; only a terminal outcome clears it", async () => {
+  const clock = { t: T0 };
+  const { queue, consumer, calls } = await harness({
+    clock,
+    runTurn: async () => { throw new Error("incomplete-turn fallback suppressed — retrying"); },
+    items: [baseItem("conv-msg:500")],
+  });
+  await drain(consumer);
+  assert.equal(queue.get("conv-msg:500").state, "queued");
+  assert.equal(queue.get("conv-msg:500").nextAttemptAt, T0 + BACKOFF_MS[0]);
+  assert.deepEqual(calls.reacts.map((r) => `${r[1]}:${r[2]}`), ["add:⏳"]); // nothing removed
+
+  for (let attempt = 2; attempt <= MAX_ATTEMPTS; attempt++) {
+    clock.t = queue.get("conv-msg:500").nextAttemptAt;
+    await drain(consumer);
+  }
+  assert.equal(queue.get("conv-msg:500").state, "failed");
+  assert.equal(calls.reacts.filter((r) => r[1] === "remove" && r[2] === "⏳").length, 1); // exactly once, at the end
+  assert.ok(calls.reacts.some((r) => r[2] === "❌"));
+  assert.equal(calls.replies.length, 1); // the sender is told, rather than left with a stale ⏳
 });
 
 test("permanent errors classify to skipped:gone without retries", async () => {
@@ -302,6 +328,158 @@ test("HIGH_WATER alert fires once when queue depth exceeds the threshold, not ag
   assert.equal(calls.alerts.filter((a) => a.includes("high-water")).length, 1); // no re-alert
   gates.forEach((g) => g());
   await consumer.idle();
+});
+
+// ------------------------------------------------------------------- skip-drain
+
+// A thread item, for the drain tests: the flavor decides which sync-cheap check condemns it.
+const histItem = (id, i, over = {}) =>
+  baseItem(id, { kind: "thread", peerId: "thread:7", threadId: 7, messageId: 900 + i, objIndex: i, postedTs: SEC - 900 + i, ...over });
+
+test("syncSkipReason decides exactly the checks that need no peer lookup", () => {
+  const at = (over) => syncSkipReason(histItem("x", 0, over), T0, BOT);
+  assert.equal(at({ firstSightBacklog: true }), "backlog");
+  assert.equal(at({ postedTs: SEC - 25 * 3600 }), "stale");
+  assert.equal(at({ content: "no mention here" }), "no-mention");
+  assert.equal(at({}), null);                                            // a fresh thread mention
+  assert.equal(at({ kind: "conv", content: "no mention here" }), null);  // dm-vs-groupdm is async
+});
+
+// One claim per peer per tick is the right guard for TURNS, but it used to apply to items
+// that were never going to get one: a cold thread's history walked past at one item per
+// 5s tick, and the @mention sitting behind it waited every one of those ticks for even a ⏳.
+test("skip-drain: a whole unanswerable history clears in ONE tick and the mention is claimed in the same pass", async () => {
+  const history = Array.from({ length: 15 }, (_, i) => {
+    const flavor = i % 3;
+    return histItem(`hist-${i}`, i,
+      flavor === 0 ? { content: "just chatter" }              // no-mention
+      : flavor === 1 ? { firstSightBacklog: true }            // backlog
+      : { postedTs: SEC - 25 * 3600 + i });                   // stale
+  });
+  const mention = histItem("hist-mention", 99, { postedTs: SEC - 10 });
+  const { queue, consumer, calls } = await harness({ items: [...history, mention] });
+
+  await consumer.tick();
+  await flushMicrotasks();
+
+  const reasons = history.map((h) => queue.get(h.id));
+  assert.equal(reasons.every((r) => r.state === "skipped"), true);
+  assert.deepEqual(reasons.map((r) => r.reason).filter((r, i, a) => a.indexOf(r) === i).sort(), ["backlog", "no-mention", "stale"]);
+  assert.equal(reasons.every((r) => r.attempts === 0), true); // never claimed: no attempt burned
+  assert.deepEqual(calls.turns, ["hist-mention"]);            // claimed in the SAME tick
+  await consumer.idle();
+  assert.equal(queue.get("hist-mention").state, "done");
+});
+
+test("inline skips cost neither a peer slot nor turn budget: other peers still fill the global cap", async () => {
+  const gates = [];
+  const history = Array.from({ length: 15 }, (_, i) => histItem(`hist-${i}`, i, { content: "just chatter" }));
+  const mentions = ["A", "B", "C", "D"].map((p, i) =>
+    baseItem(`m-${p}`, { kind: "thread", peerId: `thread:${p}`, threadId: p, messageId: 700 + i, objIndex: 99, postedTs: SEC - 100 + i }));
+  const { queue, consumer, calls } = await harness({
+    items: [...history, ...mentions],
+    runTurn: async (item) => { calls.turns.push(item.id); await new Promise((resolve) => gates.push(resolve)); },
+  });
+
+  await consumer.tick();
+  await flushMicrotasks();
+
+  assert.equal(history.every((h) => queue.get(h.id).state === "skipped"), true);
+  assert.deepEqual(calls.turns, ["m-A", "m-B", "m-C"]);  // 15 skips later, all 3 slots still available
+  assert.equal(queue.get("m-D").state, "queued");        // and the global cap still bites
+  gates.forEach((g) => g());
+  await consumer.idle();
+});
+
+// dm-vs-groupdm decides whether a mention is even required, and it is an awaited lookup —
+// so conversation items must keep going the long way round.
+test("conversation items still take the async path (classifyPeer is consulted)", async () => {
+  const seen = [];
+  const { queue, consumer, calls } = await harness({
+    items: [baseItem("conv-msg:1", { content: "plain, no mention" })],
+    classifyPeer: async (item) => { seen.push(item.id); return "groupdm"; },
+  });
+  await drain(consumer);
+  assert.deepEqual(seen, ["conv-msg:1"]); // NOT decided inline
+  assert.equal(queue.get("conv-msg:1").state, "skipped");
+  assert.equal(queue.get("conv-msg:1").reason, "no-mention");
+  assert.equal(calls.turns.length, 0);
+});
+
+// The drain must not inherit the claim loop's gates: `selectClaimable` returns NOTHING once
+// the global turn budget is spent, which is exactly the load this was built for.
+test("skip-drain runs with every turn slot occupied: 10 items settle, no turn started", async () => {
+  const gates = [];
+  const busy = Array.from({ length: MAX_GLOBAL_TURNS }, (_, i) => baseItem(`busy-${i}`, { peerId: `conv:busy-${i}` }));
+  const { queue, consumer, calls } = await harness({
+    items: busy,
+    runTurn: async (item) => { calls.turns.push(item.id); await new Promise((resolve) => gates.push(resolve)); },
+  });
+  await consumer.tick();
+  await flushMicrotasks();
+  assert.equal(calls.turns.length, MAX_GLOBAL_TURNS); // every slot taken, nothing free
+
+  const skippable = Array.from({ length: 10 }, (_, i) => histItem(`late-${i}`, i, { content: "just chatter" }));
+  await queue.enqueueAll(skippable, T0);
+  await consumer.tick();
+  await flushMicrotasks();
+
+  assert.equal(skippable.every((s) => queue.get(s.id).state === "skipped"), true);
+  assert.equal(calls.turns.length, MAX_GLOBAL_TURNS); // still no new turn — a skip is not a turn
+  gates.forEach((g) => g());
+  await consumer.idle();
+});
+
+// ...nor the per-peer gate: a claimed mention makes its peer busy, and the siblings queued
+// behind it are precisely the history we want gone.
+test("skip-drain clears siblings on a peer that is already busy with a claimed turn", async () => {
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const { queue, consumer, calls } = await harness({
+    items: [histItem("hist-mention", 50)],
+    runTurn: async (item) => { calls.turns.push(item.id); await gate; },
+  });
+  await consumer.tick();
+  await flushMicrotasks();
+  assert.deepEqual(calls.turns, ["hist-mention"]); // peer thread:7 is now busy
+
+  const siblings = Array.from({ length: 5 }, (_, i) => histItem(`sib-${i}`, 60 + i, { content: "just chatter" }));
+  await queue.enqueueAll(siblings, T0);
+  await consumer.tick();
+  await flushMicrotasks();
+
+  assert.equal(siblings.every((s) => queue.get(s.id).state === "skipped"), true);
+  assert.equal(queue.get("hist-mention").state, "processing"); // the live turn is untouched
+  release();
+  await consumer.idle();
+});
+
+// The ingestion ⏳ (added by the producer's fast-ack) has no owner on the skip path — the
+// remove-⏳ → ✅/❌ cycle only runs for items that reach a turn. Without this, a mention that
+// is acked and then DENIED wears "seen, working on it" forever.
+test("a skip clears the ingestion ⏳ — but only for items that could have been acked", async () => {
+  const { queue, consumer, calls } = await harness({
+    items: [
+      baseItem("conv-msg:denied"),                                                    // mention → acked, then denied
+      histItem("thread-comment:stale", 1, { postedTs: SEC - 25 * 3600, enqueuedAt: T0 - 25 * 3600 * 1000 }), // mention → acked when fresh, now stale
+      baseItem("conv-msg:quiet", { peerId: "conv:quiet", content: "no mention" }),     // never ack-worthy
+      histItem("thread-comment:backlog", 2, { firstSightBacklog: true }),              // mention, but backlog is never acked
+      // A plain 1:1 DM message: enqueued fresh and fast-acked with NO mention (DMs need
+      // none), still queued 25h later, now skipped as stale. No sync-skip path classifies the
+      // peer, so `kind` is unknown — treating an unclassified conv item as possibly-acked is
+      // the only thing that clears this ⏳.
+      baseItem("conv-msg:dm-stale", { peerId: "conv:dm", content: "any news?", postedTs: SEC - 25 * 3600, enqueuedAt: T0 - 25 * 3600 * 1000 }),
+      // ...whereas one that was ALREADY stale when it arrived was never acked: no futile
+      // reaction call, however many of them an outage drains.
+      baseItem("conv-msg:dm-born-stale", { peerId: "conv:born", content: "any news?", postedTs: SEC - 25 * 3600, enqueuedAt: T0 }),
+    ],
+    admission: async () => ({ admit: false, admission: "deny", commandAuthorized: false }),
+  });
+  await drain(consumer);
+  const cleared = calls.reacts.filter((r) => r[1] === "remove" && r[2] === "⏳").map((r) => r[0]).sort();
+  assert.deepEqual(cleared, ["conv-msg:denied", "conv-msg:dm-stale", "thread-comment:stale"]);
+  assert.equal(calls.reacts.some((r) => ["conv-msg:quiet", "thread-comment:backlog", "conv-msg:dm-born-stale"].includes(r[0])), false);
+  assert.equal(queue.get("conv-msg:denied").reason, "admission:deny");
 });
 
 test("hung-turn alert fires once after HUNG_TURN_ALERT_MS, not again next tick", async () => {

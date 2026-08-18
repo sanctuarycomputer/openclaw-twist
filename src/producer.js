@@ -9,8 +9,50 @@ const ITEM_FETCH_LIMIT = 30;
 // the next poll resumes exactly where this one stopped.
 export const MAX_PAGES_PER_POLL = 10;
 
-export function createProducer({ client, queue, cursors, botUserId, freshSinceTs, now, log, abortSignal }) {
+/**
+ * @param {object} deps
+ * @param {(item: object) => Promise<void>} [deps.fastAck]
+ *   Best-effort "we've seen you" side effect, fired once per NEWLY-enqueued, non-backlog
+ *   item right after its batch is durably persisted. The ⏳ a human waits for used to be
+ *   added at CLAIM time, so a mention sitting behind N unprocessed items in the same
+ *   thread got no visible acknowledgement for N consumer ticks. Acking at ingestion makes
+ *   that latency independent of queue depth. WHICH items actually get a reaction is not
+ *   decided here (this layer stays transport-only) — the injected implementation applies
+ *   the mention/DM rules. Defaults to a no-op.
+ */
+export function createProducer({ client, queue, cursors, botUserId, freshSinceTs, now, log, abortSignal, fastAck = async () => {} }) {
   const isBacklog = (firstSight, postedTs) => firstSight && !(typeof postedTs === "number" && postedTs >= freshSinceTs);
+
+  /**
+   * Persist a batch, THEN ack it. Durability first, always: an ack is cosmetic, but a ⏳ on
+   * a message that never made it into the queue is a promise we can't keep.
+   *
+   * "Newly enqueued" is knowable without changing enqueueAll's `added` count return (other
+   * callers, and queue.test.js, rely on it): `queue.has` is exactly enqueueAll's dedup
+   * predicate (live items OR tombstones), and nothing awaits between this filter and the
+   * enqueue, so the filtered list IS the set enqueueAll adds. A re-seen item is filtered out
+   * here and therefore never re-acked.
+   *
+   * Acks are awaited in order rather than fired off in parallel — a first-sight DM sweep can
+   * carry a whole fetch window, and a burst of reaction calls is exactly what a rate limiter
+   * punishes. Each one is contained: a rejection is logged and the sweep continues. Because
+   * the loop is serial it also checks the abort signal between acks: on shutdown the items
+   * are already durable, so the remaining (purely cosmetic) reactions are worth abandoning
+   * rather than holding the process open for.
+   */
+  async function enqueueAcked(items) {
+    const fresh = items.filter((it) => !queue.has(it.id));
+    await queue.enqueueAll(fresh, now());
+    for (const item of fresh) {
+      if (abortSignal?.aborted) break;
+      if (item.firstSightBacklog) continue; // never answered → never acknowledged
+      try {
+        await fastAck(item);
+      } catch (err) {
+        log(`fast-ack failed for ${item.id}: ${String(err)}`);
+      }
+    }
+  }
 
   function toItem({ raw, kind, peerId, conversationId, threadId, channelId, firstSight }) {
     return {
@@ -35,7 +77,7 @@ export function createProducer({ client, queue, cursors, botUserId, freshSinceTs
    * obj_index 1691). Paging ascending from `cursor + 1` means the cursor can only ever move
    * across items we actually saw.
    *
-   * Ordering per page: enqueueAll(page N) → setCursor(max of page N) → page N+1. A crash
+   * Ordering per page: enqueueAcked(page N) → setCursor(max of page N) → page N+1. A crash
    * anywhere in the walk loses nothing; at worst the next boot refetches one page.
    *
    * @param {(fromObjIndex:number) => Promise<any[]>} fetchPage
@@ -46,7 +88,7 @@ export function createProducer({ client, queue, cursors, botUserId, freshSinceTs
     let cur = cursor;
     for (let page = 0; page < MAX_PAGES_PER_POLL; page++) {
       const batch = (await fetchPage(cur + 1)) ?? [];
-      await queue.enqueueAll(toItems(batch, cur), now());
+      await enqueueAcked(toItems(batch, cur));
       const next = advanceCursor(cur, batch);
       // advanceCursor never goes backwards, so `stalled` means the page carried nothing
       // above the cursor — a full page like that would otherwise loop forever.
@@ -81,7 +123,7 @@ export function createProducer({ client, queue, cursors, botUserId, freshSinceTs
     if (firstSight) {
       // First sight IS the backlog baseline: take the newest window (desc) and start there.
       const messages = (await client.getConversationMessages(convId, { limit: ITEM_FETCH_LIMIT, signal: abortSignal })) ?? [];
-      await queue.enqueueAll(toItems(messages, -1), now());
+      await enqueueAcked(toItems(messages, -1));
       await cursors.setCursor("conversations", convId, advanceCursor(-1, messages));
       return;
     }
@@ -115,7 +157,7 @@ export function createProducer({ client, queue, cursors, botUserId, freshSinceTs
           log(`thread post fetch failed ${threadId}: ${String(err)}`);
         }
       }
-      await queue.enqueueAll(items, now());
+      await enqueueAcked(items);
       nextCursor = advanceCursor(-1, comments);
       await cursors.setCursor("threads", threadId, nextCursor);
     } else {

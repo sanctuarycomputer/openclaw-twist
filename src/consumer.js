@@ -1,6 +1,6 @@
 // State-machine orchestration. All effects are injected; nothing here touches
 // the network or the SDK directly, so the whole delivery guarantee is testable.
-import { contentMentionsBot } from "./routing.js";
+import { contentMentionsBot, fastAckDecision } from "./routing.js";
 
 export const BACKOFF_MS = [30_000, 120_000, 600_000, 3_600_000, 3_600_000];
 export const MAX_ATTEMPTS = 6;
@@ -22,6 +22,29 @@ export function isPermanentError(err) {
   const status = err?.status ?? err?.statusCode;
   if (status === 404 || status === 410) return true;
   return /not found|does not exist|deleted/i.test(String(err?.message ?? ""));
+}
+
+/**
+ * The part of the policy that needs NO async work and NO peer classification:
+ * backlog, past the replay horizon, or a thread item with no @mention. Returns the skip
+ * reason, or null when the item needs the full (awaited) verdict.
+ *
+ * Split out so tick() can drain condemned items INLINE, without paying a peer slot and a
+ * turn budget slot each. Per-peer serialization means one claimed item blocks its peer for
+ * the whole tick, so a cold thread carrying 15 unanswerable comments used to take 15 ticks
+ * to walk past them — and the @mention behind them waited every one of those ticks. These
+ * three checks are exactly the ones that can be decided from the item alone.
+ *
+ * Conversation items are deliberately NOT decided here beyond backlog/stale: the mention
+ * requirement depends on whether the conversation is a 1:1 DM (open) or a group DM
+ * (mention-only), and that is an awaited lookup.
+ */
+export function syncSkipReason(item, nowMs, botUserId) {
+  if (item.firstSightBacklog) return "backlog";
+  // postedTs is in seconds.
+  if (nowMs - (item.postedTs ?? 0) * 1000 > REPLAY_HORIZON_MS) return "stale";
+  if (item.kind !== "conv" && !contentMentionsBot(item.content, botUserId)) return "no-mention";
+  return null;
 }
 
 /**
@@ -59,17 +82,48 @@ export function createConsumer({ queue, botUserId, now, log, classifyPeer, admis
     }
   }
 
+  // Defense in depth: tick() already drains anything syncSkipReason condemns, but this path
+  // must stand alone — it is what boot-recovered and requeued items come back through, and
+  // the sync checks are cheap. They run BEFORE the (network-hitting) peer classification and
+  // the mention test: a backlog or stale item costs nothing to drop.
   async function policyVerdict(item) {
-    if (item.firstSightBacklog) return { skip: "backlog" };
-    // Checked BEFORE the (network-hitting) peer classification and the mention test: a stale
-    // item costs nothing to drop. postedTs is in seconds.
-    if (now() - (item.postedTs ?? 0) * 1000 > REPLAY_HORIZON_MS) return { skip: "stale" };
+    const sync = syncSkipReason(item, now(), botUserId);
+    if (sync) return { skip: sync };
     const kind = item.kind === "conv" ? await classifyPeer(item) : "thread";
-    if (kind !== "dm" && !contentMentionsBot(item.content, botUserId)) return { skip: "no-mention" };
+    if (kind !== "dm" && !contentMentionsBot(item.content, botUserId)) return { skip: "no-mention", kind };
     const adm = await admission(item);
-    if (!adm.admit) return { skip: `admission:${adm.admission}` };
-    return { commandAuthorized: adm.commandAuthorized };
+    if (!adm.admit) return { skip: `admission:${adm.admission}`, kind };
+    return { commandAuthorized: adm.commandAuthorized, kind };
   }
+
+  /**
+   * Is this item plausibly already wearing an ingestion-time ⏳? Mirrors the producer's
+   * fast-ack rule (any @mention, or any message in a 1:1 DM; never backlog). A skip is the
+   * one terminal outcome with no reaction step of its own, so without this a mention that is
+   * acked at ingestion and then DENIED (or skipped as stale) would wear "seen, working on
+   * it" forever.
+   *
+   * `kind` (dm vs groupdm) is only known once the peer has been classified, and NO sync-skip
+   * path classifies — so an unknown kind on a conversation item is treated as possibly-acked.
+   * That deliberately fails toward removing: a 1:1 DM message needs no mention to be acked,
+   * so without this a plain DM message skipped as stale keeps its ⏳ forever. The cost of
+   * guessing wrong (a group DM item that was never acked) is one swallowed API call.
+   *
+   * @param {string} [kind] "dm" | "groupdm" | "thread", when the peer has been classified
+   */
+  const wasFastAcked = (item, kind) => {
+    // Re-run the producer's own rule AS OF INGESTION — `enqueuedAt`, not now(). That is the
+    // moment the ack decision was made, and it matters: an item that was already past the
+    // replay horizon when it arrived was never acked, so after a long outage a mass `stale`
+    // drain issues zero futile reaction calls instead of one per item.
+    const decision = fastAckDecision(item, {
+      botUserId,
+      nowMs: item.enqueuedAt ?? now(),
+      replayHorizonMs: REPLAY_HORIZON_MS,
+    });
+    if (decision !== "peer-kind") return decision === "ack";
+    return kind === undefined || kind === "dm";
+  };
 
   /**
    * Terminal failure: the item will never be tried again. Loud on purpose — ❌ reaction,
@@ -86,16 +140,21 @@ export function createConsumer({ queue, botUserId, now, log, classifyPeer, admis
   // Bookkeeping ON TOP OF an already-failed turn: classify the error and record the verdict
   // (gone / dead-letter / retry with backoff). May throw — settle() contains it.
   async function recordFailure(item, err) {
-    await safeReact(item, "remove", "⏳");
     if (isPermanentError(err)) {
+      await safeReact(item, "remove", "⏳"); // terminal: nothing is coming, don't leave it pending
       await queue.transition(item.id, { state: "skipped", reason: "gone", lastError: String(err) }, now());
       return;
     }
     const attempts = queue.get(item.id)?.attempts ?? item.attempts;
     if (attempts >= MAX_ATTEMPTS) {
+      await safeReact(item, "remove", "⏳"); // terminal: deadLetter replaces it with ❌
       await deadLetter(item, String(err), attempts);
       return;
     }
+    // RETRYABLE: the ⏳ deliberately STAYS. The item is still going to be answered — the
+    // next attempt is up to an hour out, and clearing the marker in the meantime tells the
+    // human "nothing is happening here" for the whole gap, then flickers it back. The
+    // reaction is idempotent, so the retry's claim-time add is a no-op.
     const delay = BACKOFF_MS[Math.min(attempts - 1, BACKOFF_MS.length - 1)];
     log(`turn failed for ${item.id} (attempt ${attempts}), retrying in ${delay}ms: ${String(err)}`);
     await queue.transition(item.id, { state: "queued", nextAttemptAt: now() + delay, lastError: String(err) }, now());
@@ -109,6 +168,7 @@ export function createConsumer({ queue, botUserId, now, log, classifyPeer, admis
           // Every silently-dropped message is a support ticket waiting to happen: log the
           // reason (backlog / no-mention / admission:<verdict>) for ALL skips, not just denials.
           log(`skip ${item.id} (${item.peerId}): ${verdict.skip}`);
+          if (wasFastAcked(item, verdict.kind)) await safeReact(item, "remove", "⏳");
           await queue.transition(item.id, { state: "skipped", reason: verdict.skip }, now());
           return;
         }
@@ -141,6 +201,43 @@ export function createConsumer({ queue, botUserId, now, log, classifyPeer, admis
       }
     } finally {
       inFlight.delete(item.peerId);
+    }
+  }
+
+  /**
+   * PRE-PASS, run before any claiming: settle every queued item the sync-cheap policy
+   * already condemns.
+   *
+   * Deliberately outside the claim loop, and therefore outside BOTH of its gates. The claim
+   * loop can only look at items `selectClaimable` will hand it, which excludes busy peers and
+   * returns nothing at all once the global turn budget is spent — precisely the conditions
+   * this drain exists for. Under 3 in-flight turns, or behind a claimed mention on the same
+   * peer, a claim-loop drain would settle nothing while a cold thread's history piled up.
+   *
+   * Dropping those gates is safe because a skip is not a turn: it touches no session, posts
+   * nothing, and runs no agent. Per-peer serialization protects a peer's conversational
+   * ordering and the global cap protects the box — a terminal transition threatens neither.
+   * The one gate that IS kept is `nextAttemptAt`: an item waiting out its backoff is not yet
+   * due, and short-circuiting its ladder here would change retry semantics.
+   */
+  async function drainSyncSkippable() {
+    for (const item of queue.itemsInState("queued")) {
+      if (item.nextAttemptAt > now()) continue;
+      const reason = syncSkipReason(item, now(), botUserId);
+      if (!reason) continue;
+      log(`skip ${item.id} (${item.peerId}): ${reason}`);
+      // A stale item may be wearing an ingestion ⏳ (backlog is never acked, and an
+      // unmentioned thread item was never ack-worthy) — clear it so it doesn't leak.
+      if (wasFastAcked(item)) await safeReact(item, "remove", "⏳");
+      try {
+        await queue.transition(item.id, { state: "skipped", reason }, now());
+      } catch (err) {
+        // The item is still `queued`, so the next pass would hand it straight back. Bail out
+        // like a failed claim rather than hammering a store that can't persist this tick.
+        log(`skip persist failed for ${item.id}: ${String(err)}`);
+        await alert(`twist queue: skip persist failed for ${item.id} — stranded until restart`).catch(() => {});
+        return;
+      }
     }
   }
 
@@ -192,6 +289,9 @@ export function createConsumer({ queue, botUserId, now, log, classifyPeer, admis
             await alert(`twist queue: turn for ${f.id} (${peerId}) running > ${HUNG_TURN_ALERT_MS / 60000}min`).catch(() => {});
           }
         }
+        // Drain first, claim second: the whole point is that an unanswerable backlog never
+        // stands between a mention and its turn, so the mention is claimable in THIS tick.
+        await drainSyncSkippable();
         while (true) {
           const item = queue.selectClaimable(now(), new Set(inFlight.keys()), MAX_GLOBAL_TURNS - inFlight.size);
           if (!item) break;
