@@ -89,11 +89,18 @@ export function shouldRespondToThread({ directMention }) {
 /**
  * Build a transcript (chronological, excluding the trigger item) of recent items
  * so the agent gets surrounding context, not just the single trigger message.
- * @param {Array<{id:any,creator_name?:string,content?:string}>} items
+ * Input order is NOT trusted: the bare comments/get / conversation_messages/get
+ * calls return DESCENDING (newest first), so the items are sorted by obj_index
+ * before windowing — otherwise `.slice(-limit)` keeps the OLDEST slice of the
+ * fetch and the agent loses exactly the most recent context. Items lacking
+ * obj_index all tie at 0, so for them the stable sort preserves input order —
+ * chronology is only guaranteed when obj_index is present (Twist always sets it).
+ * @param {Array<{id:any,obj_index?:number,creator_name?:string,content?:string}>} items
  * @param {string|number} triggerId  id of the item being dispatched (excluded)
  */
 export function buildTranscript(items, triggerId, limit = 15) {
-  return (items ?? [])
+  return [...(items ?? [])]
+    .sort((a, b) => (a.obj_index ?? 0) - (b.obj_index ?? 0))
     .filter((it) => String(it.id) !== String(triggerId))
     .slice(-limit)
     .map((it) => ({ name: it.creator_name, content: it.content }));
