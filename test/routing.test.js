@@ -119,6 +119,25 @@ test("isBareCronFailureAlert matches the gateway's bare cron alert and nothing e
   assert.equal(isBareCronFailureAlert(""), false);
 });
 
+test("buildTranscript keeps the NEWEST items in chronological order given a descending fetch", () => {
+  // comments/get and conversation_messages/get return DESCENDING (newest first)
+  // when called without from_obj_index — exactly how buildContext fetches. The
+  // transcript must still carry the newest window, oldest→newest.
+  const descending = Array.from({ length: 30 }, (_, i) => ({
+    id: 30 - i,
+    obj_index: 30 - i,
+    creator_name: "U",
+    content: `msg ${30 - i}`,
+  }));
+  // trigger = the newest (id 30); the message posted just before it (id 29) MUST survive
+  const transcript = buildTranscript(descending, 30, 15);
+  assert.equal(transcript.length, 15);
+  assert.deepEqual(
+    transcript.map((t) => t.content),
+    Array.from({ length: 15 }, (_, i) => `msg ${15 + i}`), // 15..29, chronological
+  );
+});
+
 test("cleanTwistMarkup rewrites mention markup to @Name", () => {
   assert.equal(
     cleanTwistMarkup("hey [Stacksbot](twist-mention://634870) vet [Acme](twist-group-mention://9)"),
