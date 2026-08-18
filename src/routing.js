@@ -113,38 +113,56 @@ export function buildTranscript(items, triggerId, limit = 15) {
  * prompt discipline has not stopped it — so the outbound path drops anything
  * preceding the first report-header line. Messages with no such header (ordinary
  * conversational replies) pass through untouched, as does a header quoted inside
- * a fenced code block.
+ * a fenced code block (fences close only on a matching ``` / ~~~ character, and
+ * lines indented ≥4 spaces are content, not delimiters — per CommonMark).
+ *
+ * Known, ACCEPTED alteration: a conversational reply that intros a re-posted
+ * report ("Here's the digest you asked about:\n\n# … via [Stacksbot](…)") loses
+ * the intro line — the header-first contract is enforced even on re-posts. The
+ * report body itself always survives, and the strip is logged by the caller.
  */
 export function stripPreHeaderNarration(text) {
   if (!text) return text;
   const lines = text.split("\n");
-  let inFence = false;
+  let fenceChar = null; // "`" or "~" while inside a fence, else null
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
-    if (/^\s*(```|~~~)/.test(line)) {
-      inFence = !inFence;
+    const fence = /^ {0,3}(`{3,}|~{3,})/.exec(line);
+    if (fence) {
+      const ch = fence[1][0];
+      if (fenceChar === null) fenceChar = ch; // open
+      else if (ch === fenceChar) fenceChar = null; // matching close only
       continue;
     }
-    if (!inFence && /^#\s.*via \[Stacksbot\]\(/.test(line)) {
+    if (fenceChar === null && /^#\s.*via \[Stacksbot\]\(/.test(line)) {
       if (i === 0) return text;
-      const before = lines.slice(0, i).join("\n");
-      if (!before.trim()) return lines.slice(i).join("\n"); // whitespace-only preamble
       return lines.slice(i).join("\n");
     }
   }
   return text;
 }
 
+// A real gateway alert is one short paragraph. Anything longer or containing a
+// blank line is treated as NOT the bare alert — e.g. an agent reply that OPENS by
+// quoting the alert verbatim and then explains. Both bounds fail toward posting
+// (worst case: a duplicate alert), never toward losing a message.
+const BARE_ALERT_MAX_CHARS = 600;
+
 /**
- * The gateway's bare per-occurrence cron failure alert (`⚠️ Cron job "<name>"
- * failed: <error>`). It is fully redundant: the jobs-status reconciler posts a
- * formatted, deduped `# Job Failure Alert` for the same failure (with job name,
- * link, and transition-based dedup), and repeat failures are already surfaced via
- * the Jobs DB status fields, the Logs ledger, and the daily health review. The
- * outbound path drops this shape so every failure alerts exactly once.
+ * The gateway's bare per-occurrence cron failure alert
+ * (`⚠️ Cron job "<name>" failed: <error>` — emitted by openclaw's
+ * dispatchCronFailureDestinationNotifications). It is fully redundant: the
+ * jobs-status reconciler posts a formatted, deduped `# Job Failure Alert` for the
+ * same failure (with job name, link, and transition-based dedup), and repeat
+ * failures are already surfaced via the Jobs DB status fields, the Logs ledger,
+ * and the daily health review. The outbound path drops this shape — bounded to
+ * short, single-paragraph messages so a reply merely QUOTING an alert (followed
+ * by structured explanation) can never be swallowed.
  */
 export function isBareCronFailureAlert(text) {
-  return /^⚠️ Cron job "[^"]+" failed: /.test(text ?? "");
+  const s = text ?? "";
+  if (s.length > BARE_ALERT_MAX_CHARS || s.includes("\n\n")) return false;
+  return /^⚠️ Cron job "[^"]+" failed: /.test(s);
 }
 
 /** Channel default recipients to notify, or null to use Twist's default. */

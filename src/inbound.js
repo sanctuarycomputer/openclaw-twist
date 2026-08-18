@@ -183,13 +183,13 @@ export async function handleTwistInbound({ message, account, cfg, runtime, clien
       deliver: async (payload) => {
         const text = typeof payload === "string" ? payload : (payload?.text ?? "");
         if (!text.trim()) return;
-        await postToTwist({
+        const res = await postToTwist({
           client,
           kind: message.kind === "thread" ? "thread" : "conv",
           id: message.kind === "thread" ? message.threadId : message.conversationId,
           text,
         });
-        statusSink?.({ lastOutboundAt: Date.now() });
+        if (!res?.suppressed) statusSink?.({ lastOutboundAt: Date.now() });
       },
       onError: (err, info) => {
         runtime.error?.(`twist ${info?.kind ?? "reply"} delivery failed: ${String(err)}`);

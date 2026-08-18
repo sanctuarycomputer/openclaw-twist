@@ -100,6 +100,39 @@ test("stripPreHeaderNarration drops leaked run narration before a report header"
   assert.equal(stripPreHeaderNarration(""), "");
 });
 
+test("stripPreHeaderNarration fence tracking: mismatched closers and indented pseudo-fences", () => {
+  const header = "# Recall Skill via [Stacksbot](https://x)";
+
+  // A ~~~ line inside a backtick fence does NOT close it (CommonMark: closers must
+  // match the opening character) — the header stays quoted, nothing is stripped.
+  const tildeInside = "look at this format:\n```\n~~~\n" + header + "\n```\ndone";
+  assert.equal(stripPreHeaderNarration(tildeInside), tildeInside);
+
+  // An indented (≥4 spaces) ``` line is content, not a fence delimiter — it must
+  // not close the surrounding fence and expose the quoted header.
+  const indentedInside = "before\n```\n    ```\n" + header + "\n```\nafter";
+  assert.equal(stripPreHeaderNarration(indentedInside), indentedInside);
+
+  // A properly closed fence followed by a real header outside it still strips.
+  const closedThenHeader = "narration\n```\nquoted stuff\n```\n" + header + "\n\nbody";
+  assert.equal(stripPreHeaderNarration(closedThenHeader), `${header}\n\nbody`);
+});
+
+test("isBareCronFailureAlert: quoted-alert replies and oversized messages are NOT suppressed", () => {
+  // An agent reply that OPENS by quoting the alert verbatim, then explains —
+  // structured (blank line) content must never be swallowed.
+  const quotedReply =
+    '⚠️ Cron job "notion:3ac1" failed: exec error — here is what happened and how I fixed it:\n\n1. The filter file was malformed\n2. Re-ran with the corrected body';
+  assert.equal(isBareCronFailureAlert(quotedReply), false);
+
+  // Oversized "alert" (way past any real gateway alert) fails open → posts.
+  const huge = '⚠️ Cron job "x" failed: ' + "e".repeat(700);
+  assert.equal(isBareCronFailureAlert(huge), false);
+
+  // A genuine bare alert with a short multiline error (no blank line) still matches.
+  assert.equal(isBareCronFailureAlert('⚠️ Cron job "x" failed: line one\nline two'), true);
+});
+
 test("isBareCronFailureAlert matches the gateway's bare cron alert and nothing else", () => {
   // The redundant bare alert observed in the thread (duplicates the reconciler's
   // formatted Job Failure Alert ~13 min later).
