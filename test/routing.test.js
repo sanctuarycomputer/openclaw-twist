@@ -5,6 +5,8 @@ import {
   resolveOutboundTarget,
   cleanTwistMarkup,
   buildTranscript,
+  stripPreHeaderNarration,
+  isBareCronFailureAlert,
   classifyConversation,
   shouldRespondToConversation,
   shouldRespondToThread,
@@ -70,6 +72,84 @@ test("buildTranscript excludes the trigger and keeps the other items in order", 
   const many = Array.from({ length: 20 }, (_, i) => ({ id: i, creator_name: "U", content: String(i) }));
   assert.equal(buildTranscript(many, 19, 5).length, 5);
   assert.deepEqual(buildTranscript(undefined, 1), []);
+});
+
+test("stripPreHeaderNarration drops leaked run narration before a report header", () => {
+  const header = "# Observations Digest Job via [Stacksbot](https://app.notion.com/p/390131fea2c7811c9557cda134dccd30)";
+  const body = `${header}\n\n*last 24h*\n\n- item one`;
+
+  // Leaked preamble before the header is dropped; report survives intact.
+  const leaked = `I now have the observations data. Let me compose the digest.\n\nBased on the query results, I have 20 observations.\n\n${body}`;
+  assert.equal(stripPreHeaderNarration(leaked), body);
+
+  // Header already first → untouched.
+  assert.equal(stripPreHeaderNarration(body), body);
+
+  // No report header at all (ordinary conversational reply) → untouched.
+  const chat = "Sounds good — I'll get that vetting run started now.";
+  assert.equal(stripPreHeaderNarration(chat), chat);
+
+  // Header inside a fenced code block does not count as a report header.
+  const quoted = "Here's what the report format looks like:\n```\n# Recall Skill via [Stacksbot](https://x)\n```\ndone";
+  assert.equal(stripPreHeaderNarration(quoted), quoted);
+
+  // Only whitespace before the header → normalized to header-first.
+  assert.equal(stripPreHeaderNarration(`\n\n${body}`), body);
+
+  // Empty/nullish input passes through.
+  assert.equal(stripPreHeaderNarration(""), "");
+});
+
+test("stripPreHeaderNarration fence tracking: mismatched closers and indented pseudo-fences", () => {
+  const header = "# Recall Skill via [Stacksbot](https://x)";
+
+  // A ~~~ line inside a backtick fence does NOT close it (CommonMark: closers must
+  // match the opening character) — the header stays quoted, nothing is stripped.
+  const tildeInside = "look at this format:\n```\n~~~\n" + header + "\n```\ndone";
+  assert.equal(stripPreHeaderNarration(tildeInside), tildeInside);
+
+  // An indented (≥4 spaces) ``` line is content, not a fence delimiter — it must
+  // not close the surrounding fence and expose the quoted header.
+  const indentedInside = "before\n```\n    ```\n" + header + "\n```\nafter";
+  assert.equal(stripPreHeaderNarration(indentedInside), indentedInside);
+
+  // A properly closed fence followed by a real header outside it still strips.
+  const closedThenHeader = "narration\n```\nquoted stuff\n```\n" + header + "\n\nbody";
+  assert.equal(stripPreHeaderNarration(closedThenHeader), `${header}\n\nbody`);
+});
+
+test("isBareCronFailureAlert: quoted-alert replies and oversized messages are NOT suppressed", () => {
+  // An agent reply that OPENS by quoting the alert verbatim, then explains —
+  // structured (blank line) content must never be swallowed.
+  const quotedReply =
+    '⚠️ Cron job "notion:3ac1" failed: exec error — here is what happened and how I fixed it:\n\n1. The filter file was malformed\n2. Re-ran with the corrected body';
+  assert.equal(isBareCronFailureAlert(quotedReply), false);
+
+  // Oversized "alert" (way past any real gateway alert) fails open → posts.
+  const huge = '⚠️ Cron job "x" failed: ' + "e".repeat(700);
+  assert.equal(isBareCronFailureAlert(huge), false);
+
+  // A genuine bare alert with a short multiline error (no blank line) still matches.
+  assert.equal(isBareCronFailureAlert('⚠️ Cron job "x" failed: line one\nline two'), true);
+});
+
+test("isBareCronFailureAlert matches the gateway's bare cron alert and nothing else", () => {
+  // The redundant bare alert observed in the thread (duplicates the reconciler's
+  // formatted Job Failure Alert ~13 min later).
+  assert.equal(
+    isBareCronFailureAlert('⚠️ Cron job "notion:3ac131fea2c7812f92e1fdc1f7b5de02" failed: ⚠️ 🛠️ Exec failed: `ntn api …`'),
+    true,
+  );
+  assert.equal(isBareCronFailureAlert('⚠️ Cron job "stacksbot-resync" failed: boom'), true);
+  // The reconciler's formatted alert opens with the report header — never matched.
+  assert.equal(
+    isBareCronFailureAlert('# Job Failure Alert via [Stacksbot](https://x)\n\n⚠️ Job **"Observe: Twist"** failed — …'),
+    false,
+  );
+  // Auto-disable notices and conversational mentions pass through.
+  assert.equal(isBareCronFailureAlert('⚠️ Cron job "x" has been auto-disabled after 5 consecutive schedule errors.'), false);
+  assert.equal(isBareCronFailureAlert('fyi: ⚠️ Cron job "x" failed: y'), false);
+  assert.equal(isBareCronFailureAlert(""), false);
 });
 
 test("buildTranscript keeps the NEWEST items in chronological order given a descending fetch", () => {

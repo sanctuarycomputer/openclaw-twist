@@ -3,7 +3,7 @@
 // "thread:<id>" or "conv:<id>" (optionally prefixed "twist:").
 import { createTwistClient } from "./twist-client.js";
 import { resolveTwistAccount } from "./config.js";
-import { parseTarget, resolveOutboundTarget, channelDefaultRecipients } from "./routing.js";
+import { parseTarget, resolveOutboundTarget, channelDefaultRecipients, stripPreHeaderNarration, isBareCronFailureAlert } from "./routing.js";
 
 export { parseTarget };
 
@@ -34,14 +34,28 @@ async function resolveThreadRecipients(client, threadId) {
   }
 }
 
-/** Post text to a Twist thread or conversation. Returns { messageId }. */
+/**
+ * Post text to a Twist thread or conversation. Returns { messageId } — or
+ * { messageId: undefined, suppressed: true } for the redundant bare cron
+ * failure alert (see isBareCronFailureAlert). Suppressions and strips are
+ * logged loudly (console → gateway logs) so a wrongly-eaten message is
+ * diagnosable, never a silent black hole.
+ */
 export async function postToTwist({ client, kind, id, text, recipients }) {
+  if (isBareCronFailureAlert(text)) {
+    console.warn(`[twist] suppressed bare cron failure alert to ${kind}:${id} (redundant with Job Failure Alert): ${String(text).slice(0, 160)}`);
+    return { messageId: undefined, suppressed: true };
+  }
+  const body = stripPreHeaderNarration(text);
+  if (body !== text) {
+    console.warn(`[twist] stripped ${text.length - body.length} chars of pre-header narration from post to ${kind}:${id}`);
+  }
   if (kind === "thread") {
     const resolved = recipients !== undefined ? recipients : await resolveThreadRecipients(client, id);
-    const res = await client.addThreadComment(id, text, { recipients: resolved });
+    const res = await client.addThreadComment(id, body, { recipients: resolved });
     return { messageId: res?.id != null ? String(res.id) : undefined };
   }
-  const res = await client.addConversationMessage(id, text);
+  const res = await client.addConversationMessage(id, body);
   return { messageId: res?.id != null ? String(res.id) : undefined };
 }
 
@@ -57,7 +71,11 @@ export const twistOutbound = {
   base: {
     deliveryMode: "direct",
     chunkerMode: "markdown",
-    textChunkLimit: 9000, // Twist messages are generous; keep well under any cap
+    // NOTE: inert in openclaw 2026.7.1-2 — no `chunker` fn is set and core doesn't
+    // default one, so sendText receives the FULL text in one unit. Kept as intent
+    // for when a chunker is wired; multi-part delivery today only happens via the
+    // inbound block dispatcher (one postToTwist per block).
+    textChunkLimit: 9000,
   },
   attachedResults: {
     channel: "twist",
