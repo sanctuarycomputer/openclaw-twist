@@ -4,7 +4,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createQueueStore } from "../src/queue.js";
-import { createConsumer, BACKOFF_MS, MAX_ATTEMPTS, MAX_GLOBAL_TURNS, HIGH_WATER, HUNG_TURN_ALERT_MS, REPLAY_HORIZON_MS, isPermanentError } from "../src/consumer.js";
+import { createConsumer, BACKOFF_MS, MAX_ATTEMPTS, MAX_GLOBAL_TURNS, HIGH_WATER, HUNG_TURN_ALERT_MS, REPLAY_HORIZON_MS, isPermanentError, syncSkipReason } from "../src/consumer.js";
 
 const BOT = 634870;
 const T0 = 1_785_900_000_000;
@@ -302,6 +302,102 @@ test("HIGH_WATER alert fires once when queue depth exceeds the threshold, not ag
   assert.equal(calls.alerts.filter((a) => a.includes("high-water")).length, 1); // no re-alert
   gates.forEach((g) => g());
   await consumer.idle();
+});
+
+// ------------------------------------------------------------------- skip-drain
+
+// A thread item, for the drain tests: the flavor decides which sync-cheap check condemns it.
+const histItem = (id, i, over = {}) =>
+  baseItem(id, { kind: "thread", peerId: "thread:7", threadId: 7, messageId: 900 + i, objIndex: i, postedTs: SEC - 900 + i, ...over });
+
+test("syncSkipReason decides exactly the checks that need no peer lookup", () => {
+  const at = (over) => syncSkipReason(histItem("x", 0, over), T0, BOT);
+  assert.equal(at({ firstSightBacklog: true }), "backlog");
+  assert.equal(at({ postedTs: SEC - 25 * 3600 }), "stale");
+  assert.equal(at({ content: "no mention here" }), "no-mention");
+  assert.equal(at({}), null);                                            // a fresh thread mention
+  assert.equal(at({ kind: "conv", content: "no mention here" }), null);  // dm-vs-groupdm is async
+});
+
+// One claim per peer per tick is the right guard for TURNS, but it used to apply to items
+// that were never going to get one: a cold thread's history walked past at one item per
+// 5s tick, and the @mention sitting behind it waited every one of those ticks for even a ⏳.
+test("skip-drain: a whole unanswerable history clears in ONE tick and the mention is claimed in the same pass", async () => {
+  const history = Array.from({ length: 15 }, (_, i) => {
+    const flavor = i % 3;
+    return histItem(`hist-${i}`, i,
+      flavor === 0 ? { content: "just chatter" }              // no-mention
+      : flavor === 1 ? { firstSightBacklog: true }            // backlog
+      : { postedTs: SEC - 25 * 3600 + i });                   // stale
+  });
+  const mention = histItem("hist-mention", 99, { postedTs: SEC - 10 });
+  const { queue, consumer, calls } = await harness({ items: [...history, mention] });
+
+  await consumer.tick();
+  await flushMicrotasks();
+
+  const reasons = history.map((h) => queue.get(h.id));
+  assert.equal(reasons.every((r) => r.state === "skipped"), true);
+  assert.deepEqual(reasons.map((r) => r.reason).filter((r, i, a) => a.indexOf(r) === i).sort(), ["backlog", "no-mention", "stale"]);
+  assert.equal(reasons.every((r) => r.attempts === 0), true); // never claimed: no attempt burned
+  assert.deepEqual(calls.turns, ["hist-mention"]);            // claimed in the SAME tick
+  await consumer.idle();
+  assert.equal(queue.get("hist-mention").state, "done");
+});
+
+test("inline skips cost neither a peer slot nor turn budget: other peers still fill the global cap", async () => {
+  const gates = [];
+  const history = Array.from({ length: 15 }, (_, i) => histItem(`hist-${i}`, i, { content: "just chatter" }));
+  const mentions = ["A", "B", "C", "D"].map((p, i) =>
+    baseItem(`m-${p}`, { kind: "thread", peerId: `thread:${p}`, threadId: p, messageId: 700 + i, objIndex: 99, postedTs: SEC - 100 + i }));
+  const { queue, consumer, calls } = await harness({
+    items: [...history, ...mentions],
+    runTurn: async (item) => { calls.turns.push(item.id); await new Promise((resolve) => gates.push(resolve)); },
+  });
+
+  await consumer.tick();
+  await flushMicrotasks();
+
+  assert.equal(history.every((h) => queue.get(h.id).state === "skipped"), true);
+  assert.deepEqual(calls.turns, ["m-A", "m-B", "m-C"]);  // 15 skips later, all 3 slots still available
+  assert.equal(queue.get("m-D").state, "queued");        // and the global cap still bites
+  gates.forEach((g) => g());
+  await consumer.idle();
+});
+
+// dm-vs-groupdm decides whether a mention is even required, and it is an awaited lookup —
+// so conversation items must keep going the long way round.
+test("conversation items still take the async path (classifyPeer is consulted)", async () => {
+  const seen = [];
+  const { queue, consumer, calls } = await harness({
+    items: [baseItem("conv-msg:1", { content: "plain, no mention" })],
+    classifyPeer: async (item) => { seen.push(item.id); return "groupdm"; },
+  });
+  await drain(consumer);
+  assert.deepEqual(seen, ["conv-msg:1"]); // NOT decided inline
+  assert.equal(queue.get("conv-msg:1").state, "skipped");
+  assert.equal(queue.get("conv-msg:1").reason, "no-mention");
+  assert.equal(calls.turns.length, 0);
+});
+
+// The ingestion ⏳ (added by the producer's fast-ack) has no owner on the skip path — the
+// remove-⏳ → ✅/❌ cycle only runs for items that reach a turn. Without this, a mention that
+// is acked and then DENIED wears "seen, working on it" forever.
+test("a skip clears the ingestion ⏳ — but only for items that could have been acked", async () => {
+  const { queue, consumer, calls } = await harness({
+    items: [
+      baseItem("conv-msg:denied"),                                                    // mention → acked, then denied
+      histItem("thread-comment:stale", 1, { postedTs: SEC - 25 * 3600 }),              // mention → acked, then inline stale
+      baseItem("conv-msg:quiet", { peerId: "conv:quiet", content: "no mention" }),     // never ack-worthy
+      histItem("thread-comment:backlog", 2, { firstSightBacklog: true }),              // mention, but backlog is never acked
+    ],
+    admission: async () => ({ admit: false, admission: "deny", commandAuthorized: false }),
+  });
+  await drain(consumer);
+  const cleared = calls.reacts.filter((r) => r[1] === "remove" && r[2] === "⏳").map((r) => r[0]).sort();
+  assert.deepEqual(cleared, ["conv-msg:denied", "thread-comment:stale"]);
+  assert.equal(calls.reacts.some((r) => r[0] === "conv-msg:quiet" || r[0] === "thread-comment:backlog"), false);
+  assert.equal(queue.get("conv-msg:denied").reason, "admission:deny");
 });
 
 test("hung-turn alert fires once after HUNG_TURN_ALERT_MS, not again next tick", async () => {

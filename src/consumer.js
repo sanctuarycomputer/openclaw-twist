@@ -25,6 +25,29 @@ export function isPermanentError(err) {
 }
 
 /**
+ * The part of the policy that needs NO async work and NO peer classification:
+ * backlog, past the replay horizon, or a thread item with no @mention. Returns the skip
+ * reason, or null when the item needs the full (awaited) verdict.
+ *
+ * Split out so tick() can drain condemned items INLINE, without paying a peer slot and a
+ * turn budget slot each. Per-peer serialization means one claimed item blocks its peer for
+ * the whole tick, so a cold thread carrying 15 unanswerable comments used to take 15 ticks
+ * to walk past them — and the @mention behind them waited every one of those ticks. These
+ * three checks are exactly the ones that can be decided from the item alone.
+ *
+ * Conversation items are deliberately NOT decided here beyond backlog/stale: the mention
+ * requirement depends on whether the conversation is a 1:1 DM (open) or a group DM
+ * (mention-only), and that is an awaited lookup.
+ */
+export function syncSkipReason(item, nowMs, botUserId) {
+  if (item.firstSightBacklog) return "backlog";
+  // postedTs is in seconds.
+  if (nowMs - (item.postedTs ?? 0) * 1000 > REPLAY_HORIZON_MS) return "stale";
+  if (item.kind !== "conv" && !contentMentionsBot(item.content, botUserId)) return "no-mention";
+  return null;
+}
+
+/**
  * @param {object} deps
  * @param {Map<string, {id:string, startedAt:number, hungAlerted:boolean}>} [deps.inFlight]
  *   peerId -> live turn. Injectable because per-peer exclusion and MAX_GLOBAL_TURNS must
@@ -59,17 +82,30 @@ export function createConsumer({ queue, botUserId, now, log, classifyPeer, admis
     }
   }
 
+  // Defense in depth: tick() already drains anything syncSkipReason condemns, but this path
+  // must stand alone — it is what boot-recovered and requeued items come back through, and
+  // the sync checks are cheap. They run BEFORE the (network-hitting) peer classification and
+  // the mention test: a backlog or stale item costs nothing to drop.
   async function policyVerdict(item) {
-    if (item.firstSightBacklog) return { skip: "backlog" };
-    // Checked BEFORE the (network-hitting) peer classification and the mention test: a stale
-    // item costs nothing to drop. postedTs is in seconds.
-    if (now() - (item.postedTs ?? 0) * 1000 > REPLAY_HORIZON_MS) return { skip: "stale" };
+    const sync = syncSkipReason(item, now(), botUserId);
+    if (sync) return { skip: sync };
     const kind = item.kind === "conv" ? await classifyPeer(item) : "thread";
-    if (kind !== "dm" && !contentMentionsBot(item.content, botUserId)) return { skip: "no-mention" };
+    if (kind !== "dm" && !contentMentionsBot(item.content, botUserId)) return { skip: "no-mention", kind };
     const adm = await admission(item);
-    if (!adm.admit) return { skip: `admission:${adm.admission}` };
-    return { commandAuthorized: adm.commandAuthorized };
+    if (!adm.admit) return { skip: `admission:${adm.admission}`, kind };
+    return { commandAuthorized: adm.commandAuthorized, kind };
   }
+
+  /**
+   * Is this item plausibly already wearing an ingestion-time ⏳? Mirrors the producer's
+   * fast-ack rule (any @mention, or any message in a 1:1 DM; never backlog). A skip is the
+   * one terminal outcome with no reaction step of its own, so without this a mention that is
+   * acked at ingestion and then DENIED (or claimed past the replay horizon) would wear
+   * "seen, working on it" forever. `kind` is only known once the peer has been classified;
+   * unknown means "not a DM", which is safe — the mention test still catches the ack.
+   */
+  const wasFastAcked = (item, kind) =>
+    !item.firstSightBacklog && (contentMentionsBot(item.content, botUserId) || kind === "dm");
 
   /**
    * Terminal failure: the item will never be tried again. Loud on purpose — ❌ reaction,
@@ -109,6 +145,7 @@ export function createConsumer({ queue, botUserId, now, log, classifyPeer, admis
           // Every silently-dropped message is a support ticket waiting to happen: log the
           // reason (backlog / no-mention / admission:<verdict>) for ALL skips, not just denials.
           log(`skip ${item.id} (${item.peerId}): ${verdict.skip}`);
+          if (wasFastAcked(item, verdict.kind)) await safeReact(item, "remove", "⏳");
           await queue.transition(item.id, { state: "skipped", reason: verdict.skip }, now());
           return;
         }
@@ -195,6 +232,31 @@ export function createConsumer({ queue, botUserId, now, log, classifyPeer, admis
         while (true) {
           const item = queue.selectClaimable(now(), new Set(inFlight.keys()), MAX_GLOBAL_TURNS - inFlight.size);
           if (!item) break;
+          // Drain the obviously-unanswerable INLINE: no peer slot, no turn budget, no
+          // settle() round-trip — just the terminal transition, then straight on to the next
+          // item. Claiming these was pure latency: one claim per peer per tick meant a cold
+          // thread's 15-comment history took 15 ticks (over a minute) to walk past, and the
+          // @mention sitting behind it waited every one of them. Now the history drains in a
+          // single tick and the mention is claimed in the same pass. Conversation items that
+          // clear the sync checks still go the long way round — dm-vs-groupdm is an awaited
+          // lookup — and settle() re-runs these same checks regardless.
+          const skipReason = syncSkipReason(item, now(), botUserId);
+          if (skipReason) {
+            log(`skip ${item.id} (${item.peerId}): ${skipReason}`);
+            // Only a stale item can be wearing an ingestion ⏳ here (backlog is never acked,
+            // and a no-mention thread item was never ack-worthy) — clear it so it doesn't leak.
+            if (wasFastAcked(item)) await safeReact(item, "remove", "⏳");
+            try {
+              await queue.transition(item.id, { state: "skipped", reason: skipReason }, now());
+            } catch (err) {
+              // The item is still `queued`, so selectClaimable would hand it straight back:
+              // continuing here is an infinite loop. Bail out of the pass like a failed claim.
+              log(`skip persist failed for ${item.id}: ${String(err)}`);
+              await alert(`twist queue: skip persist failed for ${item.id} — stranded until restart`).catch(() => {});
+              break;
+            }
+            continue;
+          }
           // Reserve the peer slot BEFORE the (awaited) claim persist, so a claim that's slow
           // to persist can't let another loop iteration double-claim the same peer.
           inFlight.set(item.peerId, { id: item.id, startedAt: now(), hungAlerted: false });
