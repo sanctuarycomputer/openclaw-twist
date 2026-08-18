@@ -35,12 +35,16 @@ export function createProducer({ client, queue, cursors, botUserId, freshSinceTs
    *
    * Acks are awaited in order rather than fired off in parallel — a first-sight DM sweep can
    * carry a whole fetch window, and a burst of reaction calls is exactly what a rate limiter
-   * punishes. Each one is contained: a rejection is logged and the sweep continues.
+   * punishes. Each one is contained: a rejection is logged and the sweep continues. Because
+   * the loop is serial it also checks the abort signal between acks: on shutdown the items
+   * are already durable, so the remaining (purely cosmetic) reactions are worth abandoning
+   * rather than holding the process open for.
    */
   async function enqueueAcked(items) {
     const fresh = items.filter((it) => !queue.has(it.id));
     await queue.enqueueAll(fresh, now());
     for (const item of fresh) {
+      if (abortSignal?.aborted) break;
       if (item.firstSightBacklog) continue; // never answered → never acknowledged
       try {
         await fastAck(item);

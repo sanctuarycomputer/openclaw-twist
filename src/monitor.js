@@ -18,12 +18,13 @@ import {
   buildTranscript,
   resolveOutboundTarget,
   turnDeliveryVerdict,
+  fastAckDecision,
 } from "./routing.js";
 import { admissionVerdict, handleTwistInbound } from "./inbound.js";
 import { postToTwist } from "./outbound.js";
 import { createQueueStore } from "./queue.js";
 import { createProducer } from "./producer.js";
-import { createConsumer } from "./consumer.js";
+import { createConsumer, REPLAY_HORIZON_MS } from "./consumer.js";
 import { getTwistRuntime } from "./runtime.js";
 
 const ITEM_FETCH_LIMIT = 30;
@@ -232,9 +233,9 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
       verdict: { admit: true, admission: "dispatch", commandAuthorized },
       onDelivery: (outcome) => deliveries.push(outcome),
     });
-    if (turnDeliveryVerdict(deliveries).retryAsIncompleteTurn) {
-      throw new Error("incomplete-turn fallback suppressed — retrying");
-    }
+    const { retry } = turnDeliveryVerdict(deliveries);
+    if (retry === "incomplete-turn") throw new Error("incomplete-turn fallback suppressed — retrying");
+    if (retry === "delivery-failed") throw new Error("reply delivery to Twist failed — retrying");
   };
 
   // Boot recovery: did the bot already answer this item before the crash? True when a
@@ -281,6 +282,12 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
    * than none: any container where the bot is @mentioned, plus EVERY message in a 1:1 DM
    * (DMs need no mention). A group DM message without a mention gets nothing.
    *
+   * The replay horizon is re-checked HERE, not just at claim time. Paging forward from a
+   * stale cursor after a long outage can enqueue hundreds of items the consumer will
+   * immediately condemn as `stale` — in a 1:1 DM (where no mention is needed) that is a
+   * reaction call each, run sequentially in front of consumer.tick(). Acking them would be
+   * both a lie and a self-inflicted stall.
+   *
    * The consumer still adds ⏳ when it claims (safeReact tolerates the duplicate — Twist
    * treats a repeated reaction from the same user as a no-op), and its normal remove-⏳ →
    * ✅ / ❌ lifecycle clears this reaction with no extra bookkeeping. The one outcome with
@@ -288,8 +295,8 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
    * (see `wasFastAcked`) — an acknowledged mention must never be left wearing ⏳ forever.
    */
   async function shouldFastAck(item) {
-    if (contentMentionsBot(item.content, botUserId)) return true;
-    if (item.kind !== "conv") return false; // threads are mention-only
+    const decision = fastAckDecision(item, { botUserId, nowMs: Date.now(), replayHorizonMs: REPLAY_HORIZON_MS });
+    if (decision !== "peer-kind") return decision === "ack";
     return (await participantKind(item.conversationId)) === "dm";
   }
   async function fastAck(item) {

@@ -1,6 +1,6 @@
 // State-machine orchestration. All effects are injected; nothing here touches
 // the network or the SDK directly, so the whole delivery guarantee is testable.
-import { contentMentionsBot } from "./routing.js";
+import { contentMentionsBot, fastAckDecision } from "./routing.js";
 
 export const BACKOFF_MS = [30_000, 120_000, 600_000, 3_600_000, 3_600_000];
 export const MAX_ATTEMPTS = 6;
@@ -100,12 +100,30 @@ export function createConsumer({ queue, botUserId, now, log, classifyPeer, admis
    * Is this item plausibly already wearing an ingestion-time ⏳? Mirrors the producer's
    * fast-ack rule (any @mention, or any message in a 1:1 DM; never backlog). A skip is the
    * one terminal outcome with no reaction step of its own, so without this a mention that is
-   * acked at ingestion and then DENIED (or claimed past the replay horizon) would wear
-   * "seen, working on it" forever. `kind` is only known once the peer has been classified;
-   * unknown means "not a DM", which is safe — the mention test still catches the ack.
+   * acked at ingestion and then DENIED (or skipped as stale) would wear "seen, working on
+   * it" forever.
+   *
+   * `kind` (dm vs groupdm) is only known once the peer has been classified, and NO sync-skip
+   * path classifies — so an unknown kind on a conversation item is treated as possibly-acked.
+   * That deliberately fails toward removing: a 1:1 DM message needs no mention to be acked,
+   * so without this a plain DM message skipped as stale keeps its ⏳ forever. The cost of
+   * guessing wrong (a group DM item that was never acked) is one swallowed API call.
+   *
+   * @param {string} [kind] "dm" | "groupdm" | "thread", when the peer has been classified
    */
-  const wasFastAcked = (item, kind) =>
-    !item.firstSightBacklog && (contentMentionsBot(item.content, botUserId) || kind === "dm");
+  const wasFastAcked = (item, kind) => {
+    // Re-run the producer's own rule AS OF INGESTION — `enqueuedAt`, not now(). That is the
+    // moment the ack decision was made, and it matters: an item that was already past the
+    // replay horizon when it arrived was never acked, so after a long outage a mass `stale`
+    // drain issues zero futile reaction calls instead of one per item.
+    const decision = fastAckDecision(item, {
+      botUserId,
+      nowMs: item.enqueuedAt ?? now(),
+      replayHorizonMs: REPLAY_HORIZON_MS,
+    });
+    if (decision !== "peer-kind") return decision === "ack";
+    return kind === undefined || kind === "dm";
+  };
 
   /**
    * Terminal failure: the item will never be tried again. Loud on purpose — ❌ reaction,
@@ -186,6 +204,43 @@ export function createConsumer({ queue, botUserId, now, log, classifyPeer, admis
     }
   }
 
+  /**
+   * PRE-PASS, run before any claiming: settle every queued item the sync-cheap policy
+   * already condemns.
+   *
+   * Deliberately outside the claim loop, and therefore outside BOTH of its gates. The claim
+   * loop can only look at items `selectClaimable` will hand it, which excludes busy peers and
+   * returns nothing at all once the global turn budget is spent — precisely the conditions
+   * this drain exists for. Under 3 in-flight turns, or behind a claimed mention on the same
+   * peer, a claim-loop drain would settle nothing while a cold thread's history piled up.
+   *
+   * Dropping those gates is safe because a skip is not a turn: it touches no session, posts
+   * nothing, and runs no agent. Per-peer serialization protects a peer's conversational
+   * ordering and the global cap protects the box — a terminal transition threatens neither.
+   * The one gate that IS kept is `nextAttemptAt`: an item waiting out its backoff is not yet
+   * due, and short-circuiting its ladder here would change retry semantics.
+   */
+  async function drainSyncSkippable() {
+    for (const item of queue.itemsInState("queued")) {
+      if (item.nextAttemptAt > now()) continue;
+      const reason = syncSkipReason(item, now(), botUserId);
+      if (!reason) continue;
+      log(`skip ${item.id} (${item.peerId}): ${reason}`);
+      // A stale item may be wearing an ingestion ⏳ (backlog is never acked, and an
+      // unmentioned thread item was never ack-worthy) — clear it so it doesn't leak.
+      if (wasFastAcked(item)) await safeReact(item, "remove", "⏳");
+      try {
+        await queue.transition(item.id, { state: "skipped", reason }, now());
+      } catch (err) {
+        // The item is still `queued`, so the next pass would hand it straight back. Bail out
+        // like a failed claim rather than hammering a store that can't persist this tick.
+        log(`skip persist failed for ${item.id}: ${String(err)}`);
+        await alert(`twist queue: skip persist failed for ${item.id} — stranded until restart`).catch(() => {});
+        return;
+      }
+    }
+  }
+
   return {
     inFlightCount: () => inFlight.size,
     // Test-only: await all settle() work currently tracked. NOT for production use —
@@ -234,34 +289,12 @@ export function createConsumer({ queue, botUserId, now, log, classifyPeer, admis
             await alert(`twist queue: turn for ${f.id} (${peerId}) running > ${HUNG_TURN_ALERT_MS / 60000}min`).catch(() => {});
           }
         }
+        // Drain first, claim second: the whole point is that an unanswerable backlog never
+        // stands between a mention and its turn, so the mention is claimable in THIS tick.
+        await drainSyncSkippable();
         while (true) {
           const item = queue.selectClaimable(now(), new Set(inFlight.keys()), MAX_GLOBAL_TURNS - inFlight.size);
           if (!item) break;
-          // Drain the obviously-unanswerable INLINE: no peer slot, no turn budget, no
-          // settle() round-trip — just the terminal transition, then straight on to the next
-          // item. Claiming these was pure latency: one claim per peer per tick meant a cold
-          // thread's 15-comment history took 15 ticks (over a minute) to walk past, and the
-          // @mention sitting behind it waited every one of them. Now the history drains in a
-          // single tick and the mention is claimed in the same pass. Conversation items that
-          // clear the sync checks still go the long way round — dm-vs-groupdm is an awaited
-          // lookup — and settle() re-runs these same checks regardless.
-          const skipReason = syncSkipReason(item, now(), botUserId);
-          if (skipReason) {
-            log(`skip ${item.id} (${item.peerId}): ${skipReason}`);
-            // Only a stale item can be wearing an ingestion ⏳ here (backlog is never acked,
-            // and a no-mention thread item was never ack-worthy) — clear it so it doesn't leak.
-            if (wasFastAcked(item)) await safeReact(item, "remove", "⏳");
-            try {
-              await queue.transition(item.id, { state: "skipped", reason: skipReason }, now());
-            } catch (err) {
-              // The item is still `queued`, so selectClaimable would hand it straight back:
-              // continuing here is an infinite loop. Bail out of the pass like a failed claim.
-              log(`skip persist failed for ${item.id}: ${String(err)}`);
-              await alert(`twist queue: skip persist failed for ${item.id} — stranded until restart`).catch(() => {});
-              break;
-            }
-            continue;
-          }
           // Reserve the peer slot BEFORE the (awaited) claim persist, so a claim that's slow
           // to persist can't let another loop iteration double-claim the same peer.
           inFlight.set(item.peerId, { id: item.id, startedAt: now(), hungAlerted: false });

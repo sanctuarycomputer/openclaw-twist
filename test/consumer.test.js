@@ -406,6 +406,54 @@ test("conversation items still take the async path (classifyPeer is consulted)",
   assert.equal(calls.turns.length, 0);
 });
 
+// The drain must not inherit the claim loop's gates: `selectClaimable` returns NOTHING once
+// the global turn budget is spent, which is exactly the load this was built for.
+test("skip-drain runs with every turn slot occupied: 10 items settle, no turn started", async () => {
+  const gates = [];
+  const busy = Array.from({ length: MAX_GLOBAL_TURNS }, (_, i) => baseItem(`busy-${i}`, { peerId: `conv:busy-${i}` }));
+  const { queue, consumer, calls } = await harness({
+    items: busy,
+    runTurn: async (item) => { calls.turns.push(item.id); await new Promise((resolve) => gates.push(resolve)); },
+  });
+  await consumer.tick();
+  await flushMicrotasks();
+  assert.equal(calls.turns.length, MAX_GLOBAL_TURNS); // every slot taken, nothing free
+
+  const skippable = Array.from({ length: 10 }, (_, i) => histItem(`late-${i}`, i, { content: "just chatter" }));
+  await queue.enqueueAll(skippable, T0);
+  await consumer.tick();
+  await flushMicrotasks();
+
+  assert.equal(skippable.every((s) => queue.get(s.id).state === "skipped"), true);
+  assert.equal(calls.turns.length, MAX_GLOBAL_TURNS); // still no new turn — a skip is not a turn
+  gates.forEach((g) => g());
+  await consumer.idle();
+});
+
+// ...nor the per-peer gate: a claimed mention makes its peer busy, and the siblings queued
+// behind it are precisely the history we want gone.
+test("skip-drain clears siblings on a peer that is already busy with a claimed turn", async () => {
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const { queue, consumer, calls } = await harness({
+    items: [histItem("hist-mention", 50)],
+    runTurn: async (item) => { calls.turns.push(item.id); await gate; },
+  });
+  await consumer.tick();
+  await flushMicrotasks();
+  assert.deepEqual(calls.turns, ["hist-mention"]); // peer thread:7 is now busy
+
+  const siblings = Array.from({ length: 5 }, (_, i) => histItem(`sib-${i}`, 60 + i, { content: "just chatter" }));
+  await queue.enqueueAll(siblings, T0);
+  await consumer.tick();
+  await flushMicrotasks();
+
+  assert.equal(siblings.every((s) => queue.get(s.id).state === "skipped"), true);
+  assert.equal(queue.get("hist-mention").state, "processing"); // the live turn is untouched
+  release();
+  await consumer.idle();
+});
+
 // The ingestion ⏳ (added by the producer's fast-ack) has no owner on the skip path — the
 // remove-⏳ → ✅/❌ cycle only runs for items that reach a turn. Without this, a mention that
 // is acked and then DENIED wears "seen, working on it" forever.
@@ -413,16 +461,24 @@ test("a skip clears the ingestion ⏳ — but only for items that could have bee
   const { queue, consumer, calls } = await harness({
     items: [
       baseItem("conv-msg:denied"),                                                    // mention → acked, then denied
-      histItem("thread-comment:stale", 1, { postedTs: SEC - 25 * 3600 }),              // mention → acked, then inline stale
+      histItem("thread-comment:stale", 1, { postedTs: SEC - 25 * 3600, enqueuedAt: T0 - 25 * 3600 * 1000 }), // mention → acked when fresh, now stale
       baseItem("conv-msg:quiet", { peerId: "conv:quiet", content: "no mention" }),     // never ack-worthy
       histItem("thread-comment:backlog", 2, { firstSightBacklog: true }),              // mention, but backlog is never acked
+      // A plain 1:1 DM message: enqueued fresh and fast-acked with NO mention (DMs need
+      // none), still queued 25h later, now skipped as stale. No sync-skip path classifies the
+      // peer, so `kind` is unknown — treating an unclassified conv item as possibly-acked is
+      // the only thing that clears this ⏳.
+      baseItem("conv-msg:dm-stale", { peerId: "conv:dm", content: "any news?", postedTs: SEC - 25 * 3600, enqueuedAt: T0 - 25 * 3600 * 1000 }),
+      // ...whereas one that was ALREADY stale when it arrived was never acked: no futile
+      // reaction call, however many of them an outage drains.
+      baseItem("conv-msg:dm-born-stale", { peerId: "conv:born", content: "any news?", postedTs: SEC - 25 * 3600, enqueuedAt: T0 }),
     ],
     admission: async () => ({ admit: false, admission: "deny", commandAuthorized: false }),
   });
   await drain(consumer);
   const cleared = calls.reacts.filter((r) => r[1] === "remove" && r[2] === "⏳").map((r) => r[0]).sort();
-  assert.deepEqual(cleared, ["conv-msg:denied", "thread-comment:stale"]);
-  assert.equal(calls.reacts.some((r) => r[0] === "conv-msg:quiet" || r[0] === "thread-comment:backlog"), false);
+  assert.deepEqual(cleared, ["conv-msg:denied", "conv-msg:dm-stale", "thread-comment:stale"]);
+  assert.equal(calls.reacts.some((r) => ["conv-msg:quiet", "thread-comment:backlog", "conv-msg:dm-born-stale"].includes(r[0])), false);
   assert.equal(queue.get("conv-msg:denied").reason, "admission:deny");
 });
 

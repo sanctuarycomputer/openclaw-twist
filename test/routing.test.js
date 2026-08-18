@@ -7,7 +7,9 @@ import {
   buildTranscript,
   stripPreHeaderNarration,
   isBareCronFailureAlert,
+  fastAckDecision,
   isIncompleteTurnFallback,
+  stripIncompleteTurnFallback,
   turnDeliveryVerdict,
   classifyConversation,
   shouldRespondToConversation,
@@ -120,42 +122,87 @@ test("stripPreHeaderNarration fence tracking: mismatched closers and indented ps
   assert.equal(stripPreHeaderNarration(closedThenHeader), `${header}\n\nbody`);
 });
 
-// Delivered live as if it were the answer, which recorded the item `done` — a transient
-// platform flake ate a user's request with no retry. Both openclaw variants share a prefix.
-test("isIncompleteTurnFallback matches openclaw's placeholder, in both variants", () => {
-  assert.equal(
-    isIncompleteTurnFallback("⚠️ Agent couldn't generate a response. Note: some tool actions may have already been executed — please verify before retrying."),
-    true,
+// The ack is a promise that a turn is coming, so it must never outrun what we'll answer.
+// Without the horizon check, a resumed container after a >24h outage acks hundreds of items
+// the consumer then condemns as stale — sequential reaction calls stalling the poll, and a
+// ⏳ on every one of them.
+test("fastAckDecision acknowledges only what the bot will actually answer", () => {
+  const HORIZON = 24 * 3600 * 1000;
+  const NOW = 1_785_900_000_000;
+  const SEC = NOW / 1000;
+  const decide = (over) => fastAckDecision(
+    { kind: "thread", content: `[Bot](twist-mention://${BOT}) hi`, postedTs: SEC - 60, firstSightBacklog: false, ...over },
+    { botUserId: BOT, nowMs: NOW, replayHorizonMs: HORIZON },
   );
-  assert.equal(isIncompleteTurnFallback("⚠️ Agent couldn't generate a response. Please try again."), true);
-  // Leading whitespace from a block dispatcher, and any future suffix, still match.
-  assert.equal(isIncompleteTurnFallback("\n  ⚠️ Agent couldn't generate a response. Something new here."), true);
-  assert.equal(isIncompleteTurnFallback("⚠️ Agent couldn’t generate a response. Please try again."), true); // typographic apostrophe
+  assert.equal(decide({}), "ack");                                     // fresh thread mention
+  assert.equal(decide({ kind: "thread-post" }), "ack");                // a thread's opening post
+  assert.equal(decide({ kind: "conv" }), "ack");                       // mention in any conversation
+  assert.equal(decide({ postedTs: SEC - 25 * 3600 }), "none");         // past the replay horizon
+  assert.equal(decide({ firstSightBacklog: true }), "none");           // never answered
+  assert.equal(decide({ content: "just chatter" }), "none");           // threads are mention-only
+  assert.equal(decide({ kind: "conv", content: "any news?" }), "peer-kind"); // 1:1 DM? must classify
+  // A stale DM message must not even reach the (network) classification.
+  assert.equal(decide({ kind: "conv", content: "any news?", postedTs: SEC - 25 * 3600 }), "none");
+  assert.equal(decide({ postedTs: undefined }), "none");               // no timestamp reads as ancient
+});
+
+// Delivered live as if it were the answer, which recorded the item `done` — a transient
+// platform flake ate a user's request with no retry. The three emission sites in openclaw
+// 2026.6.11 produce two standalone variants plus one that TRAILS real tool output.
+const FALLBACK_SIDE_EFFECTS = "⚠️ Agent couldn't generate a response. Note: some tool actions may have already been executed — please verify before retrying.";
+const FALLBACK_RETRY = "⚠️ Agent couldn't generate a response. Please try again.";
+
+test("isIncompleteTurnFallback matches openclaw's placeholder line in every emitted form", () => {
+  assert.equal(isIncompleteTurnFallback(FALLBACK_SIDE_EFFECTS), true);
+  assert.equal(isIncompleteTurnFallback(FALLBACK_RETRY), true);
+  assert.equal(isIncompleteTurnFallback("  ⚠️ Agent couldn't generate a response. Something new here."), true);
+  assert.equal(isIncompleteTurnFallback("⚠ Agent couldn't generate a response. Please try again."), true); // no variation selector
+  assert.equal(isIncompleteTurnFallback("⚠️ agent COULDN'T generate a response."), true);                  // openclaw's detector is /i
+  assert.equal(isIncompleteTurnFallback("⚠️ Agent couldn’t generate a response."), true);                  // typographic apostrophe
 });
 
 test("isIncompleteTurnFallback leaves real replies alone", () => {
   assert.equal(isIncompleteTurnFallback("Sure — the Q3 number is 41%."), false);
   assert.equal(isIncompleteTurnFallback("⚠️ I couldn't find that thread — can you link it?"), false);
-  // Only a leading match suppresses: an answer that QUOTES the placeholder must still post.
-  assert.equal(
-    isIncompleteTurnFallback("Here's what the gateway said:\n\n⚠️ Agent couldn't generate a response. Please try again."),
-    false,
-  );
+  assert.equal(isIncompleteTurnFallback("The gateway said: ⚠️ Agent couldn't generate a response."), false); // not line-leading
   assert.equal(isIncompleteTurnFallback(""), false);
   assert.equal(isIncompleteTurnFallback(undefined), false);
 });
 
-test("turnDeliveryVerdict retries only when the placeholder was the turn's ONLY output", () => {
+// openclaw's third site is `terminalToolPresentation.concat("\n\n", placeholder)` — real tool
+// output with the placeholder bolted on. Suppressing the whole payload there would throw away
+// work the human is owed; delivering it verbatim posts the scary warning under a real answer.
+test("stripIncompleteTurnFallback keeps real content and drops only the placeholder line", () => {
+  const presentation = "Ran `notion.query` and found 3 open tasks:\n\n- Ship the queue\n- Fix the cursor";
+  const mixed = presentation.concat("\n\n", FALLBACK_RETRY);
+  assert.deepEqual(stripIncompleteTurnFallback(mixed), { body: presentation, hadFallback: true });
+
+  // Placeholder-only payloads leave nothing behind — that's what marks the turn unanswered.
+  assert.deepEqual(stripIncompleteTurnFallback(FALLBACK_SIDE_EFFECTS), { body: "", hadFallback: true });
+  assert.deepEqual(stripIncompleteTurnFallback(`\n${FALLBACK_RETRY}\n`), { body: "", hadFallback: true });
+
+  // Untouched (and returned byte-identical) when there is no placeholder at all.
+  const real = "Here's the Q3 number: 41%.\n\nWant the breakdown?";
+  assert.deepEqual(stripIncompleteTurnFallback(real), { body: real, hadFallback: false });
+  assert.deepEqual(stripIncompleteTurnFallback(""), { body: "", hadFallback: false });
+  assert.deepEqual(stripIncompleteTurnFallback(undefined), { body: "", hadFallback: false });
+});
+
+test("turnDeliveryVerdict retries only when the turn delivered NOTHING", () => {
   const fallback = { suppressed: "incomplete-turn" };
-  assert.deepEqual(turnDeliveryVerdict([fallback]), { delivered: false, retryAsIncompleteTurn: true });
-  // Answered, then trailed a placeholder block: retrying would post the answer twice.
-  assert.deepEqual(turnDeliveryVerdict([{ delivered: true }, fallback]), { delivered: true, retryAsIncompleteTurn: false });
-  assert.deepEqual(turnDeliveryVerdict([{ delivered: true }]), { delivered: true, retryAsIncompleteTurn: false });
+  assert.deepEqual(turnDeliveryVerdict([fallback]), { delivered: false, retry: "incomplete-turn" });
+  // A post that threw is a LOST real message — the more serious reason, so it wins.
+  assert.deepEqual(turnDeliveryVerdict([{ failed: true }]), { delivered: false, retry: "delivery-failed" });
+  assert.deepEqual(turnDeliveryVerdict([fallback, { failed: true }]), { delivered: false, retry: "delivery-failed" });
+  // Anything actually delivered: no retry, or the human gets the answer twice.
+  assert.deepEqual(turnDeliveryVerdict([{ delivered: true }, fallback]), { delivered: true, retry: null });
+  assert.deepEqual(turnDeliveryVerdict([{ delivered: true }, { failed: true }]), { delivered: true, retry: null });
+  assert.deepEqual(turnDeliveryVerdict([{ delivered: true }]), { delivered: true, retry: null });
   // A deliberately suppressed bare cron alert IS the intended outcome, not a failed turn.
-  assert.deepEqual(turnDeliveryVerdict([{ suppressed: "cron-alert" }]), { delivered: true, retryAsIncompleteTurn: false });
+  assert.deepEqual(turnDeliveryVerdict([{ suppressed: "cron-alert" }]), { delivered: true, retry: null });
   // No payloads at all (e.g. an empty reply) is not this failure mode — unchanged behavior.
-  assert.deepEqual(turnDeliveryVerdict([]), { delivered: false, retryAsIncompleteTurn: false });
-  assert.deepEqual(turnDeliveryVerdict(undefined), { delivered: false, retryAsIncompleteTurn: false });
+  assert.deepEqual(turnDeliveryVerdict([]), { delivered: false, retry: null });
+  assert.deepEqual(turnDeliveryVerdict(undefined), { delivered: false, retry: null });
 });
 
 test("isBareCronFailureAlert: quoted-alert replies and oversized messages are NOT suppressed", () => {

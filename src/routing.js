@@ -166,46 +166,107 @@ export function isBareCronFailureAlert(text) {
 }
 
 /**
- * openclaw's `incomplete_turn` fallback — the placeholder it substitutes when an attempt
- * produced no usable assistant turn (empty response, reasoning-only, length-terminal,
- * provider error). Source: `resolveIncompleteTurnPayloadText` in openclaw 2026.6.11
- * (`dist/selection-*.js`), which emits one of two strings sharing this prefix:
+ * The synchronous half of the fast-ack rule: should this freshly-enqueued item get the ⏳
+ * that tells a human "seen", and can that be decided without a network lookup?
  *
- *   "⚠️ Agent couldn't generate a response. Note: some tool actions may have already been
- *    executed — please verify before retrying."   (side effects possible)
- *   "⚠️ Agent couldn't generate a response. Please try again."
+ * - "ack"       → acknowledge it (the bot is @mentioned, so it will be answered wherever it is)
+ * - "none"      → never acknowledge it
+ * - "peer-kind" → depends on whether the conversation is a 1:1 DM (open, so acked) or a group
+ *                 DM (mention-only, so not) — the caller must await its peer classification.
  *
- * This is diagnostic scaffolding, not an answer. Delivering it consumes the user's request:
- * the queue records the item `done` (a payload WAS produced), so a transient platform flake
- * silently costs a real message. Detecting it lets the channel suppress the post and fail
- * the turn instead, handing the item to the retry ladder that already exists for every other
- * transient failure. Matched on the PREFIX so both variants (and any future suffix) are
- * caught, and tolerant of either apostrophe in case the host's copy is ever typographic.
+ * The two "none" cases are both forms of "we are not going to answer this, so do not claim we
+ * will": first-sight backlog, and anything past the replay horizon. The horizon matters most:
+ * paging forward from a stale cursor after a long outage can enqueue hundreds of items the
+ * consumer will immediately condemn as `stale`, and in a 1:1 DM (no mention needed) that would
+ * otherwise be one sequential reaction call each, run in front of the consumer's tick.
  */
-export function isIncompleteTurnFallback(text) {
-  return /^\s*⚠️ Agent couldn['’]t generate a response/.test(String(text ?? ""));
+export function fastAckDecision(item, { botUserId, nowMs, replayHorizonMs }) {
+  if (item.firstSightBacklog) return "none";
+  if (nowMs - (item.postedTs ?? 0) * 1000 > replayHorizonMs) return "none"; // postedTs is seconds
+  if (contentMentionsBot(item.content, botUserId)) return "ack";
+  return item.kind === "conv" ? "peer-kind" : "none"; // threads are mention-only
 }
 
 /**
- * Fold one turn's per-payload delivery outcomes into a verdict.
+ * One LINE of openclaw's `incomplete_turn` fallback — the placeholder it substitutes when an
+ * attempt produced no usable assistant turn (empty response, reasoning-only, length-terminal,
+ * provider error). Deliberately the same shape openclaw uses to detect its own placeholder
+ * (`normalizeSearchQueryText`, `dist/extensions/active-memory/index.js`): anchored per line,
+ * case-insensitive, with the emoji's variation selector optional.
  *
- * The rule that matters: retry ONLY when the incomplete_turn placeholder was the turn's
- * sole output. A turn that answered and then trailed a placeholder block has already served
- * the human — retrying it would post the real answer a second time. A payload suppressed
- * for any OTHER reason (the redundant bare cron alert) counts as delivered: dropping it was
- * the intended outcome, not a failure.
+ * openclaw 2026.6.11 emits it from three sites, and the third is why this is per-LINE rather
+ * than per-payload:
  *
- * @param {Array<{delivered?: boolean, suppressed?: string}>} outcomes
- * @returns {{delivered: boolean, retryAsIncompleteTurn: boolean}}
+ *   resolveIncompleteTurnPayloadText (dist/selection-*.js) — the whole payload is either
+ *     "⚠️ Agent couldn't generate a response. Note: some tool actions may have already been
+ *      executed — please verify before retrying."   (side effects possible)
+ *     "⚠️ Agent couldn't generate a response. Please try again."
+ *   the reasoning-only-retries-exhausted path (dist/embedded-agent-*.js) —
+ *     `terminalToolPresentation.concat("\n\n", "⚠️ Agent couldn't generate a response. …")`,
+ *     i.e. REAL tool-presentation text with the placeholder TRAILING it. A `^`-anchored
+ *     whole-payload test misses this one entirely.
+ *
+ * The placeholder is diagnostic scaffolding, not an answer. Delivering it consumes the
+ * user's request — the queue records the item `done` because a payload WAS produced — so a
+ * transient platform flake silently costs a real message. The apostrophe class is a
+ * belt-and-braces widening of openclaw's own regex, in case the host's copy is ever
+ * typographic.
+ */
+export function isIncompleteTurnFallback(line) {
+  return /^⚠️?\s*Agent couldn['’]t generate a response/i.test(String(line ?? "").trim());
+}
+
+/**
+ * Split a delivery payload into what should actually be posted and whether a placeholder was
+ * present. A payload that MIXES real content with a trailing placeholder keeps the real
+ * content (the human is owed the tool output that did happen) and loses only the placeholder
+ * line; a payload that is placeholder-only leaves an empty body, which the caller treats as
+ * "this turn produced no answer".
+ *
+ * Known, ACCEPTED alteration: a genuine reply that quotes the placeholder on its own line
+ * loses that line. The rest of the reply is still delivered and the turn still counts as
+ * answered, so the cost is one quoted line — against silently burning a request every time
+ * openclaw trails the placeholder onto real output.
+ *
+ * @returns {{body: string, hadFallback: boolean}}
+ */
+export function stripIncompleteTurnFallback(text) {
+  const src = String(text ?? "");
+  const lines = src.split("\n");
+  const kept = lines.filter((line) => !isIncompleteTurnFallback(line));
+  if (kept.length === lines.length) return { body: src, hadFallback: false };
+  return { body: kept.join("\n").trim(), hadFallback: true };
+}
+
+/**
+ * Fold one turn's per-payload delivery outcomes into a verdict: did the human get anything,
+ * and if not, is this worth another attempt?
+ *
+ * Retry ONLY when nothing at all was delivered. A turn that answered and then trailed a
+ * placeholder (or lost one block of several) has already served the human, and retrying it
+ * would post the real answer a second time — at-least-once beats at-most-once for delivery,
+ * but not at the price of duplicate replies to a message that was answered.
+ *
+ * `failed` outranks `incomplete-turn` as the retry reason: a post that threw is a lost real
+ * message, which is the more serious of the two. A payload suppressed for any OTHER reason
+ * (the redundant bare cron alert) counts as delivered — dropping it was the intended outcome.
+ *
+ * @param {Array<{delivered?: boolean, suppressed?: string, failed?: boolean}>} outcomes
+ * @returns {{delivered: boolean, retry: null | "delivery-failed" | "incomplete-turn"}}
  */
 export function turnDeliveryVerdict(outcomes) {
   let delivered = false;
   let sawIncompleteTurn = false;
+  let sawFailure = false;
   for (const outcome of outcomes ?? []) {
-    if (outcome?.suppressed === "incomplete-turn") sawIncompleteTurn = true;
+    if (outcome?.failed) sawFailure = true;
+    else if (outcome?.suppressed === "incomplete-turn") sawIncompleteTurn = true;
     else delivered = true;
   }
-  return { delivered, retryAsIncompleteTurn: sawIncompleteTurn && !delivered };
+  if (delivered) return { delivered: true, retry: null };
+  if (sawFailure) return { delivered: false, retry: "delivery-failed" };
+  if (sawIncompleteTurn) return { delivered: false, retry: "incomplete-turn" };
+  return { delivered: false, retry: null }; // no payloads at all — not this failure mode
 }
 
 /** Channel default recipients to notify, or null to use Twist's default. */

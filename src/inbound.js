@@ -9,7 +9,7 @@ import {
 import { resolveInboundRouteEnvelopeBuilderWithRuntime } from "openclaw/plugin-sdk/inbound-envelope";
 import { getTwistRuntime } from "./runtime.js";
 import { resolveRequireMention } from "./config.js";
-import { contentMentionsBot, cleanTwistMarkup, isIncompleteTurnFallback } from "./routing.js";
+import { contentMentionsBot, cleanTwistMarkup, stripIncompleteTurnFallback } from "./routing.js";
 import { postToTwist } from "./outbound.js";
 
 const CHANNEL_ID = "twist";
@@ -109,12 +109,13 @@ export async function admissionVerdict({ message, account, cfg }) {
  * @param {object} p.client  TwistClient (for delivery)
  * @param {(u:object)=>void} [p.statusSink]
  * @param {{admit: boolean, admission: string, commandAuthorized: boolean}} [p.verdict] pre-computed admission verdict; when omitted, computed internally
- * @param {(outcome:{delivered?: boolean, suppressed?: string})=>void} [p.onDelivery]
+ * @param {(outcome:{delivered?: boolean, suppressed?: string, failed?: boolean})=>void} [p.onDelivery]
  *   Called once per non-empty payload the dispatcher produces, AFTER the deliver decision:
- *   `{delivered:true}` for a real post, `{suppressed:"incomplete-turn"}` for openclaw's
- *   incomplete_turn placeholder (never posted — see isIncompleteTurnFallback). The caller
- *   owns what that means for the turn: the queue consumer uses it to fail-and-retry a turn
- *   whose ONLY output was the placeholder, instead of recording the item answered.
+ *   `{delivered:true}` for a real post, `{suppressed:"incomplete-turn"}` for a payload that
+ *   was ONLY openclaw's incomplete_turn placeholder (never posted — see
+ *   stripIncompleteTurnFallback), `{failed:true}` when the post threw. The caller owns what
+ *   that means for the turn: the queue consumer fails-and-retries a turn that delivered
+ *   nothing, instead of recording the item answered. See turnDeliveryVerdict.
  */
 export async function handleTwistInbound({ message, account, cfg, runtime, client, statusSink, verdict, onDelivery }) {
   const core = getTwistRuntime();
@@ -191,20 +192,37 @@ export async function handleTwistInbound({ message, account, cfg, runtime, clien
         if (!text.trim()) return;
         // openclaw's incomplete_turn placeholder is NOT an answer — posting it burns the
         // user's request (the item records `done`) over what is usually a transient flake.
-        // Drop it here and tell the caller, which decides whether to retry the whole turn.
-        if (isIncompleteTurnFallback(text)) {
+        const { body, hadFallback } = stripIncompleteTurnFallback(text);
+        if (hadFallback && !body) {
+          // Placeholder-only: nothing to say. Tell the caller, which fails the turn so the
+          // consumer's retry ladder takes over instead of recording it answered.
           runtime.log?.(`twist: suppressed incomplete_turn fallback for ${message.peerId} (not delivered): ${text.slice(0, 120)}`);
           onDelivery?.({ suppressed: "incomplete-turn" });
           return;
         }
-        const res = await postToTwist({
-          client,
-          kind: message.kind === "thread" ? "thread" : "conv",
-          id: message.kind === "thread" ? message.threadId : message.conversationId,
-          text,
-        });
-        if (!res?.suppressed) statusSink?.({ lastOutboundAt: Date.now() });
-        onDelivery?.(res?.suppressed ? { suppressed: "cron-alert" } : { delivered: true });
+        if (hadFallback) {
+          // Mixed payload (openclaw's `terminalToolPresentation + placeholder` shape): the
+          // tool output really happened, so it ships — minus the placeholder. The turn counts
+          // as delivered; retrying it would re-post that output.
+          runtime.log?.(`twist: stripped an incomplete_turn placeholder from a mixed payload to ${message.peerId} (delivering the remaining ${body.length} chars, not retrying)`);
+        }
+        try {
+          const res = await postToTwist({
+            client,
+            kind: message.kind === "thread" ? "thread" : "conv",
+            id: message.kind === "thread" ? message.threadId : message.conversationId,
+            text: body,
+          });
+          if (!res?.suppressed) statusSink?.({ lastOutboundAt: Date.now() });
+          onDelivery?.(res?.suppressed ? { suppressed: "cron-alert" } : { delivered: true });
+        } catch (err) {
+          // The dispatcher swallows a rejecting deliver (it routes to onError and resolves),
+          // so an unrecorded failure here means the turn returns clean, the item records
+          // `done`, and the reply is simply GONE. Record it: the caller retries the turn when
+          // nothing else in it landed.
+          runtime.error?.(`twist reply delivery to ${message.peerId} failed: ${String(err)}`);
+          onDelivery?.({ failed: true });
+        }
       },
       onError: (err, info) => {
         runtime.error?.(`twist ${info?.kind ?? "reply"} delivery failed: ${String(err)}`);
