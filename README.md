@@ -18,6 +18,8 @@ When the bot posts a comment to a channel thread, it notifies the channel's **de
 
 While a turn runs, the triggering message gets an **⏳** reaction, which becomes **✅** on success, or **❌** only once the item has *finally* failed (retries exhausted) — a retryable error just clears the ⏳ and tries again later. This works for thread comments, DMs, and a thread's opening post alike. So you can see at a glance that the bot picked your message up and whether it's settled.
 
+**The ack contract:** ⏳ means *acknowledged*, not *started*. It's added the moment the message is durably enqueued — within one poll interval of you sending it — for every `@mention` and every message in a 1:1 DM, regardless of how much unprocessed history sits in front of it. ✅ means *answered*. (Previously the ⏳ waited for the consumer to claim the item, so a mention behind a backlog of unanswerable comments could sit silent for minutes.) If the message turns out not to be answerable after all — admission denied, or past the replay horizon — the ⏳ is removed when the item is recorded `skipped`, so an acknowledged message never hangs there forever.
+
 The agent receives full Twist context, not just the bare mention: the **thread title**, **channel name**, and a **transcript** of the surrounding discussion (Twist `[Name](twist-mention://id)` markup is cleaned to readable `@Name`).
 
 ## How it works
@@ -30,7 +32,7 @@ A producer/queue/consumer pipeline replaces a single fetch-decide-dispatch pass:
 
 - **Producer** (transport only): every poll, enqueues every new message/comment by Twist's globally-unique id. Enqueue is idempotent — an id already in the queue, live or tombstoned, is a no-op — so a cursor bug now causes a harmless refetch, not lost messages. No policy at this layer, only self-post exclusion. Fetches **page forward from the cursor** (ascending, up to 10 pages per container per poll) rather than grabbing the newest N — a burst bigger than one fetch window is drained across polls instead of being skipped. A thread's opening post is enqueued too (id `thread-post:<threadId>`), so a thread created by @mentioning the bot gets answered.
 - **Queue**: a persistent state machine, one record per message. States: `queued → processing → done | skipped | failed`. Every transition is durably persisted (tmp-file + fsync + atomic rename) before its side effects proceed.
-- **Consumer**: claims `queued` items oldest-first, at most **one turn per peer** at a time (keeps a thread/DM's turns ordered and its session coherent — a busy peer's next mention waits instead of being dropped) and at most **3 turns globally** (box/spend protection). Policy — mention check, admission gate — is evaluated at claim time and recorded as a terminal `skipped` state, never silently dropped.
+- **Consumer**: claims `queued` items oldest-first, at most **one turn per peer** at a time (keeps a thread/DM's turns ordered and its session coherent — a busy peer's next mention waits instead of being dropped) and at most **3 turns globally** (box/spend protection). Policy — mention check, admission gate — is evaluated at claim time and recorded as a terminal `skipped` state, never silently dropped. Items the policy can condemn without any lookup (backlog, stale, a thread comment with no mention) are settled *inline*, without taking a peer or turn slot — so a cold thread's whole unanswerable history drains in a single poll instead of one item per poll, and the mention behind it is claimed in that same pass.
 
 Skip reasons (all logged, none silent):
 
