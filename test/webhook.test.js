@@ -189,69 +189,125 @@ test("hintKey: distinguishes kinds sharing an id", () => {
 
 // -------------------------------------------------------- createHintDebouncer
 
-test("debouncer: a burst for one container flushes exactly once, at the end of the window", () => {
+// The debouncer is LEADING-EDGE: the first hint for an idle container flushes at once, and
+// only the hints behind it wait for the coalescing window. Measured live, the old flat
+// trailing debounce added ~2s to the ⏳ a human waits for, with nothing to coalesce yet.
+
+test("debouncer: a lone hint flushes immediately — nothing waits on the window", () => {
   const timers = fakeTimers();
   const flushed = [];
   const d = createHintDebouncer({ delayMs: 2000, onFlush: (h) => flushed.push(h), ...timers });
 
-  assert.equal(d.push({ kind: "thread", id: "1" }), "armed");
-  assert.equal(d.push({ kind: "thread", id: "1" }), "coalesced");
-  assert.equal(d.push({ kind: "thread", id: "1" }), "coalesced");
+  assert.equal(d.push({ kind: "thread", id: "1" }), "leading");
+  assert.deepEqual(flushed, [], "still asynchronous — push never flushes inline");
 
-  timers.advance(1999);
-  assert.deepEqual(flushed, [], "must not flush before the window closes");
-  timers.advance(1);
-  assert.deepEqual(flushed, [{ kind: "thread", id: "1" }], "one sweep for the whole burst");
+  timers.advance(0);
+  assert.deepEqual(flushed, [{ kind: "thread", id: "1" }], "the leading flush lands on the next tick, not 2s later");
+
+  timers.advance(5000);
+  assert.equal(flushed.length, 1, "and no trailing flush, because nothing arrived behind it");
 });
 
-test("debouncer: separate containers keep independent windows", () => {
+test("debouncer: a burst of 5 in one window produces exactly two flushes (leading + one trailing)", () => {
+  const timers = fakeTimers();
+  const flushed = [];
+  const d = createHintDebouncer({ delayMs: 2000, onFlush: (h) => flushed.push(h.seq), ...timers });
+
+  assert.equal(d.push({ kind: "thread", id: "1", seq: 1 }), "leading");
+  for (const seq of [2, 3, 4, 5]) {
+    assert.equal(d.push({ kind: "thread", id: "1", seq }), "coalesced");
+  }
+
+  timers.advance(0);
+  assert.deepEqual(flushed, [1], "the first hint went straight through");
+  timers.advance(1999);
+  assert.deepEqual(flushed, [1], "the rest wait for the window to close");
+  timers.advance(1);
+  assert.deepEqual(flushed, [1, 5], "one trailing flush, carrying the newest hint of the burst");
+});
+
+test("debouncer: the window resets after a trailing flush — the next hint leads again", () => {
+  const timers = fakeTimers();
+  const flushed = [];
+  const d = createHintDebouncer({ delayMs: 2000, onFlush: (h) => flushed.push(h.seq), ...timers });
+
+  d.push({ kind: "thread", id: "1", seq: 1 });
+  d.push({ kind: "thread", id: "1", seq: 2 });
+  timers.advance(2000);
+  assert.deepEqual(flushed, [1, 2]);
+  assert.equal(d.size(), 0, "the container is idle again");
+
+  assert.equal(d.push({ kind: "thread", id: "1", seq: 3 }), "leading");
+  timers.advance(0);
+  assert.deepEqual(flushed, [1, 2, 3], "a hint after the window is a fresh leading flush, not a wait");
+});
+
+test("debouncer: a quiet window closes with no trailing flush, and the next hint still leads", () => {
+  const timers = fakeTimers();
+  const flushed = [];
+  const d = createHintDebouncer({ delayMs: 2000, onFlush: (h) => flushed.push(h.seq), ...timers });
+
+  d.push({ kind: "thread", id: "1", seq: 1 });
+  timers.advance(2000);
+  assert.deepEqual(flushed, [1], "exactly one flush for one hint");
+
+  assert.equal(d.push({ kind: "thread", id: "1", seq: 2 }), "leading");
+  timers.advance(0);
+  assert.deepEqual(flushed, [1, 2]);
+});
+
+test("debouncer: containers are independent — each gets its own leading flush and window", () => {
   const timers = fakeTimers();
   const flushed = [];
   const d = createHintDebouncer({ delayMs: 2000, onFlush: (h) => flushed.push(hintKey(h)), ...timers });
 
   d.push({ kind: "thread", id: "1" });
-  timers.advance(1000);
+  timers.advance(0);
+  assert.deepEqual(flushed, ["thread:1"]);
+
+  timers.advance(1000); // t=1000; thread:1's window is open until t=2000
   d.push({ kind: "conversation", id: "1" }); // same id, different kind → its own window
   d.push({ kind: "thread", id: "2" });
+  assert.equal(d.push({ kind: "thread", id: "1" }), "coalesced", "joins the window already open for it");
 
-  timers.advance(1000); // thread:1's window closes; the other two are mid-window
-  assert.deepEqual(flushed, ["thread:1"]);
-  timers.advance(1000);
-  assert.deepEqual(flushed, ["thread:1", "conversation:1", "thread:2"]);
+  timers.advance(0);
+  assert.deepEqual(flushed, ["thread:1", "conversation:1", "thread:2"], "the two new containers lead immediately");
+
+  timers.advance(1000); // t=2000: thread:1's window closes, carrying its trailing hint
+  assert.deepEqual(flushed, ["thread:1", "conversation:1", "thread:2", "thread:1"]);
+
+  timers.advance(1000); // t=3000: the other two windows close — nothing arrived behind them
+  assert.equal(flushed.length, 4, "a quiet window never emits");
 });
 
-test("debouncer: the window is NOT extended by later hints (a busy container cannot starve)", () => {
+test("debouncer: the trailing window is NOT extended by later hints (a busy container cannot starve)", () => {
   const timers = fakeTimers();
   const flushed = [];
-  const d = createHintDebouncer({ delayMs: 2000, onFlush: (h) => flushed.push(h), ...timers });
+  const d = createHintDebouncer({ delayMs: 2000, onFlush: (h) => flushed.push(h.seq), ...timers });
 
-  d.push({ kind: "thread", id: "1" });
-  timers.advance(1500);
-  d.push({ kind: "thread", id: "1" }); // a reset-style debounce would push the flush to 3500
-  timers.advance(500);
-  assert.equal(flushed.length, 1, "flush lands 2000ms after the FIRST hint");
-});
-
-test("debouncer: a new burst after a flush arms a fresh window", () => {
-  const timers = fakeTimers();
-  const flushed = [];
-  const d = createHintDebouncer({ delayMs: 2000, onFlush: (h) => flushed.push(h), ...timers });
-
-  d.push({ kind: "thread", id: "1" });
-  timers.advance(2000);
-  assert.equal(d.push({ kind: "thread", id: "1" }), "armed");
-  timers.advance(2000);
-  assert.equal(flushed.length, 2);
-});
-
-test("debouncer: the LAST hint for a container is the one flushed", () => {
-  const timers = fakeTimers();
-  const flushed = [];
-  const d = createHintDebouncer({ delayMs: 10, onFlush: (h) => flushed.push(h), ...timers });
   d.push({ kind: "thread", id: "1", seq: 1 });
-  d.push({ kind: "thread", id: "1", seq: 2 });
-  timers.advance(10);
-  assert.equal(flushed[0].seq, 2);
+  timers.advance(0);
+  assert.deepEqual(flushed, [1]);
+
+  timers.advance(1500);
+  d.push({ kind: "thread", id: "1", seq: 2 }); // reset semantics would push the trailing flush to t=3500
+  timers.advance(500); // t=2000
+
+  assert.deepEqual(flushed, [1, 2], "the trailing flush is anchored to the LEADING hint, and never moves");
+});
+
+test("debouncer: a hammered container still flushes at a steady cadence (no starvation)", () => {
+  const timers = fakeTimers();
+  const flushed = [];
+  const d = createHintDebouncer({ delayMs: 1000, onFlush: (h) => flushed.push(h.seq), ...timers });
+
+  // An event every 100ms for 5s — the shape that starves a reset-on-every-hint debounce.
+  for (let seq = 0; seq < 50; seq++) {
+    d.push({ kind: "thread", id: "1", seq });
+    timers.advance(100);
+  }
+  assert.ok(flushed.length >= 5, `expected steady flushes, got ${flushed.length}`);
+  assert.equal(flushed[0], 0, "and the very first event was not delayed at all");
 });
 
 test("debouncer: cancelAll drops armed windows without flushing (shutdown)", () => {
@@ -264,9 +320,9 @@ test("debouncer: cancelAll drops armed windows without flushing (shutdown)", () 
 
   d.cancelAll();
   assert.equal(d.size(), 0);
-  assert.equal(timers.pendingCount(), 0, "timers are cleared, not left to fire after stop()");
+  assert.equal(timers.pendingCount(), 0, "both the leading and window timers are cleared, not left to fire after stop()");
   timers.advance(10_000);
-  assert.deepEqual(flushed, []);
+  assert.deepEqual(flushed, [], "a leading flush that had not yet fired must not fire after shutdown");
 });
 
 test("debouncer: a throwing onFlush is contained and does not wedge later windows", () => {
@@ -429,7 +485,7 @@ test("handler: schedule is required", () => {
 
 // --------------------------------------------- debouncer + handler, end to end
 
-test("handler → debouncer: an event burst on one thread produces ONE sweep", () => {
+test("handler → debouncer: a burst collapses to one leading + one trailing sweep per container", () => {
   const timers = fakeTimers();
   const sweeps = [];
   const debouncer = createHintDebouncer({ delayMs: 2000, onFlush: (h) => sweeps.push(h), ...timers });
@@ -445,10 +501,19 @@ test("handler → debouncer: an event burst on one thread produces ONE sweep", (
   handler({ garbage: true }); // → the "all" fallback
   handler("also garbage"); // → coalesces with the previous fallback
 
-  timers.advance(2000);
+  // Leading edge: each of the three distinct containers sweeps at once...
+  timers.advance(0);
   assert.deepEqual(sweeps, [
     { kind: "thread", id: "7882650" },
     { kind: "conversation", id: "34567" },
+    { kind: "all", id: "*" },
+  ]);
+
+  // ...and the hints that piled up behind them collapse into one trailing sweep each. The
+  // conversation had no second event, so it emits nothing further.
+  timers.advance(2000);
+  assert.deepEqual(sweeps.slice(3), [
+    { kind: "thread", id: "7882650" },
     { kind: "all", id: "*" },
   ]);
 });
