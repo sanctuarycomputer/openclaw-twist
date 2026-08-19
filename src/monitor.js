@@ -377,7 +377,16 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
       }
       if (stopped) return;
       try {
-        await producer.sweepContainer(hint);
+        const outcome = await producer.sweepContainer(hint);
+        // An untracked thread is not swept directly — sweeping it would ingest containers
+        // the poll's direct_mention filter would never have touched. The hint degrades to
+        // a full poll, which still picks the thread up promptly IF it mentions the bot.
+        if (outcome?.swept === false) {
+          sweepAll = true;
+          if (core.logging?.shouldLogVerbose?.()) {
+            log(`webhook hint ${hint.kind}:${hint.id} degraded to a full poll (${outcome.reason})`);
+          }
+        }
       } catch (err) {
         log(`webhook sweep ${hint.kind}:${hint.id} failed: ${String(err)}`);
       }

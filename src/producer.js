@@ -205,12 +205,42 @@ export function createProducer({ client, queue, cursors, botUserId, freshSinceTs
      * afterwards from one swept by the poll loop, so a webhook that never arrives costs
      * nothing but latency.
      *
+     * THE UNTRACKED-THREAD GATE. A targeted sweep must only ever ACCELERATE work the poll
+     * would do anyway — it must never widen what gets ingested. For threads the two paths
+     * are not symmetric: pollOnce filters unread threads to `direct_mention` before
+     * sweeping, so a thread the bot was never mentioned in is never first-sighted. A hint,
+     * by contrast, names whatever container the upstream integration is installed on. So a
+     * hint for a thread with NO cursor (never tracked) would first-sight it and pull its
+     * newest fetch window into the durable queue — items the poll path would never have
+     * touched. The consumer would skip them terminally and correctly, but they are durable
+     * rows with 30-day tombstones, so a workspace-wide integration would turn all channel
+     * chatter into permanent queue growth.
+     *
+     * Untracked threads therefore do NOT get a targeted sweep. The hint degrades to
+     * "run a full poll", which applies the `direct_mention` filter exactly as today: a
+     * brand-new thread that DOES mention the bot is still picked up promptly (the hint
+     * triggered the poll), and chatter-only threads cost nothing durable. The enhancement
+     * stays purely accelerative.
+     *
+     * Conversations need no such gate: pollOnce sweeps every unread conversation without a
+     * mention filter, so hint-sweeping an unknown conversation matches poll semantics
+     * exactly — including the first-sight backlog rules.
+     *
      * @param {{kind: "thread"|"conversation", id: string|number}} hint
+     * @returns {Promise<{swept: boolean, reason?: "untracked-thread"}>} `swept:false` means
+     *   the caller should schedule a full poll instead; it is not an error.
      */
     async sweepContainer({ kind, id } = {}) {
       if (id === undefined || id === null || id === "") throw new Error("sweepContainer: id is required");
-      if (kind === "conversation") return await sweepConversation({ conversation_id: id });
-      if (kind === "thread") return await sweepThread(await threadContainer(id));
+      if (kind === "conversation") {
+        await sweepConversation({ conversation_id: id });
+        return { swept: true };
+      }
+      if (kind === "thread") {
+        if (cursors.isFirstSight("threads", id)) return { swept: false, reason: "untracked-thread" };
+        await sweepThread(await threadContainer(id));
+        return { swept: true };
+      }
       throw new Error(`sweepContainer: unknown container kind ${JSON.stringify(kind)}`);
     },
 
