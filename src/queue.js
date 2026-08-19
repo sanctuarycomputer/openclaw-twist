@@ -19,6 +19,11 @@ export function createQueueStore(filePath, { log } = {}) {
   let tombstoneSet = new Set();
   let loaded = false;
   let writeChain = Promise.resolve();
+  // The most recent persist, WITH its rejection intact. `writeChain` deliberately swallows
+  // failures so one bad write can't poison later chaining, which makes it useless as a
+  // durability signal — it resolves whether or not the bytes landed. Callers asking "is
+  // everything I mutated on disk?" need the answer to be no when it isn't.
+  let lastPersist = Promise.resolve();
 
   /**
    * @param {number} [now] epoch ms, used only to name a quarantined corrupt file.
@@ -77,11 +82,32 @@ export function createQueueStore(filePath, { log } = {}) {
       await rename(tmp, filePath);
     });
     writeChain = p.catch(() => {});
+    lastPersist = p;
     return p;
   }
 
   return {
     load,
+    /**
+     * Resolves once everything mutated so far is durably on disk; REJECTS if the most
+     * recent write failed.
+     *
+     * This exists for the cursor invariant: "the cursor advances only after the enqueue
+     * batch is durably persisted." `enqueueAll` only awaits a persist when it actually
+     * added something, which was sufficient while sweeps were serialized — a sweep that
+     * added nothing had nothing of its own to flush. Under concurrent sweeps that stopped
+     * being true: sweep B can dedup to `added = 0` against rows sweep A has inserted in
+     * memory but not yet fsynced, and B would then advance the cursor (a separate, much
+     * smaller, much faster file) past items that are not on disk. A crash in that window
+     * loses them silently — they sit below the cursor, so nothing ever refetches them.
+     *
+     * Awaiting this before any `setCursor` restores the happens-before edge for every
+     * interleaving, without forcing pointless empty writes.
+     *
+     * Checking only the LAST persist is sufficient, not a gap: every persist snapshots the
+     * whole `data` object, so a later successful write subsumes all earlier ones.
+     */
+    whenPersisted: () => lastPersist,
     has: (id) => (ensure(), id in data.items || tombstoneSet.has(id)),
     get: (id) => (ensure(), data.items[id]),
     async enqueueAll(items, now) {

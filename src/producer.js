@@ -11,7 +11,7 @@ export const MAX_PAGES_PER_POLL = 10;
 
 /**
  * @param {object} deps
- * @param {(item: object) => Promise<void>} [deps.fastAck]
+ * @param {(item: object, signal?: AbortSignal) => Promise<void>} [deps.fastAck]
  *   Best-effort "we've seen you" side effect, fired once per NEWLY-enqueued, non-backlog
  *   item right after its batch is durably persisted. The ⏳ a human waits for used to be
  *   added at CLAIM time, so a mention sitting behind N unprocessed items in the same
@@ -43,11 +43,22 @@ export function createProducer({ client, queue, cursors, botUserId, freshSinceTs
   async function enqueueAcked(items) {
     const fresh = items.filter((it) => !queue.has(it.id));
     await queue.enqueueAll(fresh, now());
+    // Unconditionally — including when we added nothing. The caller advances the cursor
+    // right after this returns, and under CONCURRENT sweeps (webhook fast path racing the
+    // poll loop) "we added nothing" can mean "another sweep added them and its fsync is
+    // still in flight". Advancing the cursor then would commit a small, fast cursors.json
+    // write ahead of the queue.json write it depends on, and a crash in that window drops
+    // the messages silently: they are below the cursor, so nothing refetches them.
+    // queue.whenPersisted() is the happens-before edge; it also rejects if the write
+    // failed, which aborts the sweep before the cursor moves. See queue.js.
+    await queue.whenPersisted?.();
     for (const item of fresh) {
       if (abortSignal?.aborted) break;
       if (item.firstSightBacklog) continue; // never answered → never acknowledged
       try {
-        await fastAck(item);
+        // The sweep's own signal goes with it: a reaction is the one Twist call fastAck
+        // makes, and without a signal it cannot be cancelled by the per-sweep deadline.
+        await fastAck(item, abortSignal);
       } catch (err) {
         log(`fast-ack failed for ${item.id}: ${String(err)}`);
       }

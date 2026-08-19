@@ -161,10 +161,22 @@ export function composeCycleSignal(
  *      last-write-wins on Twist's own read marker; the worst case is a thread lingering one
  *      extra poll in the unread list. Our cursor, not Twist's marker, is the refetch bound.
  *
- * This all depends on both paths sharing ONE queue store and ONE cursor store instance —
- * the atomicity in (1) is atomicity over a shared `data.items` object. Producer *instances*
- * may differ (they hold no mutable state of their own, only read-only refs), which is what
- * lets each sweep carry its own deadline signal.
+ * (1) requires both paths to share ONE QUEUE STORE instance, since its atomicity is
+ * atomicity over a shared `data.items` object. That holds: the queue store is memoized per
+ * queue path (QUEUE_STORES in monitor.js) precisely so it survives an in-process channel
+ * restart. The CURSOR store is NOT memoized — channel.js builds a fresh one per start — so
+ * a hot reload can briefly run two stores over one cursors.json. Within a single monitor
+ * both paths share one, so (2) holds for the concurrency introduced here; across a reload
+ * the two stores can clobber each other's snapshot and REGRESS a cursor. That is non-lossy
+ * by design: a cursor is only a refetch bound, so the cost is a redundant refetch whose
+ * items the (shared, memoized) queue then dedups away.
+ *
+ * Producer *instances* may differ freely — they hold no mutable state of their own, only
+ * read-only refs — which is what lets each sweep carry its own deadline signal.
+ *
+ * NOTE that (1) is a statement about in-memory bookkeeping, not durability. The matching
+ * durability edge — never letting a cursor commit ahead of the queue write it depends on —
+ * is `queue.whenPersisted()`, awaited in producer.enqueueAcked; see the comment there.
  *
  * The per-container guard is not a correctness requirement, then — it is a waste guard: a
  * second hint for a container already being swept is dropped because the running sweep
@@ -212,9 +224,16 @@ export function createHintSweeper({
         } finally {
           inFlight.delete(key);
         }
-        if (!outcome) return;
-        if (outcome.swept === false) onDegrade?.(hint, outcome.reason ?? "declined");
-        else onSwept?.(hint);
+        // Inside a try of its own: these are host-supplied callbacks, and a throwing logger
+        // or scheduler must not surface as an unhandled rejection (nobody awaits `run`
+        // outside tests, so that would be a process-level crash on an unrelated bug).
+        try {
+          if (!outcome) return;
+          if (outcome.swept === false) onDegrade?.(hint, outcome.reason ?? "declined");
+          else onSwept?.(hint);
+        } catch (err) {
+          log?.(`webhook sweep ${key} follow-up failed: ${String(err)}`);
+        }
       })();
       inFlight.set(key, run);
       return "started";
@@ -222,5 +241,68 @@ export function createHintSweeper({
     size: () => inFlight.size,
     /** Test-only: await every sweep currently in flight. */
     idle: () => Promise.allSettled([...inFlight.values()]),
+  };
+}
+
+/** Returned by {@link settleWithinDeadline} when the deadline won the race. */
+export const DEADLINE_EXPIRED = Symbol("deadline-expired");
+
+/**
+ * Race already-settled-shaped work against a deadline signal.
+ *
+ * A signal on its own is not enough to bound anything: it only cancels work that actually
+ * threads it all the way down, and any un-signalled call (a third-party retry sleep, a
+ * socket with no timeout) sails straight past it. This is the backstop that guarantees the
+ * CALLER is released on time regardless, so a hung request can never hold a lock, a queue
+ * slot, or a container guard for the life of the process.
+ *
+ * `work` must never reject — wrap it first. That keeps the abandoned branch from becoming
+ * an unhandled rejection once we stop looking at it.
+ *
+ * @param {Promise<T>} work
+ * @param {AbortSignal|null} [deadline]
+ * @returns {Promise<T|typeof DEADLINE_EXPIRED>}
+ * @template T
+ */
+export async function settleWithinDeadline(work, deadline) {
+  if (!deadline) return await work;
+  const blown = new Promise((resolve) => {
+    if (deadline.aborted) resolve(DEADLINE_EXPIRED);
+    else deadline.addEventListener("abort", () => resolve(DEADLINE_EXPIRED), { once: true });
+  });
+  return await Promise.race([work, blown]);
+}
+
+/**
+ * Collapses repeated "please run a cycle" requests into at most ONE queued run.
+ *
+ * Every completed bypass sweep wants the chain to do a claim pass, but N sweeps do not need
+ * N cycles — one claim pass after the last of them sees exactly the same queue. Worse,
+ * queueing one per sweep lengthens the chain that the overflow path (which falls back to
+ * chain-bound sweeps) has to wait behind, so the fast path would starve the slow path it is
+ * supposed to be relieving. One outstanding poke keeps the chain short.
+ *
+ * `starting()` is called when the queued cycle BEGINS, not when it ends: work that landed
+ * while it was queued is already covered by it, but work landing after it starts needs a
+ * fresh poke.
+ *
+ * @param {() => void} schedule
+ */
+export function createPokeGate(schedule) {
+  if (typeof schedule !== "function") throw new Error("createPokeGate: schedule is required");
+  let pending = false;
+  return {
+    /** @returns {"queued"|"already-queued"} */
+    request() {
+      if (pending) return "already-queued";
+      pending = true;
+      schedule();
+      return "queued";
+    },
+    /** The queued cycle has begun; later requests must queue a new one. */
+    starting() {
+      pending = false;
+    },
+    pending: () => pending,
   };
 }

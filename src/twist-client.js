@@ -24,7 +24,28 @@ export function createTwistClient({ token, workspaceId, fetchImpl = fetch }) {
   if (!workspaceId) throw new Error("twist: workspaceId is required");
 
   const MAX_RETRIES = 3;
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  /**
+   * Abortable delay. The plain version made the retry ladder un-cancellable: a 429 storm
+   * meant up to ~7s of dead sleep per attempt that no abort signal could interrupt, so a
+   * caller's deadline could not fire and its slot stayed pinned. Rejects with the signal's
+   * own reason (a TimeoutError for AbortSignal.timeout), which callers already classify.
+   */
+  const sleep = (ms, signal) =>
+    new Promise((resolve, reject) => {
+      if (signal?.aborted) {
+        reject(signal.reason ?? new Error("aborted"));
+        return;
+      }
+      const onAbort = () => {
+        clearTimeout(timer);
+        reject(signal.reason ?? new Error("aborted"));
+      };
+      const timer = setTimeout(() => {
+        signal?.removeEventListener?.("abort", onAbort);
+        resolve();
+      }, ms);
+      signal?.addEventListener?.("abort", onAbort, { once: true });
+    });
 
   async function request(path, { method = "GET", query, body, signal } = {}) {
     let url = `${BASE}/${path}`;
@@ -48,7 +69,7 @@ export function createTwistClient({ token, workspaceId, fetchImpl = fetch }) {
       if ((res.status === 429 || res.status === 502 || res.status === 503) && attempt < MAX_RETRIES) {
         const retryAfter = Number(res.headers?.get?.("retry-after"));
         const delay = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 2 ** attempt * 1000;
-        await sleep(delay);
+        await sleep(delay, signal);
         continue;
       }
       const text = await res.text();

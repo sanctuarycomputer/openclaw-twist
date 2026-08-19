@@ -31,7 +31,15 @@ import {
   createWebhookHandler,
   extractContainerHint,
 } from "./webhook.js";
-import { CYCLE_DEADLINE_MS, composeCycleSignal, createHintFunnel, createHintSweeper } from "./cycle.js";
+import {
+  CYCLE_DEADLINE_MS,
+  DEADLINE_EXPIRED,
+  composeCycleSignal,
+  createHintFunnel,
+  createHintSweeper,
+  createPokeGate,
+  settleWithinDeadline,
+} from "./cycle.js";
 import { createWebhookTrace } from "./webhook-trace.js";
 import { registerTwistWebhookRoute } from "./webhook-route.js";
 import { getTwistRuntime } from "./runtime.js";
@@ -114,6 +122,13 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
   let stopped = false;
   let timer = null;
   let cycle = 0;
+  // Cancels everything this monitor has in flight. The account's own abortSignal is not
+  // enough: stop() is also called directly (channel hot reload) WITHOUT the host aborting
+  // ctx.abortSignal, and in that case nothing would cancel an in-flight bypass sweep — it
+  // would keep hitting Twist on behalf of a monitor that no longer exists. Cycles and
+  // sweeps compose their deadlines from this, so both routes to shutdown cancel them.
+  const lifecycle = new AbortController();
+  abortSignal?.addEventListener?.("abort", () => lifecycle.abort(), { once: true });
 
   const queueEntry = acquireQueueStore(queuePath, log);
   await queueEntry.ready;
@@ -129,12 +144,12 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
   // item with backoff instead of guessing a kind and mis-routing (a wrong "dm" would
   // bypass the group mention requirement; a wrong "groupdm" would drop a real DM).
   const peerKindCache = new Map();
-  async function participantKind(convId) {
+  async function participantKind(convId, signal = abortSignal) {
     const key = String(convId);
     if (peerKindCache.has(key)) return peerKindCache.get(key);
     let conv;
     try {
-      conv = await client.getConversation(convId, abortSignal);
+      conv = await client.getConversation(convId, signal);
     } catch (err) {
       log(`participant lookup failed for conv ${convId}: ${String(err)}`);
       throw err;
@@ -271,11 +286,11 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
     return { threadId: Number(item.threadId) }; // "thread-post": the opening post
   }
   // Best-effort: a reaction is cosmetic and must never fail (and thus retry) a turn.
-  async function react(item, verb, reaction) {
+  async function react(item, verb, reaction, signal = abortSignal) {
     const target = reactionTarget(item);
     try {
-      if (verb === "add") await client.addReaction({ ...target, reaction });
-      else await client.removeReaction({ ...target, reaction });
+      if (verb === "add") await client.addReaction({ ...target, reaction }, signal);
+      else await client.removeReaction({ ...target, reaction }, signal);
     } catch (err) {
       log(`reaction ${verb} ${reaction} failed for ${item.id}: ${String(err)}`);
     }
@@ -307,19 +322,22 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
    * no reaction step of its own is a SKIP, so the consumer clears the ack there explicitly
    * (see `wasFastAcked`) — an acknowledged mention must never be left wearing ⏳ forever.
    */
-  async function shouldFastAck(item) {
+  async function shouldFastAck(item, signal) {
     const decision = fastAckDecision(item, { botUserId, nowMs: Date.now(), replayHorizonMs: REPLAY_HORIZON_MS });
     if (decision !== "peer-kind") return decision === "ack";
-    return (await participantKind(item.conversationId)) === "dm";
+    return (await participantKind(item.conversationId, signal)) === "dm";
   }
   // NOTE: this is reached only from the producer, for items an authenticated fetch actually
   // returned and that were durably enqueued. Acking straight off a webhook payload's message
   // id would be faster and is deliberately not done — the payload is unsigned, so that id is
   // unverified and a forged request could make the bot paint reactions on arbitrary
   // messages. See the contract at the top of webhook.js.
-  async function fastAck(item) {
-    if (!(await shouldFastAck(item))) return;
-    await react(item, "add", "⏳"); // react() is already best-effort; the producer contains throws anyway
+  // `signal` is the SWEEP's signal (threaded by producer.enqueueAcked), not the account's:
+  // both Twist calls below must be cancellable by that sweep's deadline, or a hung reaction
+  // pins the container guard and a fast-path slot for the life of the process.
+  async function fastAck(item, signal = abortSignal) {
+    if (!(await shouldFastAck(item, signal))) return;
+    await react(item, "add", "⏳", signal); // react() is already best-effort; the producer contains throws anyway
   }
 
   const alert = async (text) => {
@@ -413,7 +431,9 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
     if (sweepAll) await producer.pollOnce();
     if (stopped) return;
     await consumer.tick();
-    await queue.prune(Date.now());
+    // Pruning walks the whole queue and rewrites the file; it is housekeeping, not
+    // latency-critical, so it rides the scheduled poll rather than every claim poke.
+    if (!tickOnly) await queue.prune(Date.now());
     if (core.logging?.shouldLogVerbose?.()) {
       log(`poll #${cycle}: queue depth ${queue.nonTerminalCount()}, ${consumer.inFlightCount()} turn(s) in flight`);
     }
@@ -432,7 +452,7 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
    * its own reentrancy guard — so the next cycle simply re-sweeps.
    */
   async function runCycleWithDeadline(opts) {
-    const { signal, deadline } = composeCycleSignal(abortSignal, { deadlineMs: CYCLE_DEADLINE_MS });
+    const { signal, deadline } = composeCycleSignal(lifecycle.signal, { deadlineMs: CYCLE_DEADLINE_MS });
     let done = false;
     let failure = null;
     // Always settles, so abandoning it below can never leave an unhandled rejection.
@@ -463,6 +483,9 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
   /** Run a cycle with global mutual exclusion; never rejects (failures are logged). */
   function runExclusive(opts = {}) {
     const run = cycleChain.then(async () => {
+      // Before the `stopped` check: a poke that never runs must still free the gate, or a
+      // restarted monitor could never queue another one.
+      if (opts.tickOnly) pokeGate.starting();
       if (stopped) return;
       try {
         await runCycleWithDeadline(opts);
@@ -474,6 +497,10 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
     cycleChain = run.catch(() => {});
     return run;
   }
+
+  // At most one queued claim pass at a time — see createPokeGate for why N sweeps must not
+  // become N cycles.
+  const pokeGate = createPokeGate(() => void runExclusive({ tickOnly: true }));
 
   async function loop() {
     if (stopped) return;
@@ -498,25 +525,42 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
   const sweeper = createHintSweeper({
     log,
     sweep: async (hint) => {
-      // Each bypass sweep carries its own deadline, exactly like a chain cycle: a hung Twist
-      // read must not pin a container's in-flight slot forever.
-      const { signal, deadline } = composeCycleSignal(abortSignal, { deadlineMs: CYCLE_DEADLINE_MS });
-      try {
-        return await makeProducer(signal).sweepContainer(hint);
-      } catch (err) {
+      // Each bypass sweep carries its own deadline, exactly like a chain cycle.
+      const { signal, deadline } = composeCycleSignal(lifecycle.signal, { deadlineMs: CYCLE_DEADLINE_MS });
+      const work = makeProducer(signal)
+        .sweepContainer(hint)
+        .then((outcome) => ({ outcome }), (err) => ({ err }));
+
+      // The signal alone cannot be trusted to end this: it only reaches calls that thread
+      // it, so one un-signalled path is enough to hang the sweep forever — and a hung sweep
+      // holds this container's guard AND one of the few fast-path slots for the life of the
+      // process, silently. The race guarantees we let go on time regardless.
+      //
+      // Releasing the guard while the abandoned work may still be running is safe, and this
+      // is exactly why the concurrency argument had to be nailed down first: an orphan
+      // overlapping a fresh sweep of the same container is the same interleaving the poll
+      // loop already races, covered by the atomic filter+enqueue (no double-enqueue or
+      // double-ack), monotonic cursors, and the whenPersisted durability edge.
+      const settled = await settleWithinDeadline(work, deadline);
+      if (settled === DEADLINE_EXPIRED) {
+        log(
+          `hint sweep ${hint.kind}:${hint.id} exceeded the ${CYCLE_DEADLINE_MS}ms deadline — abandoning it and releasing the container; falling back to a full poll`,
+        );
+        return { swept: false, reason: "deadline" };
+      }
+      if (settled.err) {
         if (deadline?.aborted) {
-          log(
-            `hint sweep ${hint.kind}:${hint.id} exceeded the ${CYCLE_DEADLINE_MS}ms deadline — abandoned; falling back to a full poll`,
-          );
+          log(`hint sweep ${hint.kind}:${hint.id} was cancelled by its ${CYCLE_DEADLINE_MS}ms deadline — falling back to a full poll`);
           return { swept: false, reason: "deadline" };
         }
-        throw err;
+        throw settled.err;
       }
+      return settled.outcome;
     },
     // The ⏳ already went out inside the sweep (producer fastAck), so all that is left is the
     // claim pass — and that stays chain-serialized, because per-peer and global turn caps
     // depend on exactly one claim pass running at a time.
-    onSwept: () => void runExclusive({ tickOnly: true }),
+    onSwept: () => pokeGate.request(),
     onDegrade: (hint, reason) => {
       if (reason === "at-capacity") {
         // Too many bypass sweeps already running. Fall back to the pre-0.5.2 behaviour:
@@ -554,6 +598,7 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
     stopped = true;
     if (timer) clearTimeout(timer);
     hintDebouncer.cancelAll();
+    lifecycle.abort(); // cancel in-flight bypass sweeps and the running cycle, if any
     try {
       unregisterWebhook?.();
     } catch (err) {

@@ -127,3 +127,42 @@ test("selectClaimable: oldest first, skips busy peers, honors backoff and slots"
   assert.equal(q.selectClaimable(T0 + 1_000_000, new Set(["conv:1", "conv:3"]), 3).id, "conv-msg:3"); // backoff elapsed
   assert.equal(q.selectClaimable(T0, new Set(), 0), null);                   // no slots
 });
+
+test("whenPersisted resolves only once pending writes are durable", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "twistq-"));
+  const store = createQueueStore(join(dir, "queue.json"));
+  await store.load();
+
+  await store.enqueueAll([{ id: "conv-msg:1", peerId: "conv:9", postedTs: 1, objIndex: 0 }], 0);
+  await store.whenPersisted();
+  // The file is on disk and complete: a fresh store over the same path sees the row.
+  const reopened = createQueueStore(join(dir, "queue.json"));
+  await reopened.load();
+  assert.equal(reopened.has("conv-msg:1"), true);
+});
+
+test("whenPersisted is safe to call before anything has been written", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "twistq-"));
+  const store = createQueueStore(join(dir, "queue.json"));
+  await store.load();
+  await store.whenPersisted(); // resolves; nothing to wait for
+});
+
+// An enqueue that adds nothing does no write of its own, but must still report the
+// durability state of writes already in flight — that is the whole point of the accessor.
+test("whenPersisted reflects an in-flight write even when the caller added nothing", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "twistq-"));
+  const store = createQueueStore(join(dir, "queue.json"));
+  await store.load();
+
+  const row = { id: "conv-msg:1", peerId: "conv:9", postedTs: 1, objIndex: 0 };
+  const first = store.enqueueAll([row], 0); // not awaited: its fsync is in flight
+  const second = await store.enqueueAll([row], 0); // dedups to zero, no write of its own
+  assert.equal(second, 0);
+
+  let durable = false;
+  const gate = store.whenPersisted().then(() => { durable = true; });
+  assert.equal(durable, false, "not durable yet — the first write has not landed");
+  await Promise.all([first, gate]);
+  assert.equal(durable, true);
+});
