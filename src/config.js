@@ -47,6 +47,12 @@ export function resolveTwistAccount(cfg) {
   const pollIntervalMs =
     Number(section.pollIntervalMs ?? process.env.TWIST_POLL_INTERVAL_MS) || DEFAULT_POLL_INTERVAL_MS;
   const defaultTo = firstNonEmpty(section.defaultTo, process.env.TWIST_DEFAULT_TO);
+  // Webhook ingress is a progressive enhancement over the poll loop and is OFF unless both
+  // halves are present: without a path there is nothing to register, and without a token
+  // the route would be an unauthenticated trigger open to the internet. Never default
+  // either one.
+  const webhookPath = firstNonEmpty(section.webhook, process.env.TWIST_WEBHOOK_PATH);
+  const webhookToken = resolveSecret({ value: section.webhookToken, envName: "TWIST_WEBHOOK_TOKEN" });
   return {
     accountId: DEFAULT_ACCOUNT_ID,
     config: section,
@@ -55,6 +61,9 @@ export function resolveTwistAccount(cfg) {
     botUserId,
     pollIntervalMs,
     defaultTo,
+    webhookPath,
+    webhookToken,
+    webhookEnabled: Boolean(webhookPath && webhookToken),
     configured: Boolean(token && workspaceId && botUserId),
   };
 }
@@ -74,6 +83,8 @@ export const twistConfigAdapter = createTopLevelChannelConfigAdapter({
     "dmPolicy",
     "groupPolicy",
     "defaultTo",
+    "webhook",
+    "webhookToken",
   ],
   resolveAllowFrom: (account) => account.config.allowFrom,
   formatAllowFrom: (allowFrom) => (allowFrom ?? []).map((e) => String(e)),

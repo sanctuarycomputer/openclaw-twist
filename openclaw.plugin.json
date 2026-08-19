@@ -8,7 +8,15 @@
   },
   "channels": ["twist"],
   "channelEnvVars": {
-    "twist": ["TWIST_TOKEN", "TWIST_WORKSPACE_ID", "TWIST_BOT_USER_ID", "TWIST_POLL_INTERVAL_MS", "TWIST_DEFAULT_TO"]
+    "twist": [
+      "TWIST_TOKEN",
+      "TWIST_WORKSPACE_ID",
+      "TWIST_BOT_USER_ID",
+      "TWIST_POLL_INTERVAL_MS",
+      "TWIST_DEFAULT_TO",
+      "TWIST_WEBHOOK_PATH",
+      "TWIST_WEBHOOK_TOKEN"
+    ]
   },
   "configSchema": {
     "type": "object",
@@ -53,7 +61,9 @@
               }
             }
           },
-          "defaultTo": { "type": "string" }
+          "defaultTo": { "type": "string" },
+          "webhook": { "type": "string" },
+          "webhookToken": { "type": "string" }
         }
       },
       "uiHints": {
@@ -85,6 +95,15 @@
         "defaultTo": {
           "label": "Default delivery target",
           "help": "Where cron/proactive messages go when no explicit target is given, e.g. \"thread:7882650\" or \"conv:123\"."
+        },
+        "webhook": {
+          "label": "Webhook path",
+          "help": "Optional gateway route for Twist outgoing webhooks, e.g. \"/twist/events\". A delivery only HINTS which container to re-poll; the poll loop stays the source of truth. Requires webhookToken — unset either one and no route is registered."
+        },
+        "webhookToken": {
+          "label": "Webhook token",
+          "help": "Shared secret required on every webhook delivery as ?token=... (sensitive). Twist outgoing webhooks are unsigned, so this URL token is the only authentication. Prefer the TWIST_WEBHOOK_TOKEN env var.",
+          "sensitive": true
         }
       }
     }

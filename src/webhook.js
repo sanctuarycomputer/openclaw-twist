@@ -1,0 +1,248 @@
+// Webhook ingress — PURE decision logic. No SDK import, no network, no clock, no timers
+// of its own: every effect is injected, so this whole file is unit-testable with the
+// `openclaw` host absent from the module path (it is — the plugin is not installed
+// alongside its host in dev, which is exactly why the SDK wiring lives in
+// webhook-route.js instead).
+//
+// THE CONTRACT, in one paragraph, because it is the only thing that makes this safe:
+// Twist outgoing webhooks are UNSIGNED. Any host on the internet that learns the URL can
+// POST anything to it. So the payload is NEVER ingested as data. The single thing we take
+// from a delivery is a CONTAINER HINT — "something may have happened in thread 123" — and
+// that hint is used only to trigger a targeted producer sweep, which re-fetches the truth
+// from the Twist API with our own token. The blast radius of a perfectly-forged payload is
+// therefore one rate-limited, authenticated re-poll of a container. Poll remains the source
+// of truth; the webhook only makes it happen sooner. If a delivery carries no recognizable
+// container id we fall back to scheduling a full poll, which is what would have happened
+// anyway on the next tick.
+
+/** Events whose payload addresses a channel THREAD. */
+const THREAD_EVENTS = new Set(["thread_added", "thread_updated", "comment_added", "comment_updated"]);
+/** Events whose payload addresses a DM / group-DM CONVERSATION. */
+const CONVERSATION_EVENTS = new Set([
+  "message_added",
+  "message_updated",
+  "conversation_added",
+  "conversation_updated",
+]);
+
+const isRecord = (v) => Boolean(v) && typeof v === "object" && !Array.isArray(v);
+
+/**
+ * Coerce an untrusted id field to a safe container id, or undefined.
+ *
+ * Deliberately strict: this value is interpolated into an authenticated Twist API query,
+ * so it is constrained to digits — every id in this codebase is a Twist integer id
+ * (`Number(item.messageId)`, `thread_id`, `conversation_id`). Anything else (objects,
+ * arrays, booleans, "../../foo", "1 OR 1=1", a 400-char string) is garbage from our point
+ * of view and yields null, which degrades to the harmless full-poll fallback.
+ */
+function toContainerId(value) {
+  if (typeof value === "number") {
+    return Number.isSafeInteger(value) && value > 0 ? String(value) : undefined;
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return /^[1-9]\d{0,18}$/.test(trimmed) ? trimmed : undefined;
+  }
+  return undefined;
+}
+
+const firstId = (...values) => {
+  for (const v of values) {
+    const id = toContainerId(v);
+    if (id) return id;
+  }
+  return undefined;
+};
+
+/**
+ * Extract a container hint from an already-parsed webhook body.
+ *
+ * Twist delivers the affected object's fields at the top level alongside `event_type`;
+ * some proxies/relays nest the object under `data`. Both are checked, top level first.
+ *
+ * The event name only *prioritises* which field to read — an unrecognised or missing
+ * event name still falls through to the generic rule (`thread_id` → thread,
+ * `conversation_id` → conversation) so a new Twist event type degrades to "sweep the right
+ * container" rather than to "sweep everything".
+ *
+ * @param {unknown} body parsed JSON body (untrusted)
+ * @returns {{kind: "thread"|"conversation", id: string} | null}
+ */
+export function extractContainerHint(body) {
+  if (!isRecord(body)) return null;
+  const eventName = String(body.event_type ?? body.event_name ?? body.event ?? "").trim();
+  const scopes = [body, body.data].filter(isRecord);
+
+  for (const scope of scopes) {
+    // `id` is the container itself only for the container's own *_added/*_updated events;
+    // on a comment_added, `id` is the COMMENT id and must never be read as a thread id.
+    const isThreadObjectEvent = eventName.startsWith("thread_");
+    const isConversationObjectEvent = eventName.startsWith("conversation_");
+
+    if (THREAD_EVENTS.has(eventName)) {
+      const id = firstId(scope.thread_id, isThreadObjectEvent ? scope.id : undefined);
+      if (id) return { kind: "thread", id };
+    }
+    if (CONVERSATION_EVENTS.has(eventName)) {
+      const id = firstId(scope.conversation_id, isConversationObjectEvent ? scope.id : undefined);
+      if (id) return { kind: "conversation", id };
+    }
+    // Generic fallback: unknown/absent event name, or a known event missing its own field.
+    const threadId = toContainerId(scope.thread_id);
+    if (threadId) return { kind: "thread", id: threadId };
+    const conversationId = toContainerId(scope.conversation_id);
+    if (conversationId) return { kind: "conversation", id: conversationId };
+  }
+  return null;
+}
+
+/** Stable per-container coalescing key. */
+export const hintKey = (hint) => `${hint.kind}:${hint.id}`;
+
+/**
+ * Per-container trailing debouncer.
+ *
+ * A single human action in Twist can fan out into several deliveries (comment_added plus a
+ * thread_updated, a quick edit, a burst of replies). Sweeping per delivery would turn one
+ * conversation into N authenticated re-polls of the same container, so hints coalesce:
+ * within `delayMs` of the FIRST hint for a container, every further hint for that same
+ * container is absorbed, and exactly one flush happens at the end of the window.
+ *
+ * WHY THE WINDOW IS NOT EXTENDED by later hints (i.e. a fixed window from the first hint
+ * rather than a reset-on-every-hint debounce): an active thread producing an event every
+ * second would, under reset semantics, never flush at all — the sweep would starve for as
+ * long as people keep typing, which is precisely when it is most wanted. A fixed window
+ * bounds worst-case hint→sweep latency at `delayMs` while still collapsing a burst into one
+ * sweep. Containers are independent: each key runs its own window.
+ *
+ * Timers are injected so tests drive them deterministically instead of sleeping.
+ *
+ * @param {object} deps
+ * @param {number} deps.delayMs             trailing window per container
+ * @param {(hint:object)=>void|Promise<void>} deps.onFlush  called once per container per window
+ * @param {(fn:()=>void, ms:number)=>any} [deps.setTimer]
+ * @param {(handle:any)=>void} [deps.clearTimer]
+ * @param {(msg:string)=>void} [deps.log]
+ */
+export function createHintDebouncer({
+  delayMs = 2000,
+  onFlush,
+  setTimer = setTimeout,
+  clearTimer = clearTimeout,
+  log,
+} = {}) {
+  if (typeof onFlush !== "function") throw new Error("createHintDebouncer: onFlush is required");
+  const pending = new Map(); // key -> hint
+  const timers = new Map(); // key -> timer handle
+
+  const contain = (err) => log?.(`webhook hint flush failed: ${String(err)}`);
+
+  function flush(key) {
+    timers.delete(key);
+    const hint = pending.get(key);
+    pending.delete(key);
+    if (!hint) return;
+    try {
+      const result = onFlush(hint);
+      if (result && typeof result.then === "function") result.then(undefined, contain);
+    } catch (err) {
+      contain(err);
+    }
+  }
+
+  return {
+    /**
+     * @returns {"armed"|"coalesced"} whether this hint opened a new window or joined one.
+     */
+    push(hint) {
+      const key = hintKey(hint);
+      pending.set(key, hint);
+      if (timers.has(key)) return "coalesced";
+      timers.set(key, setTimer(() => flush(key), delayMs));
+      return "armed";
+    },
+    /** Drop every armed window without flushing — used on shutdown. */
+    cancelAll() {
+      for (const handle of timers.values()) clearTimer(handle);
+      timers.clear();
+      pending.clear();
+    },
+    size: () => timers.size,
+  };
+}
+
+/**
+ * Pull the shared secret off an incoming request.
+ *
+ * Twist's outgoing-webhook UI accepts a URL and nothing else — no custom headers — so the
+ * query parameter is the only channel the upstream can actually use, and it is the
+ * documented shape. Headers are still accepted so the endpoint can be exercised by curl /
+ * a relay without putting the secret in a URL.
+ *
+ * @param {string|undefined} url  req.url (path + query)
+ * @param {Record<string, string|string[]|undefined>} [headers]
+ * @returns {string} the presented token, or "" when none was presented
+ */
+export function extractRequestToken(url, headers = {}) {
+  try {
+    const fromQuery = new URL(url ?? "/", "http://localhost").searchParams.get("token");
+    if (fromQuery?.trim()) return fromQuery.trim();
+  } catch {
+    /* malformed URL: fall through to headers */
+  }
+  const pick = (v) => (Array.isArray(v) ? v[0] : v);
+  const custom = pick(headers["x-twist-webhook-token"]);
+  if (typeof custom === "string" && custom.trim()) return custom.trim();
+  const auth = pick(headers.authorization);
+  const bearer = typeof auth === "string" ? /^Bearer\s+(.+)$/i.exec(auth.trim()) : null;
+  return bearer ? bearer[1].trim() : "";
+}
+
+/**
+ * Build the parsed-body handler used by the HTTP wiring.
+ *
+ * Returns `(body, { token }) => decision`, where decision is one of:
+ *   {action:"unauthorized"}       — a `verifyToken` was configured and the token did not match
+ *   {action:"sweep", hint}        — a container id was recovered; a targeted sweep is scheduled
+ *   {action:"poll"}               — nothing recognizable; a full poll is scheduled instead
+ *
+ * `schedule` is invoked exactly once for the sweep/poll decisions and never for
+ * unauthorized. It MUST return promptly (enqueue, don't await): the HTTP response is sent
+ * right after this returns, and blocking the response on a Twist round-trip is how a
+ * webhook endpoint earns upstream timeouts and retries.
+ *
+ * `verifyToken` is optional and, when supplied, is defence in depth — the HTTP layer has
+ * already authenticated the target by the time the body is parsed. It is injected (rather
+ * than compared here) so this module needs no constant-time-compare dependency.
+ *
+ * @param {object} deps
+ * @param {(token:string)=>boolean} [deps.verifyToken]
+ * @param {(body:unknown)=>({kind:string,id:string}|null)} deps.extract
+ * @param {(decision:object)=>void} deps.schedule
+ * @param {(msg:string)=>void} [deps.log]
+ */
+export function createWebhookHandler({ verifyToken, extract = extractContainerHint, schedule, log } = {}) {
+  if (typeof schedule !== "function") throw new Error("createWebhookHandler: schedule is required");
+  return function handleParsedWebhookEvent(body, { token = "" } = {}) {
+    if (verifyToken && !verifyToken(token)) {
+      log?.("webhook event rejected: token mismatch");
+      return { action: "unauthorized" };
+    }
+    let hint = null;
+    try {
+      hint = extract(body);
+    } catch (err) {
+      // A throwing extractor is a bug, not an attack surface — but it must not 500 the
+      // endpoint into an upstream retry storm. Degrade to the full-poll fallback.
+      log?.(`webhook hint extraction failed: ${String(err)}`);
+    }
+    const decision = hint ? { action: "sweep", hint } : { action: "poll" };
+    try {
+      schedule(decision);
+    } catch (err) {
+      log?.(`webhook scheduling failed: ${String(err)}`);
+    }
+    return decision;
+  };
+}

@@ -173,7 +173,47 @@ export function createProducer({ client, queue, cursors, botUserId, freshSinceTs
     }
   }
 
+  /**
+   * Build the thread descriptor sweepThread expects from nothing but an id.
+   *
+   * `channel_id` matters: it becomes the queued item's channelId and therefore the
+   * message's groupId, which is what `resolveRequireMention` keys per-channel policy off.
+   * The poll path gets it from `threads/get_unread`; here it comes from an authenticated
+   * `threads/getone`. It deliberately does NOT come from the webhook payload — that body is
+   * unsigned, and letting a forged `channel_id` through would let an attacker pick which
+   * channel's mention policy applies. A failed lookup degrades to the wildcard policy
+   * (requireMention defaults to true), never to a more permissive one.
+   */
+  async function threadContainer(threadId) {
+    try {
+      const thread = await client.getThread(threadId, abortSignal);
+      return { thread_id: threadId, channel_id: thread?.channel_id };
+    } catch (err) {
+      log(`sweepContainer: thread ${threadId} metadata fetch failed: ${String(err)}`);
+      return { thread_id: threadId };
+    }
+  }
+
   return {
+    /**
+     * Sweep ONE container, using exactly the same machinery pollOnce uses for it — same
+     * cursor, same dedup, same fast-ack, same mark-read. This is the targeted entry point
+     * webhook hints funnel into: the hint says *where* to look, this re-fetches *what* is
+     * actually there from the Twist API with our own token.
+     *
+     * It is not a shortcut around the queue: a container swept here is indistinguishable
+     * afterwards from one swept by the poll loop, so a webhook that never arrives costs
+     * nothing but latency.
+     *
+     * @param {{kind: "thread"|"conversation", id: string|number}} hint
+     */
+    async sweepContainer({ kind, id } = {}) {
+      if (id === undefined || id === null || id === "") throw new Error("sweepContainer: id is required");
+      if (kind === "conversation") return await sweepConversation({ conversation_id: id });
+      if (kind === "thread") return await sweepThread(await threadContainer(id));
+      throw new Error(`sweepContainer: unknown container kind ${JSON.stringify(kind)}`);
+    },
+
     async pollOnce() {
       const convs = await client.getUnreadConversations(abortSignal);
       for (const c of convs) {
