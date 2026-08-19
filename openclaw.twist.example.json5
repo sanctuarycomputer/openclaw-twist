@@ -22,6 +22,15 @@
       groups: {
         "*": { requireMention: true },
       },
+
+      // OPTIONAL webhook ingress (off unless BOTH keys are set). Cuts mention→reply
+      // latency from one poll interval to ~2s. Twist webhooks are UNSIGNED, so a
+      // delivery is only ever a HINT to re-poll one container over the authenticated
+      // API — payload content is never ingested, and poll stays the source of truth.
+      // Twist URL: https://<gateway-host>/twist/events?token=<TWIST_WEBHOOK_TOKEN>
+      // webhook: "/twist/events",
+      // webhookToken: "${TWIST_WEBHOOK_TOKEN}",  // min 24 chars (openssl rand -hex 32); treat the whole URL as a secret
+      //                                          // NOTE: a URL token lands in Render request logs — rotate config + Twist settings together
     },
   },
 

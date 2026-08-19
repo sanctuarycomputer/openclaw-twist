@@ -173,7 +173,93 @@ export function createProducer({ client, queue, cursors, botUserId, freshSinceTs
     }
   }
 
+  /**
+   * Build the thread descriptor sweepThread expects from nothing but an id.
+   *
+   * `channel_id` matters: it becomes the queued item's channelId and therefore the
+   * message's groupId, which is what `resolveRequireMention` keys per-channel policy off.
+   * The poll path gets it from `threads/get_unread`; here it comes from an authenticated
+   * `threads/getone`. It deliberately does NOT come from the webhook payload — that body is
+   * unsigned, and letting a forged `channel_id` through would let an attacker pick which
+   * channel's mention policy applies. A failed lookup degrades to the wildcard policy
+   * (requireMention defaults to true), never to a more permissive one.
+   */
+  async function threadContainer(threadId) {
+    try {
+      const thread = await client.getThread(threadId, abortSignal);
+      return { thread_id: threadId, channel_id: thread?.channel_id };
+    } catch (err) {
+      log(`sweepContainer: thread ${threadId} metadata fetch failed: ${String(err)}`);
+      return { thread_id: threadId };
+    }
+  }
+
   return {
+    /**
+     * Sweep ONE container, using exactly the same machinery pollOnce uses for it — same
+     * cursor, same dedup, same fast-ack, same mark-read. This is the targeted entry point
+     * webhook hints funnel into: the hint says *where* to look, this re-fetches *what* is
+     * actually there from the Twist API with our own token.
+     *
+     * It is not a shortcut around the queue: a container swept here is indistinguishable
+     * afterwards from one swept by the poll loop, so a webhook that never arrives costs
+     * nothing but latency.
+     *
+     * THE UNTRACKED-THREAD GATE. A targeted sweep must only ever ACCELERATE work the poll
+     * would do anyway — it must never widen what gets ingested. For threads the two paths
+     * are not symmetric: pollOnce filters unread threads to `direct_mention` before
+     * sweeping, so a thread the bot was never mentioned in is never first-sighted. A hint,
+     * by contrast, names whatever container the upstream integration is installed on. So a
+     * hint for a thread with NO cursor (never tracked) would first-sight it and pull its
+     * newest fetch window into the durable queue — items the poll path would never have
+     * touched. The consumer would skip them terminally and correctly, but they are durable
+     * rows with 30-day tombstones, so a workspace-wide integration would turn all channel
+     * chatter into permanent queue growth.
+     *
+     * Untracked containers therefore do NOT get a targeted sweep. The hint degrades to
+     * "run a full poll", which applies the `direct_mention` filter exactly as today: a
+     * brand-new thread that DOES mention the bot is still picked up promptly (the hint
+     * triggered the poll), and chatter-only threads cost nothing durable. The enhancement
+     * stays purely accelerative.
+     *
+     * CONVERSATIONS ARE GATED THE SAME WAY, for a different reason. pollOnce sweeps
+     * conversations off the UNREAD list, so it only ever touches conversations Twist says
+     * have traffic for us. An ungated hint would instead let a caller name any
+     * conversation id at all and have the bot fetch it — an authenticated enumeration
+     * primitive (probe which ids exist, and warm them into our queue) handed to whoever
+     * holds the URL token. Gating on "we already track it" removes that entirely. A
+     * genuinely new conversation is not lost: the hint still schedules a full poll, and
+     * the poll picks it up from the unread set exactly as it does today.
+     *
+     * @param {{kind: "thread"|"conversation", id: string|number}} hint
+     * @returns {Promise<{swept: boolean, reason?: "untracked-thread"|"untracked-conversation"}>}
+     *   `swept:false` means the caller should schedule a full poll instead; not an error.
+     */
+    async sweepContainer({ kind, id } = {}) {
+      if (id === undefined || id === null || id === "") throw new Error("sweepContainer: id is required");
+      // Twist ids are integers everywhere else in this pipeline (the poll path reads them
+      // off API responses as numbers, and markThreadRead POSTs them as numbers). A hint
+      // arrives as a string, so it is coerced HERE, at the boundary, rather than leaving a
+      // string to travel into request bodies and cursor keys.
+      const numericId = Number(id);
+      if (!Number.isSafeInteger(numericId) || numericId <= 0) {
+        throw new Error(`sweepContainer: id must be a positive integer id, got ${JSON.stringify(id)}`);
+      }
+      if (kind === "conversation") {
+        if (cursors.isFirstSight("conversations", numericId)) {
+          return { swept: false, reason: "untracked-conversation" };
+        }
+        await sweepConversation({ conversation_id: numericId });
+        return { swept: true };
+      }
+      if (kind === "thread") {
+        if (cursors.isFirstSight("threads", numericId)) return { swept: false, reason: "untracked-thread" };
+        await sweepThread(await threadContainer(numericId));
+        return { swept: true };
+      }
+      throw new Error(`sweepContainer: unknown container kind ${JSON.stringify(kind)}`);
+    },
+
     async pollOnce() {
       const convs = await client.getUnreadConversations(abortSignal);
       for (const c of convs) {

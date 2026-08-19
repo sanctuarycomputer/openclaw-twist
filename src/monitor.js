@@ -25,6 +25,14 @@ import { postToTwist } from "./outbound.js";
 import { createQueueStore } from "./queue.js";
 import { createProducer } from "./producer.js";
 import { createConsumer, REPLAY_HORIZON_MS } from "./consumer.js";
+import {
+  MIN_WEBHOOK_TOKEN_LENGTH,
+  createHintDebouncer,
+  createWebhookHandler,
+  extractContainerHint,
+} from "./webhook.js";
+import { CYCLE_DEADLINE_MS, composeCycleSignal, createHintFunnel } from "./cycle.js";
+import { registerTwistWebhookRoute } from "./webhook-route.js";
 import { getTwistRuntime } from "./runtime.js";
 
 const ITEM_FETCH_LIMIT = 30;
@@ -34,6 +42,10 @@ const ITEM_FETCH_LIMIT = 30;
 // skipped by the consumer. Sized to span a realistic outage (not just a deploy): a
 // 10-minute window silently swallowed thread mentions that landed during longer downtime.
 const FIRST_SIGHT_GRACE_MS = 2 * 60 * 60 * 1000;
+// Trailing window for webhook hints. One human action can fan out into several deliveries;
+// this collapses them into a single targeted sweep while keeping hint→sweep latency well
+// inside the "⏳ within ~5s" product contract the fast-ack path is sized against.
+const WEBHOOK_HINT_DEBOUNCE_MS = 2000;
 
 /**
  * Per-process, per-queue-file ingestion state: one store, one in-flight map, one boot
@@ -321,9 +333,13 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
       text,
     });
 
-  // Built here rather than at the top of the function so `fastAck` (and the helpers it
-  // leans on) are already in scope.
-  const producer = createProducer({ client, queue, cursors, botUserId, freshSinceTs, now: Date.now, log, abortSignal, fastAck });
+  // Built PER CYCLE rather than once, so each cycle's Twist reads carry that cycle's
+  // deadline signal (see runCycle). The factory is pure closure construction — no I/O, no
+  // state of its own — so one allocation per poll is free; all durable state lives in the
+  // queue and cursor stores it is handed. Declared here rather than at the top of the
+  // function so `fastAck` (and the helpers it leans on) are already in scope.
+  const makeProducer = (signal) =>
+    createProducer({ client, queue, cursors, botUserId, freshSinceTs, now: Date.now, log, abortSignal: signal, fastAck });
 
   const consumer = createConsumer({
     queue, botUserId, now: Date.now, log,
@@ -332,10 +348,61 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
   });
 
   // ------------------------------------------------------------------ poll loop
+  //
+  // THE SEAM webhook hints funnel into, and why it is this one.
+  //
+  // Before webhooks, mutual exclusion between cycles was implicit: `loop()` only re-armed
+  // its timer AFTER its cycle resolved, so exactly one cycle could ever be in flight and
+  // nothing needed a lock. A webhook-triggered sweep firing on its own would break that by
+  // construction — two concurrent sweeps of the same container would double-fetch from the
+  // same cursor, and both would see the same items as "not yet queued" (`queue.has` is read
+  // before the awaited `enqueueAll`), so the loser's fast-ack would fire twice and the
+  // cursor could be written backwards.
+  //
+  // Rather than bolt a lock onto a loop that never had one, hints funnel into
+  // `pendingHints` and every cycle — scheduled or webhook-triggered — goes through
+  // `runExclusive`, which chains cycles onto a single promise. That makes the old implicit
+  // invariant explicit and total: at most one cycle body runs at a time, webhook and poll
+  // sweeps included, and they take the queue/cursor stores in the same order they always
+  // did. The alternative (a mutex around producer.sweep*) would have serialized the sweeps
+  // but still let a webhook cycle's consumer.tick() interleave with the poll cycle's, which
+  // is a different race for no benefit.
+  //
+  // The funnel is a bounded Map keyed by container, so a hint arriving while a cycle is
+  // running is absorbed into the NEXT cycle rather than dropped or duplicated — and a
+  // FLOOD of hints degrades to "just do a full poll" instead of queueing unbounded work.
+  // See cycle.js for why every overflow path is safe.
+  const funnel = createHintFunnel({ log });
+  let cycleChain = Promise.resolve();
 
-  async function pollOnce() {
+  async function runCycle({ full, signal }) {
+    const drained = funnel.drain();
+    let sweepAll = full || drained.sweepAll;
+    // A queued webhook cycle whose hints an earlier cycle already drained has nothing to do.
+    if (!sweepAll && drained.hints.length === 0) return;
     cycle++;
-    await producer.pollOnce();
+    // This cycle's producer carries this cycle's deadline, so a stalling Twist read is
+    // actively cancelled rather than merely abandoned.
+    const producer = makeProducer(signal);
+    for (const hint of drained.hints) {
+      if (stopped) return;
+      try {
+        const outcome = await producer.sweepContainer(hint);
+        // An untracked container is not swept directly: for threads that would ingest what
+        // the poll's direct_mention filter would never have touched, and for conversations
+        // it would be an authenticated enumeration primitive. Either way the hint degrades
+        // to a full poll, which still picks the container up if the poll would have.
+        if (outcome?.swept === false) {
+          sweepAll = true;
+          if (core.logging?.shouldLogVerbose?.()) {
+            log(`webhook hint ${hint.kind}:${hint.id} degraded to a full poll (${outcome.reason})`);
+          }
+        }
+      } catch (err) {
+        log(`webhook sweep ${hint.kind}:${hint.id} failed: ${String(err)}`);
+      }
+    }
+    if (sweepAll) await producer.pollOnce();
     if (stopped) return;
     await consumer.tick();
     await queue.prune(Date.now());
@@ -344,21 +411,151 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
     }
   }
 
+  /**
+   * Run one cycle under a hard wall-clock deadline.
+   *
+   * The composed signal cancels the producer's in-flight reads, which is where a stalling
+   * Twist API actually bites. The race is the backstop: it guarantees the exclusive chain
+   * is RELEASED at the deadline even if something the signal doesn't reach is slow, so a
+   * single bad cycle can never stop the bot answering anyone.
+   *
+   * Abandoning a cycle mid-flight is safe by construction: cursors advance only over
+   * batches already durably enqueued, enqueue is idempotent by item id, and `tick()` has
+   * its own reentrancy guard — so the next cycle simply re-sweeps.
+   */
+  async function runCycleWithDeadline({ full }) {
+    const { signal, deadline } = composeCycleSignal(abortSignal, { deadlineMs: CYCLE_DEADLINE_MS });
+    let done = false;
+    let failure = null;
+    // Always settles, so abandoning it below can never leave an unhandled rejection.
+    const body = runCycle({ full, signal }).then(
+      () => { done = true; },
+      (err) => { done = true; failure = err; },
+    );
+    if (deadline) {
+      const blown = new Promise((resolve) => {
+        if (deadline.aborted) resolve();
+        else deadline.addEventListener("abort", () => resolve(), { once: true });
+      });
+      await Promise.race([body, blown]);
+      if (!done) {
+        // Loud on purpose: this means Twist stalled past two minutes, which is never normal
+        // and is the difference between "slow" and "the bot has gone quiet".
+        log(
+          `poll cycle #${cycle} exceeded the ${CYCLE_DEADLINE_MS}ms deadline — abandoning it and releasing the poll chain; the next cycle re-sweeps (cursor + queue dedup make that safe)`,
+        );
+        return;
+      }
+    } else {
+      await body;
+    }
+    if (failure) throw failure;
+  }
+
+  /** Run a cycle with global mutual exclusion; never rejects (failures are logged). */
+  function runExclusive(full) {
+    const run = cycleChain.then(async () => {
+      if (stopped) return;
+      try {
+        await runCycleWithDeadline({ full });
+      } catch (err) {
+        log(`poll cycle failed: ${String(err)}`);
+      }
+    });
+    // Chain off the settled promise so one failed cycle cannot poison every later one.
+    cycleChain = run.catch(() => {});
+    return run;
+  }
+
   async function loop() {
     if (stopped) return;
-    try {
-      await pollOnce();
-    } catch (err) {
-      log(`poll cycle failed: ${String(err)}`);
-    }
+    await runExclusive(true);
     if (stopped) return;
     timer = setTimeout(loop, account.pollIntervalMs);
   }
 
-  abortSignal?.addEventListener?.("abort", () => {
+  // ------------------------------------------------------------- webhook ingress
+
+  // Hints are debounced per container, then handed to the funnel. The debouncer collapses
+  // an event burst for ONE container; the funnel collapses across containers and across a
+  // cycle that is already running, and caps both.
+  const hintDebouncer = createHintDebouncer({
+    delayMs: WEBHOOK_HINT_DEBOUNCE_MS,
+    log,
+    onFlush: (hint) => {
+      if (stopped) return;
+      funnel.push(hint);
+      void runExclusive(false);
+    },
+  });
+
+  let unregisterWebhook = null;
+
+  function shutdown() {
     stopped = true;
     if (timer) clearTimeout(timer);
-  });
+    hintDebouncer.cancelAll();
+    try {
+      unregisterWebhook?.();
+    } catch (err) {
+      log(`webhook deregistration failed: ${String(err)}`);
+    }
+    unregisterWebhook = null;
+  }
+
+  /**
+   * Open the webhook route. Deliberately NOT called until boot orphan recovery has
+   * settled: a hint that lands mid-recovery would schedule a cycle, and that cycle's
+   * consumer.tick() would run against items recoverOrphans() is still probing — exactly
+   * the double-dispatch the "recovery completes before the first tick" invariant exists
+   * to prevent. Latency costs nothing here; correctness does.
+   */
+  function startWebhookIngress() {
+    // `stopped` is re-checked HERE, not only at the top of the monitor: this runs after an
+    // awaited boot recovery, and the account can be aborted during that await. Registering
+    // a route for an account that is already shutting down would leak it — shutdown() has
+    // already run and will not run again to deregister it.
+    if (stopped) return;
+    if (!account.webhookEnabled) {
+      if (account.webhookDisabledReason === "token-too-short") {
+        // An ERROR, not a debug line: the operator explicitly asked for webhook ingress and
+        // is not getting it. Silence here looks exactly like "webhooks are broken".
+        (runtime.error ?? log)(
+          `[twist] webhook ingress REFUSED: channels.twist.webhookToken is shorter than ${MIN_WEBHOOK_TOKEN_LENGTH} characters. ` +
+            "The token travels in the webhook URL and is the endpoint's only authentication — use a long random value " +
+            "(e.g. `openssl rand -hex 32`). Continuing with poll only.",
+        );
+      }
+      return;
+    }
+    const onEvent = createWebhookHandler({
+      extract: extractContainerHint,
+      log,
+      // Scheduling only — this returns immediately so the HTTP 200 is not held behind a
+      // Twist round-trip. "poll" rides the same debouncer under a reserved key so a flood
+      // of unrecognizable deliveries collapses exactly like a flood of real ones.
+      schedule: (decision) =>
+        hintDebouncer.push(decision.action === "sweep" ? decision.hint : { kind: "all", id: "*" }),
+    });
+    try {
+      unregisterWebhook = registerTwistWebhookRoute({
+        accountId: account.accountId,
+        path: account.webhookPath,
+        secret: account.webhookToken,
+        config: cfg,
+        runtime,
+        statusSink,
+        onEvent,
+      });
+      log(`webhook ingress enabled at ${account.webhookPath} (hint-only; poll remains authoritative)`);
+    } catch (err) {
+      // Never fatal: the poll loop is the source of truth and works without this.
+      log(`webhook ingress registration failed (continuing with poll only): ${String(err)}`);
+      unregisterWebhook = null;
+    }
+  }
+
+  abortSignal?.addEventListener?.("abort", shutdown);
 
   // Boot-only: items left "processing" by a CRASHED process are probed and either marked
   // done (the reply landed) or requeued. MUST complete before the first tick(), and must
@@ -373,12 +570,8 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
   await queueEntry.recovery;
 
   log(`polling workspace ${account.workspaceId} every ${account.pollIntervalMs}ms (bot ${botUserId})`);
+  startWebhookIngress(); // only now — recovery has settled, so a hint can safely schedule a cycle
   void loop();
 
-  return {
-    stop: () => {
-      stopped = true;
-      if (timer) clearTimeout(timer);
-    },
-  };
+  return { stop: shutdown };
 }
