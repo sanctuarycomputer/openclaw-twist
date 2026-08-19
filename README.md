@@ -63,7 +63,7 @@ If the gateway is reachable from the internet, Twist's **outgoing webhooks** can
 - **Therefore the blast radius of a perfectly forged payload is one rate-limited, authenticated re-poll of one container.** It cannot inject a message, impersonate a sender, or make the bot say anything.
 - **Poll remains the source of truth.** A delivery that never arrives, arrives twice, arrives out of order, or is dropped entirely **costs nothing** — the next poll picks the same messages up, deduped by id. There is no reconciliation to do and no failure mode to monitor. If the webhook is broken, the bot is simply as fast as it was before.
 - Unrecognizable payloads fall back to scheduling a normal full poll, which is what would have happened anyway.
-- Hints are **debounced per container (~2s trailing)**, so a burst of events on one thread produces one sweep, and webhook sweeps are serialized against the poll loop — they never run concurrently with it.
+- Hints are **debounced per container (~2s trailing)**, so a burst of events on one thread produces one sweep, and webhook sweeps are serialized against the poll loop — they never run concurrently with it. Every stage is bounded; see [Behaviour under flood](#behaviour-under-flood).
 
 **Setup.** Both keys are required; set only one and no route is registered (a path without a token would be an unauthenticated trigger open to the internet).
 
@@ -82,9 +82,35 @@ Then in Twist → **Settings → Integrations → Add integration → Outgoing w
 https://<gateway-host>/twist/events?token=<TWIST_WEBHOOK_TOKEN>
 ```
 
-The token goes **in the URL query string** because Twist's outgoing-webhook UI accepts a URL and nothing else — no custom headers. Since it is unsigned, that token is the *only* authentication on the endpoint, so treat the whole URL as a secret: use a long random value (`openssl rand -hex 32`), keep it out of committed config (`TWIST_WEBHOOK_TOKEN`), and rotate it by changing the env var and the URL together. `X-Twist-Webhook-Token: <token>` and `Authorization: Bearer <token>` are also accepted, for curl and for relays that can set headers.
+The token goes **in the URL query string** because Twist's outgoing-webhook UI accepts a URL and nothing else — no custom headers. Since the delivery is unsigned, that token is the *only* authentication on the endpoint. `X-Twist-Webhook-Token: <token>` and `Authorization: Bearer <token>` are also accepted, for curl and for relays that can set headers.
 
-**The enhancement is purely accelerative — it never widens what gets ingested.** A hint names whatever container the integration is installed on, but the poll filters channel threads to `direct_mention` before sweeping them. So a hint for a thread the pipeline doesn't already track gets **no targeted sweep**: it degrades to scheduling an ordinary full poll, which applies the same `direct_mention` filter it always has. A brand-new thread that *does* mention the bot is still picked up promptly (the hint is what triggered that poll); a thread that is merely being chattered in costs nothing durable. Conversations need no such gate — the poll sweeps every unread conversation with no mention filter, so hint-sweeping an unknown conversation matches poll semantics exactly, first-sight backlog rules included. The upshot: you can install the integration workspace-wide without it inflating the queue.
+**Treat the whole URL as a secret.** Tokens shorter than 24 characters are refused outright (logged as an error, ingress stays off) — use `openssl rand -hex 32`. Keep it out of committed config via `TWIST_WEBHOOK_TOKEN`.
+
+> **Operational note:** a token in a query string **appears in Render's platform request logs**, and in any proxy or CDN log in front of the gateway. That is inherent to the URL-token design Twist forces, not a bug in this plugin — but it means anyone with log access effectively has the token. Rotate on any suspicion of leak, and on staff offboarding. **Rotation is two steps that must happen together:** update `TWIST_WEBHOOK_TOKEN` (or `channels.twist.webhookToken`) *and* update the URL in Twist's integration settings. Between the two the endpoint returns 401 and deliveries are dropped — which costs nothing, because the poll loop covers the gap.
+
+### Behaviour under flood
+
+The endpoint is reachable by anyone who learns the URL, so it is built to make a flood boring rather than to assume it won't happen. Every layer degrades toward "just do a normal poll", which is always safe because a full poll is a strict superset of any set of targeted sweeps.
+
+| Layer | Bound |
+|---|---|
+| Rate limit | 120 requests/min per (path, client IP), fixed window (SDK default) → 429 |
+| Concurrency | 8 in-flight handlers per (path, client IP) (SDK default) → 429. Catches slow-body floods that stay under the rate cap |
+| Body | 64 KiB, 10s read timeout → 413 / 408 |
+| Debounce | ~2s trailing per container: a burst on one thread is one sweep |
+| Pending hints | 32 distinct containers max. Beyond that the pending set is **dropped** and one full poll runs instead |
+| Per cycle | At most 32 containers swept; any remainder becomes a full poll |
+| Cycle deadline | 2 minutes. A cycle that overruns is abandoned (loudly logged) and the poll chain is released, so a stalling Twist API can never make the bot go quiet. Cursor + queue dedup make the next cycle's re-sweep safe |
+| Container gates | Untracked threads *and* conversations are never swept on a hint — they degrade to a full poll |
+
+Client IPs are resolved through the gateway's `trustedProxies` config. Without it, everything behind a reverse proxy shares one rate-limit bucket and a single sender could push everyone else into 429s — so **after deploying, verify that two different source IPs land in distinct buckets** (send >120 req/min from one and confirm the other still gets 200s).
+
+**The enhancement is purely accelerative — it never widens what gets ingested.** A targeted sweep only ever runs against a container the pipeline **already tracks**. Anything else degrades to scheduling an ordinary full poll:
+
+- **Threads** — the poll filters channel threads to `direct_mention` before sweeping, so an ungated hint would first-sight threads the poll would never have touched and turn workspace chatter into durable queue rows. A brand-new thread that *does* mention the bot is still picked up promptly, by the poll the hint just triggered.
+- **Conversations** — the poll only sweeps conversations off the *unread* list. An ungated hint would let whoever holds the URL token name any conversation id and have the bot fetch it: an authenticated enumeration primitive. Gated, a hint reveals nothing about a conversation we don't already follow, and a genuinely new conversation still arrives via the hint-triggered poll.
+
+The upshot: you can install the integration workspace-wide without it inflating the queue or leaking anything.
 
 Requests are guarded the same way the host's bundled webhook channels guard theirs: POST only, per-IP fixed-window rate limiting, JSON content-type enforcement, a 64 KiB/10s bounded body read, constant-time token comparison, and anomaly counters on every rejection. The handler schedules and returns — the HTTP 200 never waits on a Twist round-trip.
 
@@ -170,7 +196,7 @@ See [`openclaw.twist.example.json5`](./openclaw.twist.example.json5) for a fully
 | `groups."*".requireMention` | boolean | `true` | Require `@mention` in groups/threads |
 | `defaultTo` | string | — | Default delivery target for cron/proactive messages (e.g. `"thread:7882650"` or `"conv:123"`). Falls back to `TWIST_DEFAULT_TO` env var. |
 | `webhook` | string | — | Optional gateway route path for [webhook ingress](#webhook-ingress-optional-off-by-default), e.g. `"/twist/events"`. Falls back to `TWIST_WEBHOOK_PATH`. |
-| `webhookToken` | string | — | Shared secret presented as `?token=…`. Falls back to `TWIST_WEBHOOK_TOKEN`. Required alongside `webhook` — set one without the other and nothing is registered. |
+| `webhookToken` | string | — | Shared secret presented as `?token=…`. Falls back to `TWIST_WEBHOOK_TOKEN`. Required alongside `webhook` — set one without the other and nothing is registered. **Minimum 24 characters**; shorter tokens are refused with an error and ingress stays off. |
 
 ## Optional: richer Twist tools via MCP
 

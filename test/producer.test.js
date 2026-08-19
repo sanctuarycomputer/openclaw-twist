@@ -218,21 +218,56 @@ test("first-sight thread with no comments does not mark as read", async () => {
 // path's per-container internals verbatim, so these tests mostly assert SAMENESS: the
 // cursor, dedup, fast-ack and mark-read behaviour must be indistinguishable from pollOnce.
 
-test("sweepContainer(conversation) enqueues an UNTRACKED conversation — poll has no mention filter there either", async () => {
+test("sweepContainer(conversation) sweeps a TRACKED conversation without touching the unread lists", async () => {
   const state = {
     convs: [{ conversation_id: 9 }],
-    convMsgs: { 9: [{ id: 501, obj_index: 0, creator: 427360, posted_ts: FRESH_TS + 100, content: "hey bot" }] },
+    convMsgs: { 9: [{ id: 501, obj_index: 1, creator: 427360, posted_ts: FRESH_TS + 100, content: "hey bot" }] },
   };
   const { queue, cursors, producer } = await build(state);
-  assert.equal(cursors.isFirstSight("conversations", 9), true, "precondition: never tracked");
+  await cursors.setCursor("conversations", 9, 0); // the poll already tracks this conversation
 
   const outcome = await producer.sweepContainer({ kind: "conversation", id: 9 });
 
   assert.deepEqual(outcome, { swept: true });
   assert.equal(queue.has("conv-msg:501"), true);
   assert.equal(queue.get("conv-msg:501").peerId, "conv:9");
-  assert.equal(cursors.getCursor("conversations", 9), 0);
+  assert.equal(cursors.getCursor("conversations", 9), 1);
   assert.equal(state.unreadCalls, undefined, "a targeted sweep must not fetch the unread lists");
+});
+
+// Conversations are gated for a different reason than threads: pollOnce only ever sweeps
+// conversations off the UNREAD list, so an ungated hint would let whoever holds the URL
+// token name ANY conversation id and have the bot fetch it — an authenticated enumeration
+// primitive. Gating on "already tracked" removes it.
+test("sweepContainer(conversation) does NOT sweep an untracked conversation — no enumeration primitive", async () => {
+  const state = {
+    convMsgs: { 9: msgRun(1, 5) },
+  };
+  const { queue, cursors, producer } = await build(state);
+  assert.equal(cursors.isFirstSight("conversations", 9), true, "precondition: never tracked");
+
+  const outcome = await producer.sweepContainer({ kind: "conversation", id: 9 });
+
+  assert.deepEqual(outcome, { swept: false, reason: "untracked-conversation" });
+  assert.equal(queue.itemsInState("queued").length, 0, "nothing durable was created");
+  assert.equal(state.fetches, undefined, "the conversation was never fetched — nothing is learned about it");
+  assert.equal(cursors.isFirstSight("conversations", 9), true, "and it is still untracked");
+});
+
+test("sweepContainer gate is per-container: a tracked conversation sweeps while an untracked one degrades", async () => {
+  const state = { convMsgs: { 9: msgRun(1, 2), 10: msgRun(1, 2) } };
+  const { queue, cursors, producer } = await build(state);
+  await cursors.setCursor("conversations", 9, 0);
+
+  assert.deepEqual(await producer.sweepContainer({ kind: "conversation", id: 9 }), { swept: true });
+  assert.deepEqual(await producer.sweepContainer({ kind: "conversation", id: 10 }), {
+    swept: false,
+    reason: "untracked-conversation",
+  });
+  assert.deepEqual(
+    queue.itemsInState("queued").map((i) => i.conversationId),
+    [9, 9],
+  );
 });
 
 // The gate that keeps the webhook purely ACCELERATIVE. pollOnce filters unread threads to
@@ -293,13 +328,24 @@ test("sweepContainer(thread) gate is per-thread: a tracked thread sweeps while a
   );
 });
 
-test("sweepContainer(conversation) accepts a string id (ids arrive from a webhook as strings)", async () => {
+// Hints arrive as strings; the poll path treats Twist ids as numbers (markThreadRead POSTs
+// them). The coercion happens once, at this boundary.
+test("sweepContainer coerces a string id to a number at the boundary", async () => {
   const state = {
-    convMsgs: { 9: [{ id: 501, obj_index: 0, creator: 427360, posted_ts: FRESH_TS + 100, content: "hey" }] },
+    convMsgs: { 9: [{ id: 501, obj_index: 1, creator: 427360, posted_ts: FRESH_TS + 100, content: "hey" }] },
+    threadObjs: { 7: { id: 7, channel_id: 3 } },
+    threadComments: { 7: [{ id: 88, obj_index: 1, creator: 427360, posted_ts: FRESH_TS + 60, content: "ping" }] },
   };
-  const { queue, producer } = await build(state);
+  const { queue, cursors, producer } = await build(state);
+  await cursors.setCursor("conversations", 9, 0);
+  await cursors.setCursor("threads", 7, 0);
+
   await producer.sweepContainer({ kind: "conversation", id: "9" });
-  assert.equal(queue.has("conv-msg:501"), true);
+  await producer.sweepContainer({ kind: "thread", id: "7" });
+
+  assert.equal(queue.get("conv-msg:501").conversationId, 9, "a number, not the string \"9\"");
+  assert.equal(queue.get("thread-comment:88").threadId, 7);
+  assert.deepEqual(state.marked, [[7, 1]], "markThreadRead gets a numeric id like the poll path");
 });
 
 test("sweepContainer(thread) pages forward from an existing cursor, same as the poll path", async () => {
@@ -339,7 +385,8 @@ test("sweepContainer then pollOnce does not double-enqueue or double-ack", async
     convs: [{ conversation_id: 9 }],
     convMsgs: { 9: msgRun(1, 3) },
   };
-  const { queue, producer } = await build(state, { fastAck: async (item) => { acked.push(item.id); } });
+  const { queue, cursors, producer } = await build(state, { fastAck: async (item) => { acked.push(item.id); } });
+  await cursors.setCursor("conversations", 9, 0);
 
   await producer.sweepContainer({ kind: "conversation", id: 9 });
   await producer.pollOnce();
@@ -351,7 +398,8 @@ test("sweepContainer then pollOnce does not double-enqueue or double-ack", async
 test("sweepContainer fast-acks newly enqueued items exactly like a poll sweep", async () => {
   const acked = [];
   const state = { convMsgs: { 9: msgRun(1, 2) } };
-  const { producer } = await build(state, { fastAck: async (item) => { acked.push(item.id); } });
+  const { cursors, producer } = await build(state, { fastAck: async (item) => { acked.push(item.id); } });
+  await cursors.setCursor("conversations", 9, 0);
   await producer.sweepContainer({ kind: "conversation", id: 9 });
   assert.deepEqual(acked, ["conv-msg:1001", "conv-msg:1002"]);
 });
@@ -362,4 +410,13 @@ test("sweepContainer rejects a container it cannot address instead of sweeping s
   await assert.rejects(() => producer.sweepContainer({ kind: "thread" }), /id is required/);
   await assert.rejects(() => producer.sweepContainer({ kind: "thread", id: "" }), /id is required/);
   await assert.rejects(() => producer.sweepContainer(), /id is required/);
+  // A non-numeric id can only come from a bug or a forged hint that slipped the extractor;
+  // it must never reach an API query.
+  for (const bad of ["abc", "../../x", "1 OR 1=1", "1.5", "-3", "0", "9".repeat(30), Number.NaN]) {
+    await assert.rejects(
+      () => producer.sweepContainer({ kind: "thread", id: bad }),
+      /must be a positive integer id/,
+      `expected rejection for ${String(bad)}`,
+    );
+  }
 });

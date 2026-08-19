@@ -216,29 +216,45 @@ export function createProducer({ client, queue, cursors, botUserId, freshSinceTs
      * rows with 30-day tombstones, so a workspace-wide integration would turn all channel
      * chatter into permanent queue growth.
      *
-     * Untracked threads therefore do NOT get a targeted sweep. The hint degrades to
+     * Untracked containers therefore do NOT get a targeted sweep. The hint degrades to
      * "run a full poll", which applies the `direct_mention` filter exactly as today: a
      * brand-new thread that DOES mention the bot is still picked up promptly (the hint
      * triggered the poll), and chatter-only threads cost nothing durable. The enhancement
      * stays purely accelerative.
      *
-     * Conversations need no such gate: pollOnce sweeps every unread conversation without a
-     * mention filter, so hint-sweeping an unknown conversation matches poll semantics
-     * exactly — including the first-sight backlog rules.
+     * CONVERSATIONS ARE GATED THE SAME WAY, for a different reason. pollOnce sweeps
+     * conversations off the UNREAD list, so it only ever touches conversations Twist says
+     * have traffic for us. An ungated hint would instead let a caller name any
+     * conversation id at all and have the bot fetch it — an authenticated enumeration
+     * primitive (probe which ids exist, and warm them into our queue) handed to whoever
+     * holds the URL token. Gating on "we already track it" removes that entirely. A
+     * genuinely new conversation is not lost: the hint still schedules a full poll, and
+     * the poll picks it up from the unread set exactly as it does today.
      *
      * @param {{kind: "thread"|"conversation", id: string|number}} hint
-     * @returns {Promise<{swept: boolean, reason?: "untracked-thread"}>} `swept:false` means
-     *   the caller should schedule a full poll instead; it is not an error.
+     * @returns {Promise<{swept: boolean, reason?: "untracked-thread"|"untracked-conversation"}>}
+     *   `swept:false` means the caller should schedule a full poll instead; not an error.
      */
     async sweepContainer({ kind, id } = {}) {
       if (id === undefined || id === null || id === "") throw new Error("sweepContainer: id is required");
+      // Twist ids are integers everywhere else in this pipeline (the poll path reads them
+      // off API responses as numbers, and markThreadRead POSTs them as numbers). A hint
+      // arrives as a string, so it is coerced HERE, at the boundary, rather than leaving a
+      // string to travel into request bodies and cursor keys.
+      const numericId = Number(id);
+      if (!Number.isSafeInteger(numericId) || numericId <= 0) {
+        throw new Error(`sweepContainer: id must be a positive integer id, got ${JSON.stringify(id)}`);
+      }
       if (kind === "conversation") {
-        await sweepConversation({ conversation_id: id });
+        if (cursors.isFirstSight("conversations", numericId)) {
+          return { swept: false, reason: "untracked-conversation" };
+        }
+        await sweepConversation({ conversation_id: numericId });
         return { swept: true };
       }
       if (kind === "thread") {
-        if (cursors.isFirstSight("threads", id)) return { swept: false, reason: "untracked-thread" };
-        await sweepThread(await threadContainer(id));
+        if (cursors.isFirstSight("threads", numericId)) return { swept: false, reason: "untracked-thread" };
+        await sweepThread(await threadContainer(numericId));
         return { swept: true };
       }
       throw new Error(`sweepContainer: unknown container kind ${JSON.stringify(kind)}`);

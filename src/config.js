@@ -1,6 +1,7 @@
 // Account/config resolution for the single-account Twist channel.
 import { readFileSync } from "node:fs";
 import { createTopLevelChannelConfigAdapter } from "openclaw/plugin-sdk/channel-config-helpers";
+import { resolveWebhookIngressConfig } from "./webhook.js";
 
 export const SECTION_KEY = "twist";
 export const DEFAULT_ACCOUNT_ID = "default";
@@ -48,11 +49,12 @@ export function resolveTwistAccount(cfg) {
     Number(section.pollIntervalMs ?? process.env.TWIST_POLL_INTERVAL_MS) || DEFAULT_POLL_INTERVAL_MS;
   const defaultTo = firstNonEmpty(section.defaultTo, process.env.TWIST_DEFAULT_TO);
   // Webhook ingress is a progressive enhancement over the poll loop and is OFF unless both
-  // halves are present: without a path there is nothing to register, and without a token
-  // the route would be an unauthenticated trigger open to the internet. Never default
-  // either one.
+  // halves are present and the token is long enough to be a real secret. The policy lives
+  // in webhook.js so it is unit-testable — this module imports the openclaw SDK and cannot
+  // be loaded in the plugin's own test environment.
   const webhookPath = firstNonEmpty(section.webhook, process.env.TWIST_WEBHOOK_PATH);
   const webhookToken = resolveSecret({ value: section.webhookToken, envName: "TWIST_WEBHOOK_TOKEN" });
+  const webhookIngress = resolveWebhookIngressConfig({ path: webhookPath, token: webhookToken });
   return {
     accountId: DEFAULT_ACCOUNT_ID,
     config: section,
@@ -63,7 +65,8 @@ export function resolveTwistAccount(cfg) {
     defaultTo,
     webhookPath,
     webhookToken,
-    webhookEnabled: Boolean(webhookPath && webhookToken),
+    webhookEnabled: webhookIngress.enabled,
+    webhookDisabledReason: webhookIngress.enabled ? undefined : webhookIngress.reason,
     configured: Boolean(token && workspaceId && botUserId),
   };
 }

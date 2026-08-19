@@ -12,10 +12,12 @@
 // untrusted) payload reach the hint extractor.
 import {
   WEBHOOK_ANOMALY_COUNTER_DEFAULTS,
+  WEBHOOK_IN_FLIGHT_DEFAULTS,
   WEBHOOK_RATE_LIMIT_DEFAULTS,
   applyBasicWebhookRequestGuards,
   createFixedWindowRateLimiter,
   createWebhookAnomalyTracker,
+  createWebhookInFlightLimiter,
   readJsonWebhookBodyOrReject,
   registerWebhookTargetWithPluginRoute,
   resolveRequestClientIp,
@@ -38,6 +40,10 @@ const rateLimiter = createFixedWindowRateLimiter({
   maxRequests: WEBHOOK_RATE_LIMIT_DEFAULTS.maxRequests,
   maxTrackedKeys: WEBHOOK_RATE_LIMIT_DEFAULTS.maxTrackedKeys,
 });
+// Caps CONCURRENT handlers per (path, client). The fixed-window limiter bounds request
+// RATE, but a sender that opens many slow-bodied requests at once stays under the rate cap
+// while pinning sockets and body-read timers; this is the guard for that shape of flood.
+const inFlightLimiter = createWebhookInFlightLimiter(WEBHOOK_IN_FLIGHT_DEFAULTS);
 const anomalyTracker = createWebhookAnomalyTracker({
   maxTrackedKeys: WEBHOOK_ANOMALY_COUNTER_DEFAULTS.maxTrackedKeys,
   ttlMs: WEBHOOK_ANOMALY_COUNTER_DEFAULTS.ttlMs,
@@ -81,6 +87,9 @@ async function handleTwistWebhookRequest(req, res) {
     res,
     targetsByPath: webhookTargets,
     allowMethods: ["POST"],
+    inFlightLimiter,
+    // Same (path, client) identity the rate limiter uses, so both caps describe one sender.
+    inFlightKey: ({ req: r, path, targets }) => rateLimitKeyFor(r, path, targets[0]),
     handle: async ({ targets, path }) => {
       const nowMs = Date.now();
       if (

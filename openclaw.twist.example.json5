@@ -29,7 +29,8 @@
       // API — payload content is never ingested, and poll stays the source of truth.
       // Twist URL: https://<gateway-host>/twist/events?token=<TWIST_WEBHOOK_TOKEN>
       // webhook: "/twist/events",
-      // webhookToken: "${TWIST_WEBHOOK_TOKEN}",  // prefer the env var; treat the URL as a secret
+      // webhookToken: "${TWIST_WEBHOOK_TOKEN}",  // min 24 chars (openssl rand -hex 32); treat the whole URL as a secret
+      //                                          // NOTE: a URL token lands in Render request logs — rotate config + Twist settings together
     },
   },
 

@@ -1,11 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  MIN_WEBHOOK_TOKEN_LENGTH,
   createHintDebouncer,
   createWebhookHandler,
   extractContainerHint,
   extractRequestToken,
   hintKey,
+  resolveWebhookIngressConfig,
 } from "../src/webhook.js";
 
 // ---------------------------------------------------------------- fake timers
@@ -169,6 +171,16 @@ test("extractContainerHint: garbage id VALUES are rejected, not interpolated", (
 
 test("extractContainerHint: an absurdly long numeric string is rejected", () => {
   assert.equal(extractContainerHint({ thread_id: "1".repeat(64) }), null);
+});
+
+// sweepContainer coerces the id back to a Number, so the accepted width must round-trip
+// without precision loss. 15 digits is the widest that always does; real ids are ~7.
+test("extractContainerHint: accepted ids survive the Number() round-trip sweepContainer does", () => {
+  const widest = "9".repeat(15);
+  assert.deepEqual(extractContainerHint({ thread_id: widest }), { kind: "thread", id: widest });
+  assert.equal(String(Number(widest)), widest, "and it round-trips exactly");
+
+  assert.equal(extractContainerHint({ thread_id: "9".repeat(16) }), null, "16 digits is refused");
 });
 
 test("hintKey: distinguishes kinds sharing an id", () => {
@@ -439,4 +451,73 @@ test("handler → debouncer: an event burst on one thread produces ONE sweep", (
     { kind: "conversation", id: "34567" },
     { kind: "all", id: "*" },
   ]);
+});
+
+// ---------------------------------------------- resolveWebhookIngressConfig
+
+test("ingress config: both halves present and a long token → enabled", () => {
+  const token = "a".repeat(MIN_WEBHOOK_TOKEN_LENGTH);
+  assert.deepEqual(resolveWebhookIngressConfig({ path: "/twist/events", token }), {
+    enabled: true,
+    path: "/twist/events",
+    token,
+  });
+});
+
+test("ingress config: a short token is REFUSED, not silently accepted", () => {
+  // The token rides in the URL and is the endpoint's only authentication, so a weak one is
+  // a real hazard — refusing costs only latency, since poll is the source of truth.
+  for (const token of ["short", "hunter2", "a".repeat(MIN_WEBHOOK_TOKEN_LENGTH - 1)]) {
+    assert.deepEqual(
+      resolveWebhookIngressConfig({ path: "/twist/events", token }),
+      { enabled: false, reason: "token-too-short", path: "/twist/events" },
+      `expected refusal for a ${token.length}-char token`,
+    );
+  }
+});
+
+test("ingress config: exactly the minimum length is accepted (boundary)", () => {
+  assert.equal(resolveWebhookIngressConfig({ path: "/e", token: "b".repeat(MIN_WEBHOOK_TOKEN_LENGTH) }).enabled, true);
+  assert.equal(resolveWebhookIngressConfig({ path: "/e", token: "b".repeat(MIN_WEBHOOK_TOKEN_LENGTH - 1) }).enabled, false);
+});
+
+test("ingress config: either half missing → unconfigured (never an open route)", () => {
+  const long = "c".repeat(40);
+  for (const input of [
+    { path: "/twist/events" },
+    { path: "/twist/events", token: "" },
+    { path: "/twist/events", token: "   " },
+    { token: long },
+    { path: "", token: long },
+    { path: "   ", token: long },
+    {},
+    undefined,
+  ]) {
+    const got = resolveWebhookIngressConfig(input);
+    assert.equal(got.enabled, false, `expected disabled for ${JSON.stringify(input)}`);
+    assert.equal(got.reason, "unconfigured");
+  }
+});
+
+test("ingress config: a path with no token never falls back to an unauthenticated route", () => {
+  const got = resolveWebhookIngressConfig({ path: "/twist/events", token: undefined });
+  assert.equal(got.enabled, false);
+  assert.equal(got.token, undefined);
+});
+
+test("ingress config: surrounding whitespace is trimmed off both values", () => {
+  const token = `  ${"d".repeat(30)}  `;
+  const got = resolveWebhookIngressConfig({ path: "  /twist/events  ", token });
+  assert.deepEqual(got, { enabled: true, path: "/twist/events", token: token.trim() });
+});
+
+test("ingress config: non-string inputs are refused rather than coerced", () => {
+  for (const input of [
+    { path: 42, token: "e".repeat(30) },
+    { path: "/e", token: 999999999999999999999999 },
+    { path: ["/e"], token: "e".repeat(30) },
+    { path: "/e", token: { value: "e".repeat(30) } },
+  ]) {
+    assert.equal(resolveWebhookIngressConfig(input).enabled, false, `expected disabled for ${JSON.stringify(input)}`);
+  }
 });
