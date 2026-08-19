@@ -149,6 +149,30 @@ export function extractContainerHint(body) {
   return null;
 }
 
+/**
+ * Pull the event's own `posted_ts` out of a payload, for LATENCY STATISTICS ONLY.
+ *
+ * This is the one number besides the container id we read from an unsigned payload, so the
+ * boundary matters: it is handed to the trace file and nowhere else. It is deliberately NOT
+ * attached to the hint, so it cannot travel into the sweep path — the pipeline's own
+ * freshness, backlog and dedup decisions all use `posted_ts` from our authenticated fetch.
+ * A forged value here can corrupt a latency chart and nothing more.
+ *
+ * @returns {number|null} epoch seconds, or null when absent/unusable
+ */
+export function extractEventTimestamp(body) {
+  if (!isRecord(body)) return null;
+  for (const scope of [body, body.data].filter(isRecord)) {
+    const raw = scope.posted_ts;
+    if (typeof raw === "number") {
+      if (Number.isFinite(raw) && raw > 0) return raw;
+      continue;
+    }
+    if (typeof raw === "string" && /^[1-9]\d{0,14}$/.test(raw.trim())) return Number(raw.trim());
+  }
+  return null;
+}
+
 /** Stable per-container coalescing key. */
 export const hintKey = (hint) => `${hint.kind}:${hint.id}`;
 
@@ -305,7 +329,13 @@ export function extractRequestToken(url, headers = {}) {
  * @param {(decision:object)=>void} deps.schedule
  * @param {(msg:string)=>void} [deps.log]
  */
-export function createWebhookHandler({ verifyToken, extract = extractContainerHint, schedule, log } = {}) {
+export function createWebhookHandler({
+  verifyToken,
+  extract = extractContainerHint,
+  extractTimestamp = extractEventTimestamp,
+  schedule,
+  log,
+} = {}) {
   if (typeof schedule !== "function") throw new Error("createWebhookHandler: schedule is required");
   return function handleParsedWebhookEvent(body, { token = "" } = {}) {
     if (verifyToken && !verifyToken(token)) {
@@ -321,6 +351,14 @@ export function createWebhookHandler({ verifyToken, extract = extractContainerHi
       log?.(`webhook hint extraction failed: ${String(err)}`);
     }
     const decision = hint ? { action: "sweep", hint } : { action: "poll" };
+    // Diagnostics only, and kept off the hint on purpose — see extractEventTimestamp.
+    let eventTs = null;
+    try {
+      eventTs = extractTimestamp(body);
+    } catch {
+      /* a broken timestamp must never cost us the sweep */
+    }
+    if (eventTs != null) decision.eventTs = eventTs;
     try {
       schedule(decision);
     } catch (err) {

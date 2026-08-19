@@ -63,7 +63,8 @@ If the gateway is reachable from the internet, Twist's **outgoing webhooks** can
 - **Therefore the blast radius of a perfectly forged payload is one rate-limited, authenticated re-poll of one container.** It cannot inject a message, impersonate a sender, or make the bot say anything.
 - **Poll remains the source of truth.** A delivery that never arrives, arrives twice, arrives out of order, or is dropped entirely **costs nothing** — the next poll picks the same messages up, deduped by id. There is no reconciliation to do and no failure mode to monitor. If the webhook is broken, the bot is simply as fast as it was before.
 - Unrecognizable payloads fall back to scheduling a normal full poll, which is what would have happened anyway.
-- Hints are **debounced per container, leading-edge**: the first hint for an idle container sweeps immediately, and further hints during the next ~2s collapse into a single trailing sweep. So a lone mention pays no debounce delay at all, while a burst on one thread still costs at most two sweeps. Webhook sweeps are serialized against the poll loop — they never run concurrently with it. Every stage is bounded; see [Behaviour under flood](#behaviour-under-flood).
+- Hints are **debounced per container, leading-edge**: the first hint for an idle container sweeps immediately, and further hints during the next ~2s collapse into a single trailing sweep. So a lone mention pays no debounce delay at all, while a burst on one thread still costs at most two sweeps.
+- A targeted sweep then runs **straight away, off the poll loop's cycle chain** — waiting behind a running poll cycle was the single largest remaining source of ingest latency (measured: the same DM landing at 3.0s or 6.6s depending only on where the poll cycle happened to be). At most one sweep per container runs at a time, and at most a handful across all containers; past that, hints fall back to the chain-bound path. *Claiming* stays chain-serialized, so per-peer and global turn caps are untouched. Every stage is bounded; see [Behaviour under flood](#behaviour-under-flood).
 
 **Setup.** Both keys are required; set only one and no route is registered (a path without a token would be an unauthenticated trigger open to the internet).
 
@@ -98,6 +99,7 @@ The endpoint is reachable by anyone who learns the URL, so it is built to make a
 | Concurrency | 8 in-flight handlers per (path, client IP) (SDK default) → 429. Catches slow-body floods that stay under the rate cap |
 | Body | 64 KiB, 10s read timeout → 413 / 408 |
 | Debounce | Leading-edge per container: first hint sweeps at once, then at most one trailing sweep per ~2s window |
+| Bypass sweeps | 1 in flight per container (a second hint is dropped — the running sweep already re-fetches current state), 4 across all containers. Beyond that, hints fall back to the chain-bound funnel |
 | Pending hints | 32 distinct containers max. Beyond that the pending set is **dropped** and one full poll runs instead |
 | Per cycle | At most 32 containers swept; any remainder becomes a full poll |
 | Cycle deadline | 2 minutes. A cycle that overruns is abandoned (loudly logged) and the poll chain is released, so a stalling Twist API can never make the bot go quiet. Cursor + queue dedup make the next cycle's re-sweep safe |
@@ -118,6 +120,7 @@ Requests are guarded the same way the host's bundled webhook channels guard thei
 
 - `.state/cursors.json` — per-thread/conversation fetch cursor. A refetch-bound optimization only, not a dedup source of truth. Twist's own read state is never mutated by it.
 - `.state/queue.json` — the durable queue. Source of truth for what's been seen and its outcome.
+- `.state/webhook-trace.jsonl` — webhook latency breadcrumbs, one JSON line per accepted hint (`{t, k, e}`: receive time, container key, and the event's own `posted_ts` when the payload carried one). Pure diagnostics: never read back by the pipeline, rotated at ~1MB (one previous generation kept), and safe to delete at any time. `e` comes from the **unsigned** payload and is used only to split Twist's delivery latency from ours — never as a cursor, freshness input, or dedup key.
 
 ### Migration
 

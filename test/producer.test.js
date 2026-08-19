@@ -420,3 +420,120 @@ test("sweepContainer rejects a container it cannot address instead of sweeping s
     );
   }
 });
+
+// ------------------------------------------ cursor/queue durability ordering
+//
+// The invariant producer.js has always claimed: "the cursor advances only after the enqueue
+// batch is durably persisted". Concurrent sweeps (the webhook fast path racing the poll
+// loop) can break it in a way serialized sweeps could not — sweep B dedups to added=0
+// against rows sweep A has inserted in memory but NOT yet fsynced, so B's enqueueAll skips
+// its persist entirely and B's cursor write (a much smaller, much faster file) can commit
+// first. A crash in that window loses those messages silently: they sit below the cursor,
+// so nothing ever refetches them.
+
+/** Queue store with the real one's semantics and a persist we can hold open. */
+function gatedQueue() {
+  const items = new Map();
+  const gates = [];
+  let writeChain = Promise.resolve();
+  let lastPersist = Promise.resolve();
+  return {
+    persistsOpened: 0,
+    openAll() {
+      for (const release of gates.splice(0)) release();
+    },
+    has: (id) => items.has(id),
+    count: () => items.size,
+    async enqueueAll(list) {
+      let added = 0;
+      for (const it of list) {
+        if (items.has(it.id)) continue; // same dedup predicate as the real store
+        items.set(it.id, it);
+        added++;
+      }
+      if (added) {
+        const p = writeChain.then(() => new Promise((release) => gates.push(release)));
+        writeChain = p.catch(() => {});
+        lastPersist = p;
+        await p;
+      }
+      return added;
+    },
+    whenPersisted: () => lastPersist,
+  };
+}
+
+const settleMicrotasks = async () => {
+  for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
+};
+
+test("a cursor cannot commit while another sweep's queue write is still in flight", async () => {
+  const state = { convMsgs: { 9: msgRun(1, 3) } };
+  const queue = gatedQueue();
+  const cursorWrites = [];
+  const cursors = {
+    isFirstSight: () => false, // tracked, so the hint gate lets the sweep through
+    getCursor: () => 0,
+    setCursor: async (kind, id, idx) => cursorWrites.push(`${kind}:${id}=${idx}`),
+  };
+  const producer = createProducer({
+    client: fakeClient(state), queue, cursors, botUserId: BOT,
+    freshSinceTs: FRESH_TS, now: () => NOW_MS, log: () => {},
+  });
+
+  // Sweep A enqueues the batch and blocks on its (artificially slow) persist.
+  const sweepA = producer.sweepContainer({ kind: "conversation", id: 9 });
+  await settleMicrotasks();
+  assert.equal(queue.count(), 3, "A has the rows in memory");
+  assert.deepEqual(cursorWrites, [], "and has not moved the cursor — its persist is pending");
+
+  // Sweep B sees every id already present, so it adds nothing and has no persist of its own.
+  const sweepB = producer.sweepContainer({ kind: "conversation", id: 9 });
+  await settleMicrotasks();
+
+  assert.deepEqual(
+    cursorWrites,
+    [],
+    "B must NOT advance the cursor past rows that are only in A's memory — that is the crash window that loses messages",
+  );
+
+  queue.openAll();
+  await Promise.all([sweepA, sweepB]);
+  assert.ok(cursorWrites.length > 0, "once the queue write lands, the cursor is free to move");
+});
+
+test("a failed queue persist aborts the sweep instead of advancing the cursor over it", async () => {
+  const state = { convMsgs: { 9: msgRun(1, 2) } };
+  const cursorWrites = [];
+  const queue = {
+    has: () => false,
+    enqueueAll: async () => 2,
+    whenPersisted: () => Promise.reject(new Error("ENOSPC")),
+  };
+  const producer = createProducer({
+    client: fakeClient(state), queue,
+    cursors: { isFirstSight: () => false, getCursor: () => 0, setCursor: async (...a) => cursorWrites.push(a) },
+    botUserId: BOT, freshSinceTs: FRESH_TS, now: () => NOW_MS, log: () => {},
+  });
+
+  await assert.rejects(() => producer.sweepContainer({ kind: "conversation", id: 9 }), /ENOSPC/);
+  assert.deepEqual(cursorWrites, [], "a cursor must never move past a write that failed");
+});
+
+test("the sweep's own signal reaches fastAck, so a hung reaction is cancellable", async () => {
+  const state = { convMsgs: { 9: msgRun(1, 1) } };
+  const controller = new AbortController();
+  const seen = [];
+  const { queue, cursors } = await build(state, {});
+  await cursors.setCursor("conversations", 9, 0);
+  const producer = createProducer({
+    client: fakeClient(state), queue, cursors, botUserId: BOT,
+    freshSinceTs: FRESH_TS, now: () => NOW_MS, log: () => {},
+    abortSignal: controller.signal,
+    fastAck: async (item, signal) => seen.push([item.id, signal]),
+  });
+
+  await producer.sweepContainer({ kind: "conversation", id: 9 });
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0][1], controller.signal, "fastAck receives the sweep's signal, not undefined");
+});

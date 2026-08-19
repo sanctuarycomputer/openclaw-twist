@@ -2,13 +2,19 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   CYCLE_DEADLINE_MS,
+  DEADLINE_EXPIRED,
+  MAX_CONCURRENT_HINT_SWEEPS,
   MAX_PENDING_HINTS,
   composeCycleSignal,
   createHintFunnel,
+  createHintSweeper,
+  createPokeGate,
+  settleWithinDeadline,
 } from "../src/cycle.js";
 
 const hint = (kind, id) => ({ kind, id: String(id) });
 const keys = (hints) => hints.map((h) => `${h.kind}:${h.id}`).sort();
+const hintKeyOf = (h) => `${h.kind}:${h.id}`;
 
 // ------------------------------------------------------------------- funnel
 
@@ -187,4 +193,298 @@ test("composeCycleSignal: each call gets its own deadline (cycles do not share a
 
 test("CYCLE_DEADLINE_MS is two minutes", () => {
   assert.equal(CYCLE_DEADLINE_MS, 120_000);
+});
+
+// -------------------------------------------------------- createHintSweeper
+
+/** A sweep whose completion the test controls. */
+function deferred() {
+  let resolve, reject;
+  const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+}
+const swept = { swept: true };
+
+test("sweeper: a hint starts a sweep immediately and pokes onSwept when it lands", async () => {
+  const gate = deferred();
+  const seen = [];
+  const s = createHintSweeper({ sweep: async (h) => { seen.push(hintKeyOf(h)); return await gate.promise; }, onSwept: (h) => seen.push(`swept:${hintKeyOf(h)}`) });
+
+  assert.equal(s.dispatch(hint("thread", 1)), "started");
+  await null;
+  assert.deepEqual(seen, ["thread:1"], "the sweep began without waiting for anything");
+  assert.equal(s.size(), 1);
+
+  gate.resolve(swept);
+  await s.idle();
+  assert.deepEqual(seen, ["thread:1", "swept:thread:1"]);
+  assert.equal(s.size(), 0, "the slot is released");
+});
+
+// The whole point of the bypass: a hint must not queue behind a poll cycle.
+test("sweeper: a sweep completes even while the exclusive chain is wedged forever", async () => {
+  const acked = [];
+  // Stand-in for a cycle that never finishes — nothing in the sweeper may await it.
+  const wedgedChain = new Promise(() => {});
+  const s = createHintSweeper({
+    sweep: async (h) => { acked.push(`ack:${hintKeyOf(h)}`); return swept; },
+    onSwept: () => { void wedgedChain; },
+  });
+
+  s.dispatch(hint("conversation", 7));
+  await Promise.race([s.idle(), wedgedChain]);
+
+  assert.deepEqual(acked, ["ack:conversation:7"], "the ⏳ went out despite the blocked chain");
+  assert.equal(s.size(), 0);
+});
+
+test("sweeper: a second hint for a container already sweeping is dropped", async () => {
+  const gate = deferred();
+  let calls = 0;
+  const s = createHintSweeper({ sweep: async () => { calls++; return await gate.promise; } });
+
+  assert.equal(s.dispatch(hint("thread", 1)), "started");
+  assert.equal(s.dispatch(hint("thread", 1)), "in-flight");
+  assert.equal(s.dispatch(hint("thread", 1)), "in-flight");
+  assert.equal(s.size(), 1);
+
+  gate.resolve(swept);
+  await s.idle();
+  assert.equal(calls, 1, "the running sweep fetches current state, so it already covers them");
+});
+
+test("sweeper: different containers sweep concurrently", async () => {
+  const gates = { "thread:1": deferred(), "conversation:1": deferred(), "thread:2": deferred() };
+  const started = [];
+  const s = createHintSweeper({
+    sweep: async (h) => { started.push(hintKeyOf(h)); return await gates[hintKeyOf(h)].promise; },
+  });
+
+  s.dispatch(hint("thread", 1));
+  s.dispatch(hint("conversation", 1)); // same id, different kind
+  s.dispatch(hint("thread", 2));
+  await null;
+
+  assert.deepEqual(started.sort(), ["conversation:1", "thread:1", "thread:2"]);
+  assert.equal(s.size(), 3, "all three in flight at once — no serialization between containers");
+
+  for (const g of Object.values(gates)) g.resolve(swept);
+  await s.idle();
+  assert.equal(s.size(), 0);
+});
+
+test("sweeper: a container can be swept again once its previous sweep finishes", async () => {
+  let gate = deferred();
+  let calls = 0;
+  const s = createHintSweeper({ sweep: async () => { calls++; return await gate.promise; } });
+
+  s.dispatch(hint("thread", 1));
+  gate.resolve(swept);
+  await s.idle();
+
+  gate = deferred();
+  assert.equal(s.dispatch(hint("thread", 1)), "started", "the guard is per-sweep, not permanent");
+  gate.resolve(swept);
+  await s.idle();
+  assert.equal(calls, 2);
+});
+
+test("sweeper: beyond maxConcurrent, hints degrade instead of spawning unbounded sweeps", async () => {
+  const gate = deferred();
+  const degraded = [];
+  const s = createHintSweeper({
+    maxConcurrent: 2,
+    sweep: async () => await gate.promise,
+    onDegrade: (h, reason) => degraded.push([hintKeyOf(h), reason]),
+  });
+
+  assert.equal(s.dispatch(hint("thread", 1)), "started");
+  assert.equal(s.dispatch(hint("thread", 2)), "started");
+  assert.equal(s.dispatch(hint("thread", 3)), "at-capacity");
+  assert.equal(s.size(), 2, "the cap holds");
+  assert.deepEqual(degraded, [["thread:3", "at-capacity"]], "the caller is told, so it can fall back");
+
+  gate.resolve(swept);
+  await s.idle();
+  assert.equal(s.dispatch(hint("thread", 3)), "started", "capacity frees up again");
+});
+
+test("sweeper: a declined sweep routes to onDegrade with its reason, not onSwept", async () => {
+  const events = [];
+  const s = createHintSweeper({
+    sweep: async () => ({ swept: false, reason: "untracked-thread" }),
+    onSwept: () => events.push("swept"),
+    onDegrade: (h, reason) => events.push(`degrade:${reason}`),
+  });
+
+  s.dispatch(hint("thread", 1));
+  await s.idle();
+  assert.deepEqual(events, ["degrade:untracked-thread"], "the untracked gate still degrades to a full poll");
+});
+
+test("sweeper: a rejecting sweep is contained, logged, and frees the container", async () => {
+  const logs = [];
+  const events = [];
+  const s = createHintSweeper({
+    sweep: async () => { throw new Error("twist exploded"); },
+    onSwept: () => events.push("swept"),
+    onDegrade: () => events.push("degrade"),
+    log: (m) => logs.push(m),
+  });
+
+  s.dispatch(hint("thread", 1));
+  await s.idle();
+
+  assert.deepEqual(events, [], "a failure is neither a sweep nor a degrade — the poll still covers it");
+  assert.match(logs.join("\n"), /twist exploded/);
+  assert.equal(s.size(), 0, "the slot is released");
+  assert.equal(s.dispatch(hint("thread", 1)), "started", "and the container is not wedged");
+});
+
+// A synchronously-throwing sweep is the ordering trap: `finally` must not run before the
+// in-flight entry exists, or the container would be blocked forever.
+test("sweeper: a SYNCHRONOUSLY throwing sweep does not wedge the container", async () => {
+  const logs = [];
+  const s = createHintSweeper({
+    sweep: () => { throw new Error("sync boom"); },
+    log: (m) => logs.push(m),
+  });
+
+  s.dispatch(hint("thread", 1));
+  await s.idle();
+
+  assert.equal(s.size(), 0, "no stale in-flight entry");
+  assert.match(logs.join("\n"), /sync boom/);
+  assert.equal(s.dispatch(hint("thread", 1)), "started");
+});
+
+test("sweeper: sweep is required", () => {
+  assert.throws(() => createHintSweeper({}), /sweep is required/);
+});
+
+test("MAX_CONCURRENT_HINT_SWEEPS is a small, deliberate bound", () => {
+  assert.ok(MAX_CONCURRENT_HINT_SWEEPS >= 1 && MAX_CONCURRENT_HINT_SWEEPS <= 8);
+});
+
+// ------------------------------------------------------ settleWithinDeadline
+
+const never = () => new Promise(() => {});
+
+test("deadline race: resolves with the work when the work wins", async () => {
+  const deadline = AbortSignal.timeout(10_000);
+  assert.equal(await settleWithinDeadline(Promise.resolve("done"), deadline), "done");
+});
+
+test("deadline race: releases the caller when the work never settles", async () => {
+  const deadline = AbortSignal.timeout(5);
+  assert.equal(await settleWithinDeadline(never(), deadline), DEADLINE_EXPIRED);
+});
+
+test("deadline race: an already-expired deadline releases immediately", async () => {
+  const c = new AbortController();
+  c.abort();
+  assert.equal(await settleWithinDeadline(never(), c.signal), DEADLINE_EXPIRED);
+});
+
+test("deadline race: with no deadline it simply awaits the work", async () => {
+  assert.equal(await settleWithinDeadline(Promise.resolve(7), null), 7);
+});
+
+// This is the composition monitor's sweep() uses: the signal alone cannot bound a call that
+// never threads it, so the race is what actually frees the container guard.
+test("sweeper: a sweep that never settles still releases its container at the deadline", async () => {
+  const logs = [];
+  const degraded = [];
+  const s = createHintSweeper({
+    log: (m) => logs.push(m),
+    onDegrade: (h, reason) => degraded.push(reason),
+    sweep: async () => {
+      const deadline = AbortSignal.timeout(5);
+      const settled = await settleWithinDeadline(never(), deadline);
+      return settled === DEADLINE_EXPIRED ? { swept: false, reason: "deadline" } : settled;
+    },
+  });
+
+  assert.equal(s.dispatch(hint("thread", 1)), "started");
+  assert.equal(s.size(), 1);
+
+  await s.idle();
+  assert.equal(s.size(), 0, "the container guard is released, not pinned for the process lifetime");
+  assert.deepEqual(degraded, ["deadline"], "and the caller falls back to a full poll");
+  assert.equal(s.dispatch(hint("thread", 1)), "started", "the container is usable again");
+});
+
+test("sweeper: a throwing onSwept is contained, not an unhandled rejection", async () => {
+  const logs = [];
+  const s = createHintSweeper({
+    sweep: async () => swept,
+    onSwept: () => {
+      throw new Error("host logger blew up");
+    },
+    log: (m) => logs.push(m),
+  });
+
+  s.dispatch(hint("thread", 1));
+  await s.idle();
+  assert.match(logs.join("\n"), /host logger blew up/);
+  assert.equal(s.size(), 0);
+});
+
+test("sweeper: a throwing onDegrade is contained too", async () => {
+  const logs = [];
+  const s = createHintSweeper({
+    sweep: async () => ({ swept: false, reason: "untracked-thread" }),
+    onDegrade: () => {
+      throw new Error("scheduler blew up");
+    },
+    log: (m) => logs.push(m),
+  });
+
+  s.dispatch(hint("thread", 1));
+  await s.idle();
+  assert.match(logs.join("\n"), /scheduler blew up/);
+});
+
+// -------------------------------------------------------------- createPokeGate
+
+test("poke gate: collapses many requests into one queued cycle", () => {
+  let scheduled = 0;
+  const gate = createPokeGate(() => scheduled++);
+
+  assert.equal(gate.request(), "queued");
+  assert.equal(gate.request(), "already-queued");
+  assert.equal(gate.request(), "already-queued");
+  assert.equal(scheduled, 1, "N finished sweeps must not become N cycles on the chain");
+  assert.equal(gate.pending(), true);
+});
+
+test("poke gate: a new request queues again once the previous cycle starts", () => {
+  let scheduled = 0;
+  const gate = createPokeGate(() => scheduled++);
+
+  gate.request();
+  gate.starting(); // the queued cycle begins — work landing from here needs its own pass
+  assert.equal(gate.pending(), false);
+  assert.equal(gate.request(), "queued");
+  assert.equal(scheduled, 2);
+});
+
+test("poke gate: requests arriving while a cycle is QUEUED are covered by it", () => {
+  let scheduled = 0;
+  const gate = createPokeGate(() => scheduled++);
+  gate.request();
+  gate.request();
+  gate.request();
+  gate.starting();
+  assert.equal(scheduled, 1, "one claim pass sees the same queue as three would");
+});
+
+test("poke gate: starting() with nothing queued is a no-op", () => {
+  const gate = createPokeGate(() => {});
+  gate.starting();
+  assert.equal(gate.pending(), false);
+});
+
+test("poke gate: schedule is required", () => {
+  assert.throws(() => createPokeGate(), /schedule is required/);
 });
