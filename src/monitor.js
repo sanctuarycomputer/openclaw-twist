@@ -311,6 +311,11 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
     if (decision !== "peer-kind") return decision === "ack";
     return (await participantKind(item.conversationId)) === "dm";
   }
+  // NOTE: this is reached only from the producer, for items an authenticated fetch actually
+  // returned and that were durably enqueued. Acking straight off a webhook payload's message
+  // id would be faster and is deliberately not done — the payload is unsigned, so that id is
+  // unverified and a forged request could make the bot paint reactions on arbitrary
+  // messages. See the contract at the top of webhook.js.
   async function fastAck(item) {
     if (!(await shouldFastAck(item))) return;
     await react(item, "add", "⏳"); // react() is already best-effort; the producer contains throws anyway

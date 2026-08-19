@@ -14,6 +14,21 @@
 // of truth; the webhook only makes it happen sooner. If a delivery carries no recognizable
 // container id we fall back to scheduling a full poll, which is what would have happened
 // anyway on the next tick.
+//
+// WHY WE DO NOT POST THE ⏳ STRAIGHT FROM THE WEBHOOK PAYLOAD, even though it is the single
+// biggest remaining win on ack latency. The payload carries a message/comment id, and
+// reacting to it directly would skip the fetch entirely — tempting, and wrong. The payload
+// is unsigned and attacker-controllable, so that id is unverified: anyone who learns the URL
+// could POST a forged body naming ANY message id in the workspace and have the bot paint a
+// reaction on it. That is a vandalism primitive — the bot becomes a writer-of-record acting
+// on unauthenticated input, and unlike a spurious re-poll it leaves visible, public marks on
+// other people's messages.
+//
+// The ack therefore stays where it is: behind the authenticated fetch, fired by the producer
+// only for items OUR OWN read of the Twist API actually returned and that we durably
+// enqueued (see producer.enqueueAcked / monitor.fastAck). The rule is the same one that
+// governs everything else here — a webhook may influence WHEN we look, never WHAT we
+// believe, and never what we write.
 
 /**
  * Minimum shared-secret length.
@@ -146,18 +161,36 @@ export const hintKey = (hint) => `${hint.kind}:${hint.id}`;
  * within `delayMs` of the FIRST hint for a container, every further hint for that same
  * container is absorbed, and exactly one flush happens at the end of the window.
  *
- * WHY THE WINDOW IS NOT EXTENDED by later hints (i.e. a fixed window from the first hint
- * rather than a reset-on-every-hint debounce): an active thread producing an event every
- * second would, under reset semantics, never flush at all — the sweep would starve for as
- * long as people keep typing, which is precisely when it is most wanted. A fixed window
- * bounds worst-case hint→sweep latency at `delayMs` while still collapsing a burst into one
- * sweep. Containers are independent: each key runs its own window.
+ * LEADING EDGE, then trailing coalesce. The FIRST hint for an idle container flushes
+ * straight away; only the ones behind it wait. This is the whole point of the change that
+ * introduced it: measured live, ingest was webhook-fast (1.5–2.7s) but the ⏳ a human waits
+ * for landed at ~7s, and a flat 2s of that was this debouncer delaying the FIRST hint —
+ * pure latency for no benefit, since there is nothing to coalesce until a second hint
+ * exists. Bursts are still collapsed: hints arriving during the window are merged into at
+ * most ONE trailing flush at the end of it.
+ *
+ * So per container, per window, there are at most two flushes: one immediately, one at the
+ * end — and the second only if something actually arrived after the first.
+ *
+ * WHY THE WINDOW IS NOT EXTENDED by later hints (a fixed window, not a reset-on-every-hint
+ * debounce): an active thread producing an event every second would, under reset semantics,
+ * never flush its trailing sweep at all — it would starve for as long as people keep typing,
+ * which is precisely when it is most wanted. The window is anchored at the leading hint and
+ * never moves, which bounds worst-case hint→sweep latency at `delayMs` for every hint in the
+ * burst (a window anchored at the first post-leading hint instead would push a hint arriving
+ * late in the window out by nearly a full extra `delayMs`). Containers are independent: each
+ * key runs its own window.
+ *
+ * WHY THE LEADING FLUSH IS STILL A TIMER (0ms) rather than a direct call: `push` runs inside
+ * the HTTP request handler, and flushing inline would drag cycle scheduling into the request
+ * path and change call-ordering for every existing caller. Deferring by a tick keeps `push`
+ * a pure, fast enqueue and preserves the "schedule and return 200" contract.
  *
  * Timers are injected so tests drive them deterministically instead of sleeping.
  *
  * @param {object} deps
- * @param {number} deps.delayMs             trailing window per container
- * @param {(hint:object)=>void|Promise<void>} deps.onFlush  called once per container per window
+ * @param {number} deps.delayMs             coalescing window per container
+ * @param {(hint:object)=>void|Promise<void>} deps.onFlush  leading flush, plus at most one trailing
  * @param {(fn:()=>void, ms:number)=>any} [deps.setTimer]
  * @param {(handle:any)=>void} [deps.clearTimer]
  * @param {(msg:string)=>void} [deps.log]
@@ -170,16 +203,12 @@ export function createHintDebouncer({
   log,
 } = {}) {
   if (typeof onFlush !== "function") throw new Error("createHintDebouncer: onFlush is required");
-  const pending = new Map(); // key -> hint
-  const timers = new Map(); // key -> timer handle
+  /** key -> {windowTimer, leadingTimer, trailing} — one open window per container. */
+  const windows = new Map();
 
   const contain = (err) => log?.(`webhook hint flush failed: ${String(err)}`);
 
-  function flush(key) {
-    timers.delete(key);
-    const hint = pending.get(key);
-    pending.delete(key);
-    if (!hint) return;
+  function fire(hint) {
     try {
       const result = onFlush(hint);
       if (result && typeof result.then === "function") result.then(undefined, contain);
@@ -188,24 +217,41 @@ export function createHintDebouncer({
     }
   }
 
+  /** Window end: emit the coalesced trailing hint if one arrived, then go idle. */
+  function closeWindow(key) {
+    const w = windows.get(key);
+    if (!w) return;
+    windows.delete(key); // idle again — the next hint for this container leads
+    if (w.trailing) fire(w.trailing);
+  }
+
   return {
     /**
-     * @returns {"armed"|"coalesced"} whether this hint opened a new window or joined one.
+     * @returns {"leading"|"coalesced"} whether this hint flushed on its own (immediately)
+     *   or joined the open window's single trailing flush.
      */
     push(hint) {
       const key = hintKey(hint);
-      pending.set(key, hint);
-      if (timers.has(key)) return "coalesced";
-      timers.set(key, setTimer(() => flush(key), delayMs));
-      return "armed";
+      const open = windows.get(key);
+      if (open) {
+        open.trailing = hint; // newest wins; one trailing flush covers the whole burst
+        return "coalesced";
+      }
+      const w = { windowTimer: null, leadingTimer: null, trailing: null };
+      windows.set(key, w);
+      w.windowTimer = setTimer(() => closeWindow(key), delayMs);
+      w.leadingTimer = setTimer(() => fire(hint), 0);
+      return "leading";
     },
-    /** Drop every armed window without flushing — used on shutdown. */
+    /** Drop every open window without flushing — used on shutdown. */
     cancelAll() {
-      for (const handle of timers.values()) clearTimer(handle);
-      timers.clear();
-      pending.clear();
+      for (const w of windows.values()) {
+        if (w.windowTimer) clearTimer(w.windowTimer);
+        if (w.leadingTimer) clearTimer(w.leadingTimer);
+      }
+      windows.clear();
     },
-    size: () => timers.size,
+    size: () => windows.size,
   };
 }
 
