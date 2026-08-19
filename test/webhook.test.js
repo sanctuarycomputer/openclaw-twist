@@ -5,6 +5,7 @@ import {
   createHintDebouncer,
   createWebhookHandler,
   extractContainerHint,
+  extractEventTimestamp,
   extractRequestToken,
   hintKey,
   resolveWebhookIngressConfig,
@@ -585,4 +586,65 @@ test("ingress config: non-string inputs are refused rather than coerced", () => 
   ]) {
     assert.equal(resolveWebhookIngressConfig(input).enabled, false, `expected disabled for ${JSON.stringify(input)}`);
   }
+});
+
+// ------------------------------------------------------ extractEventTimestamp
+
+test("event timestamp: reads posted_ts for latency stats", () => {
+  assert.equal(extractEventTimestamp({ event_type: "comment_added", thread_id: 1, posted_ts: 1785900000 }), 1785900000);
+  assert.equal(extractEventTimestamp({ data: { posted_ts: 1785900001 } }), 1785900001);
+  assert.equal(extractEventTimestamp({ posted_ts: "1785900002" }), 1785900002, "numeric strings are accepted");
+});
+
+test("event timestamp: absent or unusable values yield null, never a garbage number", () => {
+  for (const body of [
+    {},
+    null,
+    "nope",
+    [],
+    { posted_ts: null },
+    { posted_ts: "not-a-number" },
+    { posted_ts: -1 },
+    { posted_ts: 0 },
+    { posted_ts: Number.NaN },
+    { posted_ts: Infinity },
+    { posted_ts: {} },
+    { posted_ts: [1] },
+    { posted_ts: true },
+    { posted_ts: "9".repeat(16) },
+  ]) {
+    assert.equal(extractEventTimestamp(body), null, `expected null for ${JSON.stringify(body) ?? String(body)}`);
+  }
+});
+
+// The security boundary: this value comes from an unsigned payload, so it must never reach
+// the sweep path. It rides on the DECISION, never on the hint.
+test("handler: eventTs rides the decision and is kept OFF the hint", () => {
+  const { handler, scheduled } = handlerHarness();
+  const decision = handler({ event_type: "comment_added", thread_id: 7882650, posted_ts: 1785900000 });
+
+  assert.deepEqual(decision.hint, { kind: "thread", id: "7882650" }, "the hint stays exactly {kind, id}");
+  assert.equal(decision.eventTs, 1785900000);
+  assert.equal(scheduled[0].eventTs, 1785900000);
+});
+
+test("handler: a payload with no posted_ts carries no eventTs key at all", () => {
+  const { handler } = handlerHarness();
+  const decision = handler({ event_type: "comment_added", thread_id: 7882650 });
+  assert.deepEqual(decision, { action: "sweep", hint: { kind: "thread", id: "7882650" } });
+});
+
+test("handler: the poll fallback still carries eventTs when the payload had one", () => {
+  const { handler } = handlerHarness();
+  assert.deepEqual(handler({ nothing: "useful", posted_ts: 1785900005 }), { action: "poll", eventTs: 1785900005 });
+});
+
+test("handler: a throwing timestamp extractor never costs us the sweep", () => {
+  const { handler, scheduled } = handlerHarness({
+    extractTimestamp: () => {
+      throw new Error("clock bug");
+    },
+  });
+  assert.deepEqual(handler({ thread_id: 5 }), { action: "sweep", hint: { kind: "thread", id: "5" } });
+  assert.equal(scheduled.length, 1);
 });

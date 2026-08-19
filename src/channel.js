@@ -20,6 +20,9 @@ const STATE_FILE = join(STATE_DIR, "cursors.json");
 // Durable ingestion queue — lives alongside the cursors file so both survive (or are
 // lost) together; the cursor is only a refetch bound, the queue is the delivery record.
 const QUEUE_FILE = join(STATE_DIR, "queue.json");
+// Webhook latency breadcrumbs. Pure diagnostics: never read back by the pipeline, bounded
+// by rotation, and safe to delete at any time.
+const TRACE_FILE = join(STATE_DIR, "webhook-trace.jsonl");
 
 export const meta = {
   id: "twist",
@@ -60,6 +63,7 @@ async function startTwistAccount(ctx) {
         statusSink,
         cursors,
         queuePath: QUEUE_FILE,
+        tracePath: TRACE_FILE,
       }),
   });
 }

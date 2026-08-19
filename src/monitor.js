@@ -31,7 +31,8 @@ import {
   createWebhookHandler,
   extractContainerHint,
 } from "./webhook.js";
-import { CYCLE_DEADLINE_MS, composeCycleSignal, createHintFunnel } from "./cycle.js";
+import { CYCLE_DEADLINE_MS, composeCycleSignal, createHintFunnel, createHintSweeper } from "./cycle.js";
+import { createWebhookTrace } from "./webhook-trace.js";
 import { registerTwistWebhookRoute } from "./webhook-route.js";
 import { getTwistRuntime } from "./runtime.js";
 
@@ -96,7 +97,7 @@ function acquireQueueStore(queuePath, log) {
  * @param {string} p.queuePath  path to the durable queue file (sibling of the cursors file)
  * @returns {Promise<{stop: () => void}>}
  */
-export async function monitorTwistProvider({ accountId, config, runtime, abortSignal, statusSink, cursors, queuePath }) {
+export async function monitorTwistProvider({ accountId, config, runtime, abortSignal, statusSink, cursors, queuePath, tracePath }) {
   const core = getTwistRuntime();
   const cfg = config ?? core.config.current();
   const account = resolveTwistAccount(cfg);
@@ -380,11 +381,13 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
   const funnel = createHintFunnel({ log });
   let cycleChain = Promise.resolve();
 
-  async function runCycle({ full, signal }) {
+  async function runCycle({ full = false, tickOnly = false, signal }) {
     const drained = funnel.drain();
     let sweepAll = full || drained.sweepAll;
     // A queued webhook cycle whose hints an earlier cycle already drained has nothing to do.
-    if (!sweepAll && drained.hints.length === 0) return;
+    // `tickOnly` is the exception: a bypass sweep has already enqueued (and acked) its work
+    // off-chain and just needs the claim pass to run.
+    if (!sweepAll && drained.hints.length === 0 && !tickOnly) return;
     cycle++;
     // This cycle's producer carries this cycle's deadline, so a stalling Twist read is
     // actively cancelled rather than merely abandoned.
@@ -428,12 +431,12 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
    * batches already durably enqueued, enqueue is idempotent by item id, and `tick()` has
    * its own reentrancy guard — so the next cycle simply re-sweeps.
    */
-  async function runCycleWithDeadline({ full }) {
+  async function runCycleWithDeadline(opts) {
     const { signal, deadline } = composeCycleSignal(abortSignal, { deadlineMs: CYCLE_DEADLINE_MS });
     let done = false;
     let failure = null;
     // Always settles, so abandoning it below can never leave an unhandled rejection.
-    const body = runCycle({ full, signal }).then(
+    const body = runCycle({ ...opts, signal }).then(
       () => { done = true; },
       (err) => { done = true; failure = err; },
     );
@@ -458,11 +461,11 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
   }
 
   /** Run a cycle with global mutual exclusion; never rejects (failures are logged). */
-  function runExclusive(full) {
+  function runExclusive(opts = {}) {
     const run = cycleChain.then(async () => {
       if (stopped) return;
       try {
-        await runCycleWithDeadline({ full });
+        await runCycleWithDeadline(opts);
       } catch (err) {
         log(`poll cycle failed: ${String(err)}`);
       }
@@ -474,23 +477,74 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
 
   async function loop() {
     if (stopped) return;
-    await runExclusive(true);
+    await runExclusive({ full: true });
     if (stopped) return;
     timer = setTimeout(loop, account.pollIntervalMs);
   }
 
   // ------------------------------------------------------------- webhook ingress
 
-  // Hints are debounced per container, then handed to the funnel. The debouncer collapses
-  // an event burst for ONE container; the funnel collapses across containers and across a
-  // cycle that is already running, and caps both.
+  const trace = tracePath ? createWebhookTrace(tracePath, { log }) : null;
+
+  /**
+   * The FAST PATH. A targeted hint sweep runs the moment it is flushed, off the exclusive
+   * chain — that queueing delay was the entire 3.0s-vs-6.6s ingest variance. See
+   * createHintSweeper for the concurrency-safety argument (verified against producer.js,
+   * queue.js and state.js).
+   *
+   * Everything that is NOT a targeted sweep of a tracked container stays chain-bound and
+   * unchanged: the full-poll degrades, the unrecognizable-payload fallback, and claiming.
+   */
+  const sweeper = createHintSweeper({
+    log,
+    sweep: async (hint) => {
+      // Each bypass sweep carries its own deadline, exactly like a chain cycle: a hung Twist
+      // read must not pin a container's in-flight slot forever.
+      const { signal, deadline } = composeCycleSignal(abortSignal, { deadlineMs: CYCLE_DEADLINE_MS });
+      try {
+        return await makeProducer(signal).sweepContainer(hint);
+      } catch (err) {
+        if (deadline?.aborted) {
+          log(
+            `hint sweep ${hint.kind}:${hint.id} exceeded the ${CYCLE_DEADLINE_MS}ms deadline — abandoned; falling back to a full poll`,
+          );
+          return { swept: false, reason: "deadline" };
+        }
+        throw err;
+      }
+    },
+    // The ⏳ already went out inside the sweep (producer fastAck), so all that is left is the
+    // claim pass — and that stays chain-serialized, because per-peer and global turn caps
+    // depend on exactly one claim pass running at a time.
+    onSwept: () => void runExclusive({ tickOnly: true }),
+    onDegrade: (hint, reason) => {
+      if (reason === "at-capacity") {
+        // Too many bypass sweeps already running. Fall back to the pre-0.5.2 behaviour:
+        // hand the hint to the funnel so a chain cycle sweeps it, still targeted, still
+        // coalesced and capped. Only if the funnel itself overflows does it become a poll.
+        funnel.push(hint);
+      } else {
+        // Untracked container, or a blown deadline — the poll is the strict superset.
+        funnel.requestFullSweep();
+      }
+      void runExclusive();
+    },
+  });
+
+  // Hints are debounced per container, then dispatched. The debouncer collapses an event
+  // burst for ONE container (leading + at most one trailing); the sweeper bounds how many
+  // containers sweep at once; the funnel catches whatever the sweeper declines.
   const hintDebouncer = createHintDebouncer({
     delayMs: WEBHOOK_HINT_DEBOUNCE_MS,
     log,
     onFlush: (hint) => {
       if (stopped) return;
-      funnel.push(hint);
-      void runExclusive(false);
+      if (hint.kind === "all") {
+        funnel.requestFullSweep();
+        void runExclusive();
+        return;
+      }
+      sweeper.dispatch(hint);
     },
   });
 
@@ -539,8 +593,13 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
       // Scheduling only — this returns immediately so the HTTP 200 is not held behind a
       // Twist round-trip. "poll" rides the same debouncer under a reserved key so a flood
       // of unrecognizable deliveries collapses exactly like a flood of real ones.
-      schedule: (decision) =>
-        hintDebouncer.push(decision.action === "sweep" ? decision.hint : { kind: "all", id: "*" }),
+      schedule: (decision) => {
+        const hint = decision.action === "sweep" ? decision.hint : { kind: "all", id: "*" };
+        // Best-effort breadcrumb: lets the ledger split Twist's delivery leg from ours.
+        // Never awaited — a diagnostics write must not sit in front of the HTTP 200.
+        void trace?.record({ t: Date.now(), k: `${hint.kind}:${hint.id}`, e: decision.eventTs });
+        hintDebouncer.push(hint);
+      },
     });
     try {
       unregisterWebhook = registerTwistWebhookRoute({
