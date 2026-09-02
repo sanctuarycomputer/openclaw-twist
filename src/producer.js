@@ -72,6 +72,16 @@ export function createProducer({ client, queue, cursors, botUserId, freshSinceTs
       messageId: raw.id, objIndex: raw.obj_index ?? 0,
       senderId: raw.creator, senderName: raw.creator_name ?? String(raw.creator),
       content: raw.content ?? "", postedTs: raw.posted_ts ?? 0,
+      // Who Twist notified about THIS post — the audience the reply mirrors (see
+      // replyRecipients). Carried on the queue item because the turn that replies runs
+      // long after the poll that read it, and nothing refetches the comment. Thread
+      // objects (the synthesized opening post) carry the same field. Stored verbatim —
+      // Twist may report the string EVERYONE — so replyRecipients stays the one place
+      // that interprets it. null when absent, incl. items queued before this field existed.
+      // `groups` is the other half of the audience: a comment left on Twist's default
+      // audience records it as a group and leaves `recipients` empty.
+      recipients: raw.recipients ?? null,
+      groups: raw.groups ?? null,
       firstSightBacklog: isBacklog(firstSight, raw.posted_ts),
       state: "queued", attempts: 0, nextAttemptAt: 0, enqueuedAt: now(),
     };

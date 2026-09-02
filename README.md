@@ -14,7 +14,13 @@ Built and used in production at [Sanctuary Computer](https://sanctuary.computer)
 
 ### Outbound thread notifications
 
-When the bot posts a comment to a channel thread, it notifies the channel's **default participants** (the "Set default participants" setting in Twist's channel settings) instead of all thread subscribers. This is automatically read from the channel's `default_recipients` and `use_default_recipients` fields — no extra configuration required. If a channel has no default recipients configured, Twist's own default notification behavior applies. Direct messages and group DMs are unaffected.
+**A reply mirrors the audience of the message it answers.** Mention the bot alone and only you hear back; mention it alongside two colleagues and those two hear back too. Twist's `comments/add` defaults `recipients` to `EVERYONE_IN_THREAD` when the field is omitted, so a reply that stays silent about its audience notifies *everyone ever mentioned anywhere in the thread*. The bot therefore states who it is answering: the recipients of the triggering post, plus that post's author (Twist never lists you among your own recipients), minus the bot itself. The dead-letter apology, if a turn exhausts its retries, goes to that same audience.
+
+This narrows notifications only — nobody is removed from the thread, and everyone following it still sees the reply in place.
+
+**Mirroring needs a user list, and not every post has one.** A comment left on Twist's default audience records that audience under `groups` and leaves `recipients` empty — in this workspace that is roughly a third of all human comments. There is no way to mirror a group audience as a list of users without silently dropping the group, so those replies (and any post with no triggering message at all — the `message` tool, cron reports) fall back to the channel's **default participants**, read automatically from the channel's `default_recipients` and `use_default_recipients` fields. A channel with none configured leaves them on Twist's `EVERYONE_IN_THREAD` default, which can be *wider* than the post being answered. Same fallback for anything unrecognized in a recipient list: better the old audience than a request Twist rejects.
+
+Direct messages and group DMs are unaffected — their audience is the conversation itself.
 
 While a turn runs, the triggering message gets an **⏳** reaction, which becomes **✅** on success, or **❌** only once the item has *finally* failed (retries exhausted) — a retryable error just clears the ⏳ and tries again later. This works for thread comments, DMs, and a thread's opening post alike. So you can see at a glance that the bot picked your message up and whether it's settled.
 
