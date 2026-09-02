@@ -85,6 +85,53 @@ test("thread sweep enqueues comments AND synthesizes the opening post on first s
   assert.equal(queue.get("thread-post:7").peerId, "thread:7");
 });
 
+// The reply must notify who the TRIGGER notified (see replyRecipients), which means the
+// recipient list has to survive the queue — the agent turn runs long after the poll that
+// read the comment, and nothing refetches it.
+test("queued items carry the recipient list Twist reported for the comment and the opening post", async () => {
+  const { queue, producer } = await build({
+    threads: [{ thread_id: 7, channel_id: 3, direct_mention: true }],
+    threadObjs: { 7: { id: 7, title: "Budget?", content: "[Bot](twist-mention://634870) thoughts?", creator: 427360, posted_ts: FRESH_TS + 50, recipients: [634870, 552266] } },
+    threadComments: { 7: [{ id: 88, obj_index: 1, creator: 427360, posted_ts: FRESH_TS + 60, content: "ping", recipients: [634870] }] },
+  });
+  await producer.pollOnce();
+  assert.deepEqual(queue.get("thread-comment:88").recipients, [634870]);
+  assert.deepEqual(queue.get("thread-post:7").recipients, [634870, 552266]);
+});
+
+// An empty `recipients` alongside a group is how Twist records a default-audience comment,
+// so the groups are half of the audience — without them replyRecipients cannot tell that
+// shape apart from one addressed to named users alone.
+test("queued items carry the groups Twist notified, not just the named users", async () => {
+  const { queue, producer } = await build({
+    threads: [{ thread_id: 7, channel_id: 3, direct_mention: true }],
+    threadComments: { 7: [{ id: 88, obj_index: 1, creator: 427360, posted_ts: FRESH_TS + 60, content: "ping", recipients: [], groups: [1] }] },
+  });
+  await producer.pollOnce();
+  assert.deepEqual(queue.get("thread-comment:88").groups, [1]);
+});
+
+// The queue is a record of what Twist said, not an interpretation of it: EVERYONE is
+// stored verbatim so replyRecipients stays the single place that decides what a recipient
+// list means.
+test("a recipients value of EVERYONE is queued verbatim, not flattened away", async () => {
+  const { queue, producer } = await build({
+    threads: [{ thread_id: 7, channel_id: 3, direct_mention: true }],
+    threadComments: { 7: [{ id: 88, obj_index: 1, creator: 427360, posted_ts: FRESH_TS + 60, content: "ping", recipients: "EVERYONE" }] },
+  });
+  await producer.pollOnce();
+  assert.equal(queue.get("thread-comment:88").recipients, "EVERYONE");
+});
+
+test("an item Twist gave no recipients for carries null, not a fabricated list", async () => {
+  const { queue, producer } = await build({
+    convs: [{ conversation_id: 9 }],
+    convMsgs: { 9: [{ id: 501, obj_index: 0, creator: 427360, posted_ts: FRESH_TS + 100, content: "hey bot" }] },
+  });
+  await producer.pollOnce();
+  assert.equal(queue.get("conv-msg:501").recipients, null);
+});
+
 test("second poll is a no-op (idempotent), cursor bounds refetch", async () => {
   const state = {
     convs: [{ conversation_id: 9 }],

@@ -21,6 +21,7 @@ import {
   firstSightCursor,
   routingPeer,
   channelDefaultRecipients,
+  replyRecipients,
 } from "../src/routing.js";
 
 const BOT = 634870; // Stacksbot
@@ -368,6 +369,63 @@ test("channelDefaultRecipients: honors use_default_recipients + non-empty list",
   assert.equal(channelDefaultRecipients({ use_default_recipients: true, default_recipients: [] }), null);
   assert.equal(channelDefaultRecipients({}), null);
   assert.equal(channelDefaultRecipients(null), null);
+});
+
+// LIVE-OBSERVED BUG (thread 7951354): Hugh addressed a comment to Stacksbot ALONE
+// (`recipients: [634870]`) and the reply notified all 31 people in the thread. Twist's
+// comments/add documents `recipients` as defaulting to EVERYONE_IN_THREAD when omitted,
+// so a reply that says nothing blasts the thread. These pin the mirror-the-trigger rule.
+test("replyRecipients: mirrors a trigger addressed to the bot alone back to its author only", () => {
+  assert.deepEqual(replyRecipients({ recipients: [634870], senderId: 427360 }, 634870), [427360]);
+});
+
+test("replyRecipients: keeps the trigger's other humans and drops the bot", () => {
+  assert.deepEqual(replyRecipients({ recipients: [634870, 552266], senderId: 427360 }, 634870), [552266, 427360]);
+});
+
+test("replyRecipients: does not list the author twice when the trigger already names them", () => {
+  assert.deepEqual(replyRecipients({ recipients: [427360, 829885], senderId: 427360 }, 634870), [427360, 829885]);
+});
+
+// An empty `recipients` does NOT mean "notified nobody". Measured over 652 human comments
+// in this workspace: 402 were `recipients:[n] groups:[]`, but 134 were `recipients:[]
+// groups:[2]`, 38 `recipients:[] groups:[1]` and 15 `recipients:[] groups:[29100]` — an
+// ordinary comment left on Twist's default audience records the audience as a GROUP and
+// leaves the user list empty. Reading that as "nobody" would narrow every such reply to
+// its author and silently stop notifying everyone else.
+test("replyRecipients: an empty recipient list is not a mandate to notify nobody", () => {
+  assert.equal(replyRecipients({ recipients: [], groups: [1], senderId: 427360 }, 634870), null);
+  assert.equal(replyRecipients({ recipients: [], groups: [], senderId: 427360 }, 634870), null);
+});
+
+// Ids 1 and 2 are not in groups/get — they are Twist's pseudo-groups for the everyone-ish
+// audiences; 29100 is the real "Everyone (opted-in)" group. Either way a group audience is
+// not a user list, and mirroring only the named users would quietly drop the group.
+test("replyRecipients: declines to mirror when the trigger also notified a group", () => {
+  assert.equal(replyRecipients({ recipients: [634870], groups: [1], senderId: 427360 }, 634870), null);
+  assert.equal(replyRecipients({ recipients: [634870, 552266], groups: [26331], senderId: 427360 }, 634870), null);
+});
+
+// Twist may report `recipients` as the string EVERYONE, and queue items written before this
+// field existed carry none at all. Neither is a list to mirror: return null so the caller
+// keeps its existing channel-default fallback rather than inventing a narrower audience.
+test("replyRecipients: returns null when there is no recipient list to mirror", () => {
+  assert.equal(replyRecipients({ recipients: "EVERYONE", senderId: 427360 }, 634870), null);
+  assert.equal(replyRecipients({ senderId: 427360 }, 634870), null);
+  assert.equal(replyRecipients({}, 634870), null);
+  assert.equal(replyRecipients(null, 634870), null);
+});
+
+test("replyRecipients: normalizes ids to numbers, so a string id still matches the bot", () => {
+  assert.deepEqual(replyRecipients({ recipients: ["634870", "552266"], senderId: "427360" }, 634870), [552266, 427360]);
+});
+
+// A non-id inside the list would be JSON-stringified straight into the comments/add body
+// and rejected, failing the turn and dead-lettering an answer that 0.5.2 delivered fine.
+// The mirror must fail SAFE — fall back to the old audience, never break delivery.
+test("replyRecipients: refuses to mirror a list carrying anything that is not a user id", () => {
+  assert.equal(replyRecipients({ recipients: ["EVERYONE"], senderId: 427360 }, 634870), null);
+  assert.equal(replyRecipients({ recipients: [634870, null], senderId: 427360 }, 634870), null);
 });
 
 test("routingPeer produces the documented session-key peer shapes", () => {

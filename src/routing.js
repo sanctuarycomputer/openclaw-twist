@@ -277,6 +277,58 @@ export function channelDefaultRecipients(channel) {
   return null;
 }
 
+/** A Twist user id as a number, or null if the value is not one. */
+function userId(value) {
+  if (typeof value === "number") return Number.isInteger(value) ? value : null;
+  if (typeof value === "string" && /^\d+$/.test(value.trim())) return Number(value);
+  return null;
+}
+
+/**
+ * Who a reply should notify, mirroring the post that triggered it — or null when that
+ * post's audience cannot be mirrored as a user list.
+ *
+ * Twist's `comments/add` defaults `recipients` to EVERYONE_IN_THREAD — everyone ever
+ * mentioned anywhere in the thread — so a reply that omits the field blasts the whole
+ * thread even when the mention that summoned it was addressed to the bot alone. Mirror
+ * the trigger instead: the users IT notified, plus its author (Twist never lists you
+ * among your own recipients, but you are obviously party to the exchange), minus the bot.
+ *
+ * MIRROR ONLY A USER-LIST AUDIENCE. An empty `recipients` is not "nobody": a comment left
+ * on Twist's default audience records that audience under `groups` (ids 1 and 2 are
+ * Twist's own everyone-ish pseudo-groups) and leaves the user list empty — the majority
+ * shape after `recipients:[n] groups:[]` in this workspace. A trigger that notified a
+ * group is therefore NOT mirrorable: sending only its named users would silently drop the
+ * group from the conversation.
+ *
+ * Null means "no information", leaving the caller's own fallback in charge; it never means
+ * "notify nobody". Anything unexpected in the list also yields null, so a shape we did not
+ * anticipate falls back to the previous behavior rather than building a request Twist
+ * rejects — a rejected post fails the turn and dead-letters an answer that would otherwise
+ * have been delivered.
+ *
+ * @param {{recipients?: number[]|string, groups?: number[], senderId?: number|string}} trigger
+ * @param {number|string} botUserId
+ * @returns {number[]|null}
+ */
+export function replyRecipients(trigger, botUserId) {
+  if (!Array.isArray(trigger?.recipients) || !trigger.recipients.length) return null;
+  if (Array.isArray(trigger.groups) && trigger.groups.length) return null;
+  const bot = userId(botUserId);
+  const out = [];
+  const seen = new Set();
+  for (const raw of trigger.recipients) {
+    const id = userId(raw);
+    if (id === null) return null; // unrecognized member — don't guess, fall back
+    if (id === bot || seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  const author = userId(trigger.senderId);
+  if (author !== null && author !== bot && !seen.has(author)) out.push(author);
+  return out.length ? out : null;
+}
+
 /** True when a message/comment was authored by Stacksbot itself (self-loop guard). */
 export function isSelfAuthored(creatorId, botUserId) {
   return String(creatorId) === String(botUserId);

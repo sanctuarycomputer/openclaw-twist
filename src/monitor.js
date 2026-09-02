@@ -19,6 +19,7 @@ import {
   resolveOutboundTarget,
   turnDeliveryVerdict,
   fastAckDecision,
+  replyRecipients,
 } from "./routing.js";
 import { admissionVerdict, handleTwistInbound } from "./inbound.js";
 import { postToTwist } from "./outbound.js";
@@ -216,6 +217,10 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
       isGroup: peer.isGroup,
       senderId: item.senderId,
       senderName: item.senderName,
+      // Who Twist notified about this post; the reply mirrors it (see replyRecipients).
+      // Both halves: a default-audience comment carries its audience in `groups`.
+      recipients: item.recipients ?? null,
+      groups: item.groups ?? null,
       text: item.content,
       timestamp: item.postedTs ? item.postedTs * 1000 : Date.now(),
       directMention: contentMentionsBot(item.content, botUserId),
@@ -349,12 +354,16 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
     }
   };
 
+  // The dead-letter apology answers the same message the reply would have, so it owes the
+  // same audience: without this, an answer that fails notifies MORE people than one that
+  // succeeds — the exact fan-out this mirrors away from.
   const replyInPlace = (item, text) =>
     postToTwist({
       client,
       kind: item.kind === "conv" ? "conv" : "thread",
       id: item.kind === "conv" ? item.conversationId : item.threadId,
       text,
+      recipients: replyRecipients(item, botUserId) ?? undefined,
     });
 
   // Built PER CYCLE rather than once, so each cycle's Twist reads carry that cycle's
