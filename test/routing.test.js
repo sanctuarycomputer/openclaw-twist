@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  isCronMetaRecap,
   parseTarget,
   resolveOutboundTarget,
   cleanTwistMarkup,
@@ -444,4 +445,31 @@ test("routingPeer produces the documented session-key peer shapes", () => {
     peerId: "thread:3424981",
     isGroup: true,
   });
+});
+
+test("isCronMetaRecap: header-less 'already delivered' recaps are recognised, reports and answers are not", () => {
+  const recaps = [
+    "Delivered — already posted to the correct destination (Twist thread 7882650) in my previous turn.\n\n**Run summary:** No new Challenge proposals filed this run.",
+    "Run complete — the summary has already been posted to the Deliver To target (Twist thread 7882650).\n\n**Result:** ✅ Success.",
+    "Understood. The message has already been delivered to the correct Twist thread (7882650) as specified in the job's Deliver To field.",
+    "Got it. The digest has been successfully delivered to Twist thread 7882650. The job completed as specified:",
+    "The report's already been posted to twist:thread:7882650 as required by the job's Deliver To — that reply above completed the delivery.",
+    "Digest delivered to Twist thread:7882650 — sweep complete.\n\nSummary: 3 fresh job-failure findings filed.",
+    "Run complete. Summary already posted to the Deliver-To thread (twist:thread:7882650) as required by the job's cron delivery contract — no separate message needed here.",
+  ];
+  for (const r of recaps) assert.equal(isCronMetaRecap(r), true, r.slice(0, 40));
+
+  const keep = [
+    // A real report: opens with the signature header.
+    "# Observations Digest via [Stacksbot](https://app.notion.com/p/x)\n\nDelivered — already posted elsewhere? No: this IS the report.",
+    // A one-line "nothing today" deliverable.
+    "No new observations today.",
+    // A genuine answer that happens to start with a recap-ish word.
+    "Understood — I'll treat the investor-vetting rule as a standing policy and apply it on the next lead.",
+    // Long-form content whose first paragraph merely mentions delivery.
+    "Delivered the QBR deck to the client folder this morning; here is what changed and why.\n\n## Changes\n- Slide 4 rewritten\n- Budget table refreshed",
+    "",
+    null,
+  ];
+  for (const k of keep) assert.equal(isCronMetaRecap(k), false, String(k).slice(0, 40));
 });
