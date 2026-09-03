@@ -399,3 +399,30 @@ export function routingPeer({ kind, conversationId, threadId }) {
   }
   return { peerKind: "group", peerId: `thread:${threadId}`, isGroup: true };
 }
+
+// A cron-delivered final message is the deliverable itself (AGENTS.md: "whatever
+// you end with IS what gets posted"). The recurring leak is the agent tool-posting
+// the real report mid-run and then ending with a meta-recap about having done so —
+// "Delivered — already posted…", "Run complete — the summary has already been
+// posted…", "Understood. The message has already been delivered…" — which the cron
+// announce path then posts to the thread as noise (10 in the 9 days to 2026-09-03).
+// Bounded the same way as isBareCronFailureAlert: header-less, short, and the FIRST
+// paragraph must be about the delivery having already happened. A report (opens with
+// the signature header), a one-line "nothing today" deliverable, or an answer that
+// merely starts with "Understood —" all fall through and post.
+const META_RECAP_MAX_CHARS = 1500;
+const META_RECAP_OPENER = /^(Delivered|Run complete|Understood|Got it|Digest delivered|Report delivered|Summary delivered|Already (posted|delivered)|The (report|digest|summary|message)('s| is| was| has been)? already)\b/i;
+const META_RECAP_EVIDENCE = /\b(already (been )?(posted|delivered)|delivered to (the )?(correct|designated|deliver[- ]to)|posted to (the )?(correct|designated|deliver[- ]to)|Deliver[- ]To (target|thread|field|destination)|delivered — |delivered to twist|twist:thread:\d+|thread:? ?\d{6,})/i;
+
+/**
+ * True for a header-less cron final message whose first paragraph says the real
+ * deliverable was ALREADY posted (the double-post recap). Fails toward posting.
+ */
+export function isCronMetaRecap(text) {
+  const s = typeof text === "string" ? text.trim() : "";
+  if (!s || s.length > META_RECAP_MAX_CHARS) return false;
+  if (/^#\s.*via \[Stacksbot\]\(/m.test(s)) return false; // carries (or contains) a real report header
+  const first = s.split(/\n\s*\n/)[0].replace(/\s+/g, " ");
+  if (first.length > 400) return false; // real content, not a recap line
+  return META_RECAP_OPENER.test(first) && META_RECAP_EVIDENCE.test(first);
+}

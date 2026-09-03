@@ -3,7 +3,7 @@
 // "thread:<id>" or "conv:<id>" (optionally prefixed "twist:").
 import { createTwistClient } from "./twist-client.js";
 import { resolveTwistAccount } from "./config.js";
-import { parseTarget, resolveOutboundTarget, channelDefaultRecipients, stripPreHeaderNarration, isBareCronFailureAlert } from "./routing.js";
+import { parseTarget, resolveOutboundTarget, channelDefaultRecipients, stripPreHeaderNarration, isBareCronFailureAlert, isCronMetaRecap } from "./routing.js";
 
 export { parseTarget };
 
@@ -82,6 +82,14 @@ export const twistOutbound = {
     sendText: async ({ cfg, to, text }) => {
       const { client, account } = clientFromConfig(cfg);
       const { kind, id } = resolveOutboundTarget(to, account.defaultTo);
+      // Cron announce deliveries arrive here (the inbound reply path calls postToTwist
+      // directly, so an interactive answer is never subject to this check). A final
+      // message that only recaps "already posted" duplicates a report the agent
+      // tool-posted moments earlier — drop it, loudly.
+      if (isCronMetaRecap(text)) {
+        console.warn(`[twist] suppressed cron meta-recap to ${kind}:${id} (deliverable was already tool-posted): ${String(text).slice(0, 160)}`);
+        return { messageId: undefined, suppressed: true };
+      }
       return await postToTwist({ client, kind, id, text });
     },
   },
