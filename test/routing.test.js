@@ -461,6 +461,9 @@ test("isCronMetaRecap: header-less 'already delivered' recaps are recognised, re
     // posted …" opener must not slip past.
     "✅ Batch Grade Creative Network done — posted the run summary to G3D: Hiring thread 7080480.\n\nRun recap: graded 49 candidates (4⭐: 10, 3⭐: 12, 2⭐: 15, 1⭐: 12), skipped 0, queue 0 remaining.",
     "❌ Observe: Twist finished — report already delivered to twist:thread:7882650.",
+    // Live 2026-09-05 14:03Z: 0.5.5 missed this one — the completion clause and the delivery
+    // evidence sit in different sentences of the first paragraph.
+    "✅ Batch Grade Creative Network done — grading run complete for this cycle.  Delivered to Twist thread 7080480 (G3D: Hiring): 9 qualifying candidates posted individually, plus the run summary.",
   ];
   for (const r of recaps) assert.equal(isCronMetaRecap(r), true, r.slice(0, 40));
 

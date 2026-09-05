@@ -428,5 +428,13 @@ export function isCronMetaRecap(text) {
   if (/^#\s.*via \[Stacksbot\]\(/m.test(s)) return false; // carries (or contains) a real report header
   const first = s.split(/\n\s*\n/)[0].replace(/\s+/g, " ");
   if (first.length > 400) return false; // real content, not a recap line
-  return META_RECAP_OPENER.test(first) && META_RECAP_EVIDENCE.test(first);
+  if (!META_RECAP_EVIDENCE.test(first)) return false;
+  if (META_RECAP_OPENER.test(first)) return true;
+  // Live 2026-09-05 14:03Z: "✅ <job> done — grading run complete for this cycle. Delivered
+  // to Twist thread 7080480 …" — the completion clause and the delivery evidence sat in
+  // different sentences. A first SENTENCE that declares completion, with delivery evidence
+  // anywhere in the (short) first paragraph, is the same recap.
+  const firstSentence = first.split(/(?<=[.!])\s+/)[0];
+  return META_RECAP_COMPLETION.test(firstSentence);
 }
+const META_RECAP_COMPLETION = /\b(?:done|complete|completed|finished|wrapped up)\b/i;
