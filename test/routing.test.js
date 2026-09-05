@@ -456,6 +456,11 @@ test("isCronMetaRecap: header-less 'already delivered' recaps are recognised, re
     "The report's already been posted to twist:thread:7882650 as required by the job's Deliver To — that reply above completed the delivery.",
     "Digest delivered to Twist thread:7882650 — sweep complete.\n\nSummary: 3 fresh job-failure findings filed.",
     "Run complete. Summary already posted to the Deliver-To thread (twist:thread:7882650) as required by the job's cron delivery contract — no separate message needed here.",
+    // Live 2026-09-05 08:07Z, hiring thread: the job tool-posted its summary, then the cron
+    // delivery posted this recap 4 seconds later. A leading status emoji and a "<job> done —
+    // posted …" opener must not slip past.
+    "✅ Batch Grade Creative Network done — posted the run summary to G3D: Hiring thread 7080480.\n\nRun recap: graded 49 candidates (4⭐: 10, 3⭐: 12, 2⭐: 15, 1⭐: 12), skipped 0, queue 0 remaining.",
+    "❌ Observe: Twist finished — report already delivered to twist:thread:7882650.",
   ];
   for (const r of recaps) assert.equal(isCronMetaRecap(r), true, r.slice(0, 40));
 
@@ -464,6 +469,9 @@ test("isCronMetaRecap: header-less 'already delivered' recaps are recognised, re
     "# Observations Digest via [Stacksbot](https://app.notion.com/p/x)\n\nDelivered — already posted elsewhere? No: this IS the report.",
     // A one-line "nothing today" deliverable.
     "No new observations today.",
+    // The REAL summary the job posts itself — same emoji opener, but it carries the counts and no delivery talk.
+    "✅ Batch Grade Creative Network Graded 49 candidates (4⭐: 10, 3⭐: 12, 2⭐: 15, 1⭐: 12). Skipped 0. Stopped at ~35 min; queue: 0 ungraded remaining.",
+    "✅ Batch Grade Creative Network — queue empty (0 ungraded).",
     // A genuine answer that happens to start with a recap-ish word.
     "Understood — I'll treat the investor-vetting rule as a standing policy and apply it on the next lead.",
     // Long-form content whose first paragraph merely mentions delivery.

@@ -411,7 +411,11 @@ export function routingPeer({ kind, conversationId, threadId }) {
 // the signature header), a one-line "nothing today" deliverable, or an answer that
 // merely starts with "Understood —" all fall through and post.
 const META_RECAP_MAX_CHARS = 1500;
-const META_RECAP_OPENER = /^(Delivered|Run complete|Understood|Got it|Digest delivered|Report delivered|Summary delivered|Already (posted|delivered)|The (report|digest|summary|message)('s| is| was| has been)? already)\b/i;
+// The opener tolerates a leading status marker (✅ / ❌ / ⚠️ …) and a short job label
+// before a "done|complete|finished — posted|delivered|already" clause: live 2026-09-05
+// the cron delivery re-posted "✅ Batch Grade Creative Network done — posted the run
+// summary to G3D: Hiring thread 7080480" four seconds after the job's own summary.
+const META_RECAP_OPENER = /^(?:[^\p{L}\p{N}\s]+\s*)?(?:(?:Delivered|Run complete|Understood|Got it|Digest delivered|Report delivered|Summary delivered|Already (?:posted|delivered)|The (?:report|digest|summary|message)(?:'s| is| was| has been)? already)\b|[^\n—–-]{0,80}?\b(?:done|complete|completed|finished)\b\s*[—–:-]\s*(?:posted|delivered|already|report (?:already )?(?:posted|delivered)|summary (?:already )?(?:posted|delivered)))/iu;
 const META_RECAP_EVIDENCE = /\b(already (been )?(posted|delivered)|delivered to (the )?(correct|designated|deliver[- ]to)|posted to (the )?(correct|designated|deliver[- ]to)|Deliver[- ]To (target|thread|field|destination)|delivered — |delivered to twist|twist:thread:\d+|thread:? ?\d{6,})/i;
 
 /**
