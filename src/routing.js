@@ -435,6 +435,12 @@ export function isCronMetaRecap(text) {
   // different sentences. A first SENTENCE that declares completion, with delivery evidence
   // anywhere in the (short) first paragraph, is the same recap.
   const firstSentence = first.split(/(?<=[.!])\s+/)[0];
-  return META_RECAP_COMPLETION.test(firstSentence);
+  if (META_RECAP_COMPLETION.test(firstSentence)) return true;
+  // Live 2026-09-06 12:03Z: "Observations Digest delivered to thread 7882650." — opens with
+  // the job name, no completion word; the first sentence IS the delivery claim. A short first
+  // sentence whose verb is delivered/posted/sent, with the evidence already matched, is the
+  // recap. (A real report never starts by saying where it was delivered; it carries a header.)
+  return firstSentence.length <= 200 && META_RECAP_DELIVERY_VERB.test(firstSentence);
 }
 const META_RECAP_COMPLETION = /\b(?:done|complete|completed|finished|wrapped up)\b/i;
+const META_RECAP_DELIVERY_VERB = /\b(?:delivered|posted|sent)\b/i;
