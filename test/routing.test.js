@@ -464,6 +464,10 @@ test("isCronMetaRecap: header-less 'already delivered' recaps are recognised, re
     // Live 2026-09-05 14:03Z: 0.5.5 missed this one — the completion clause and the delivery
     // evidence sit in different sentences of the first paragraph.
     "✅ Batch Grade Creative Network done — grading run complete for this cycle.  Delivered to Twist thread 7080480 (G3D: Hiring): 9 qualifying candidates posted individually, plus the run summary.",
+    // Live 2026-09-06 12:03Z: the recap opened with the job name, so no opener matched and the
+    // first sentence carried no completion word — only the delivery claim itself.
+    "Observations Digest delivered to thread 7882650.",
+    "Weekly report posted to twist:thread:7882650 as required.",
   ];
   for (const r of recaps) assert.equal(isCronMetaRecap(r), true, r.slice(0, 40));
 
