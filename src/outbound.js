@@ -4,6 +4,7 @@
 import { createTwistClient } from "./twist-client.js";
 import { resolveTwistAccount } from "./config.js";
 import { parseTarget, resolveOutboundTarget, channelDefaultRecipients, stripPreHeaderNarration, isBareCronFailureAlert, isCronMetaRecap } from "./routing.js";
+import { findRecentSelfPost } from "./recap-receipt.js";
 
 export { parseTarget };
 
@@ -85,9 +86,17 @@ export const twistOutbound = {
       // Cron announce deliveries arrive here (the inbound reply path calls postToTwist
       // directly, so an interactive answer is never subject to this check). A final
       // message that only recaps "already posted" duplicates a report the agent
-      // tool-posted moments earlier — drop it, loudly.
+      // tool-posted moments earlier — drop it, loudly. openclaw records the run as
+      // delivered only if we return a message id, so hand back the id of the bot's own
+      // recent post in the target: that IS the deliverable the recap refers to. When no
+      // such post exists the claim is unverified and the run stays "not-delivered".
       if (isCronMetaRecap(text)) {
-        console.warn(`[twist] suppressed cron meta-recap to ${kind}:${id} (deliverable was already tool-posted): ${String(text).slice(0, 160)}`);
+        const prior = await findRecentSelfPost(client, { kind, id, botUserId: account.botUserId });
+        if (prior) {
+          console.warn(`[twist] suppressed cron meta-recap to ${kind}:${id} (deliverable already tool-posted as ${prior.messageId}): ${String(text).slice(0, 160)}`);
+          return { messageId: prior.messageId, suppressed: true };
+        }
+        console.warn(`[twist] suppressed cron meta-recap to ${kind}:${id} (no recent bot post found — claim unverified, run reported not-delivered): ${String(text).slice(0, 160)}`);
         return { messageId: undefined, suppressed: true };
       }
       return await postToTwist({ client, kind, id, text });
