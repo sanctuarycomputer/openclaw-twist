@@ -19,7 +19,7 @@ import {
   resolveOutboundTarget,
   turnDeliveryVerdict,
   fastAckDecision,
-  replyRecipients,
+  replyAudience,
 } from "./routing.js";
 import { admissionVerdict, handleTwistInbound } from "./inbound.js";
 import { postToTwist } from "./outbound.js";
@@ -217,7 +217,7 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
       isGroup: peer.isGroup,
       senderId: item.senderId,
       senderName: item.senderName,
-      // Who Twist notified about this post; the reply mirrors it (see replyRecipients).
+      // Who Twist notified about this post; the reply mirrors it (see replyAudience).
       // Both halves: a default-audience comment carries its audience in `groups`.
       recipients: item.recipients ?? null,
       groups: item.groups ?? null,
@@ -363,7 +363,7 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
       kind: item.kind === "conv" ? "conv" : "thread",
       id: item.kind === "conv" ? item.conversationId : item.threadId,
       text,
-      recipients: replyRecipients(item, botUserId) ?? undefined,
+      audience: replyAudience(item, botUserId) ?? undefined,
     });
 
   // Built PER CYCLE rather than once, so each cycle's Twist reads carry that cycle's

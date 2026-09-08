@@ -152,13 +152,16 @@ export function createTwistClient({ token, workspaceId, fetchImpl = fetch }) {
     // ---- mutating ----
 
     /** Post a reply comment to a thread. */
-    addThreadComment: (threadId, content, { recipients, signal } = {}) =>
+    addThreadComment: (threadId, content, { recipients, groups, signal } = {}) =>
       request("comments/add", {
         method: "POST",
         body: {
           thread_id: threadId,
           content,
+          // Omit, never send empty: comments/add reads an explicit `recipients=[]` as
+          // "notify nobody", whereas omitting it falls back to EVERYONE_IN_THREAD.
           ...(Array.isArray(recipients) && recipients.length ? { recipients: JSON.stringify(recipients) } : {}),
+          ...(Array.isArray(groups) && groups.length ? { groups: JSON.stringify(groups) } : {}),
         },
         signal,
       }),

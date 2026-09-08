@@ -9,7 +9,7 @@ import {
 import { resolveInboundRouteEnvelopeBuilderWithRuntime } from "openclaw/plugin-sdk/inbound-envelope";
 import { getTwistRuntime } from "./runtime.js";
 import { resolveRequireMention } from "./config.js";
-import { contentMentionsBot, cleanTwistMarkup, stripIncompleteTurnFallback, replyRecipients } from "./routing.js";
+import { contentMentionsBot, cleanTwistMarkup, stripIncompleteTurnFallback, replyAudience } from "./routing.js";
 import { postToTwist } from "./outbound.js";
 
 const CHANNEL_ID = "twist";
@@ -143,12 +143,12 @@ export async function handleTwistInbound({ message, account, cfg, runtime, clien
     sessionStore: cfg.session?.store,
   });
 
-  // Notify exactly who the triggering post notified. Without this every reply omits
-  // `recipients`, and Twist's comments/add default (EVERYONE_IN_THREAD) turns an answer to
-  // a mention addressed to the bot alone into a notification for the whole thread.
-  // undefined, not null, when there is nothing to mirror: postToTwist reads undefined as
-  // "resolve it yourself" and falls back to the channel's default recipients.
-  const replyTo = replyRecipients(message, account.botUserId) ?? undefined;
+  // Notify exactly who the triggering post notified — users AND groups. Without this every
+  // reply omits `recipients`, and Twist's comments/add default (EVERYONE_IN_THREAD) turns an
+  // answer to a mention addressed to the bot alone into a notification for the whole
+  // channel. undefined, not null, when there is nothing to mirror: postToTwist reads
+  // undefined as "resolve it yourself" and falls back to the channel's default recipients.
+  const audience = replyAudience(message, account.botUserId) ?? undefined;
 
   const fromLabel = message.senderName || String(message.senderId);
   const contextBlock = buildTwistContextBlock(message);
@@ -219,7 +219,7 @@ export async function handleTwistInbound({ message, account, cfg, runtime, clien
             kind: message.kind === "thread" ? "thread" : "conv",
             id: message.kind === "thread" ? message.threadId : message.conversationId,
             text: body,
-            recipients: replyTo,
+            audience,
           });
           if (!res?.suppressed) statusSink?.({ lastOutboundAt: Date.now() });
           onDelivery?.(res?.suppressed ? { suppressed: "cron-alert" } : { delivered: true });

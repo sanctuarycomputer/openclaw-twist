@@ -83,3 +83,31 @@ test("client: reactions forward the caller's signal to the request", async () =>
 
   assert.deepEqual(seen, [controller.signal, controller.signal]);
 });
+
+// A reply mirrors both halves of the trigger's audience (see replyAudience). `groups` is a
+// documented comments/add field and Twist accepts the replied-or-reacted pseudo-group 2 in
+// it (verified live) — but an empty list must be OMITTED, not sent: comments/add reads an
+// explicit empty `recipients` as "notify nobody".
+test("client: addThreadComment sends recipients and groups, omitting whichever is empty", async () => {
+  const bodies = [];
+  const client = createTwistClient({
+    token: TOKEN,
+    workspaceId: WORKSPACE,
+    fetchImpl: async (_url, opts) => {
+      bodies.push(JSON.parse(opts.body));
+      return res(200, JSON.stringify({ id: 1 }));
+    },
+  });
+
+  await client.addThreadComment(8037224, "hi", { recipients: [427360], groups: [2] });
+  await client.addThreadComment(8037224, "hi", { recipients: [427360], groups: [] });
+  await client.addThreadComment(8037224, "hi", { recipients: [], groups: [26331] });
+  await client.addThreadComment(8037224, "hi", {});
+
+  assert.deepEqual(bodies, [
+    { thread_id: 8037224, content: "hi", recipients: "[427360]", groups: "[2]" },
+    { thread_id: 8037224, content: "hi", recipients: "[427360]" },
+    { thread_id: 8037224, content: "hi", groups: "[26331]" },
+    { thread_id: 8037224, content: "hi" },
+  ]);
+});

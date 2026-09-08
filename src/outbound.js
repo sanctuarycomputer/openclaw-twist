@@ -42,7 +42,7 @@ async function resolveThreadRecipients(client, threadId) {
  * logged loudly (console → gateway logs) so a wrongly-eaten message is
  * diagnosable, never a silent black hole.
  */
-export async function postToTwist({ client, kind, id, text, recipients }) {
+export async function postToTwist({ client, kind, id, text, audience }) {
   if (isBareCronFailureAlert(text)) {
     console.warn(`[twist] suppressed bare cron failure alert to ${kind}:${id} (redundant with Job Failure Alert): ${String(text).slice(0, 160)}`);
     return { messageId: undefined, suppressed: true };
@@ -52,8 +52,10 @@ export async function postToTwist({ client, kind, id, text, recipients }) {
     console.warn(`[twist] stripped ${text.length - body.length} chars of pre-header narration from post to ${kind}:${id}`);
   }
   if (kind === "thread") {
-    const resolved = recipients !== undefined ? recipients : await resolveThreadRecipients(client, id);
-    const res = await client.addThreadComment(id, body, { recipients: resolved });
+    // `audience` mirrors the triggering post (see replyAudience); undefined means there is
+    // nothing to mirror, so the channel's default participants (or Twist's own default) apply.
+    const resolved = audience !== undefined ? audience : { recipients: await resolveThreadRecipients(client, id), groups: [] };
+    const res = await client.addThreadComment(id, body, { recipients: resolved.recipients, groups: resolved.groups });
     return { messageId: res?.id != null ? String(res.id) : undefined };
   }
   const res = await client.addConversationMessage(id, body);
