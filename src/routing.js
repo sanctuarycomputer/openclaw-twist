@@ -269,6 +269,9 @@ export function turnDeliveryVerdict(outcomes) {
   return { delivered: false, retry: null }; // no payloads at all — not this failure mode
 }
 
+/** Twist's pseudo-group for the EVERYONE_IN_THREAD audience on comments (see replyAudience). */
+const EVERYONE_IN_THREAD_GROUP = 1;
+
 /** Channel default recipients to notify, or null to use Twist's default. */
 export function channelDefaultRecipients(channel) {
   if (channel && channel.use_default_recipients && Array.isArray(channel.default_recipients) && channel.default_recipients.length) {
@@ -286,47 +289,62 @@ function userId(value) {
 
 /**
  * Who a reply should notify, mirroring the post that triggered it — or null when that
- * post's audience cannot be mirrored as a user list.
+ * post's audience cannot be mirrored.
  *
  * Twist's `comments/add` defaults `recipients` to EVERYONE_IN_THREAD — everyone ever
- * mentioned anywhere in the thread — so a reply that omits the field blasts the whole
- * thread even when the mention that summoned it was addressed to the bot alone. Mirror
- * the trigger instead: the users IT notified, plus its author (Twist never lists you
- * among your own recipients, but you are obviously party to the exchange), minus the bot.
+ * mentioned anywhere in the thread, which in practice grows every thread to channel size —
+ * so a reply that omits the field blasts the whole channel even when the mention that
+ * summoned it was addressed to the bot alone. Mirror the trigger instead, BOTH halves:
  *
- * MIRROR ONLY A USER-LIST AUDIENCE. An empty `recipients` is not "nobody": a comment left
- * on Twist's default audience records that audience under `groups` (ids 1 and 2 are
- * Twist's own everyone-ish pseudo-groups) and leaves the user list empty — the majority
- * shape after `recipients:[n] groups:[]` in this workspace. A trigger that notified a
- * group is therefore NOT mirrorable: sending only its named users would silently drop the
- * group from the conversation.
+ * - `recipients`: the users it notified, plus its author (Twist never lists you among your
+ *   own recipients, but you are obviously party to the exchange), minus the bot.
+ * - `groups`: forwarded verbatim. A comment left on the notify picker's default chip
+ *   records its audience here and leaves the user list empty; `groups` is a documented
+ *   comments/add field, so the reply can say the same thing. Two ids are Twist's own
+ *   pseudo-groups, absent from groups/get:
+ *     2 = "everyone who replied or reacted" — NARROW and thread-scoped (measured live: a
+ *         7-person channel's thread with 59 group-2 comments has 5 participants). Twist
+ *         accepts `groups=[2]` on comments/add, verified live, so it mirrors like any other.
+ *     1 = EVERYONE_IN_THREAD — the channel-wide fan-out (threads with a group-1 reply sit at
+ *         channel size). There is nothing narrower to mirror and sending it explicitly is
+ *         unverified, so it yields null and the caller's fallback (the same audience) rules.
  *
  * Null means "no information", leaving the caller's own fallback in charge; it never means
- * "notify nobody". Anything unexpected in the list also yields null, so a shape we did not
- * anticipate falls back to the previous behavior rather than building a request Twist
+ * "notify nobody". Anything unexpected in either list also yields null, so a shape we did
+ * not anticipate falls back to the previous behavior rather than building a request Twist
  * rejects — a rejected post fails the turn and dead-letters an answer that would otherwise
- * have been delivered.
+ * have been delivered. An empty list on both halves is Twist's own "notify nobody" shape;
+ * with nothing to mirror it is null too.
  *
  * @param {{recipients?: number[]|string, groups?: number[], senderId?: number|string}} trigger
  * @param {number|string} botUserId
- * @returns {number[]|null}
+ * @returns {{recipients: number[], groups: number[]}|null}
  */
-export function replyRecipients(trigger, botUserId) {
-  if (!Array.isArray(trigger?.recipients) || !trigger.recipients.length) return null;
-  if (Array.isArray(trigger.groups) && trigger.groups.length) return null;
+export function replyAudience(trigger, botUserId) {
+  if (!Array.isArray(trigger?.recipients)) return null;
+  const rawGroups = trigger.groups ?? [];
+  if (!Array.isArray(rawGroups)) return null;
+  if (!trigger.recipients.length && !rawGroups.length) return null;
   const bot = userId(botUserId);
-  const out = [];
+  const recipients = [];
   const seen = new Set();
   for (const raw of trigger.recipients) {
     const id = userId(raw);
     if (id === null) return null; // unrecognized member — don't guess, fall back
     if (id === bot || seen.has(id)) continue;
     seen.add(id);
-    out.push(id);
+    recipients.push(id);
+  }
+  const groups = [];
+  for (const raw of rawGroups) {
+    const id = userId(raw);
+    if (id === null) return null;
+    if (id === EVERYONE_IN_THREAD_GROUP) return null; // already the widest audience
+    if (!groups.includes(id)) groups.push(id);
   }
   const author = userId(trigger.senderId);
-  if (author !== null && author !== bot && !seen.has(author)) out.push(author);
-  return out.length ? out : null;
+  if (author !== null && author !== bot && !seen.has(author)) recipients.push(author);
+  return recipients.length || groups.length ? { recipients, groups } : null;
 }
 
 /** True when a message/comment was authored by Stacksbot itself (self-loop guard). */

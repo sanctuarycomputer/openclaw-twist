@@ -85,7 +85,7 @@ test("thread sweep enqueues comments AND synthesizes the opening post on first s
   assert.equal(queue.get("thread-post:7").peerId, "thread:7");
 });
 
-// The reply must notify who the TRIGGER notified (see replyRecipients), which means the
+// The reply must notify who the TRIGGER notified (see replyAudience), which means the
 // recipient list has to survive the queue — the agent turn runs long after the poll that
 // read the comment, and nothing refetches it.
 test("queued items carry the recipient list Twist reported for the comment and the opening post", async () => {
@@ -100,7 +100,7 @@ test("queued items carry the recipient list Twist reported for the comment and t
 });
 
 // An empty `recipients` alongside a group is how Twist records a default-audience comment,
-// so the groups are half of the audience — without them replyRecipients cannot tell that
+// so the groups are half of the audience — without them replyAudience cannot tell that
 // shape apart from one addressed to named users alone.
 test("queued items carry the groups Twist notified, not just the named users", async () => {
   const { queue, producer } = await build({
@@ -112,7 +112,7 @@ test("queued items carry the groups Twist notified, not just the named users", a
 });
 
 // The queue is a record of what Twist said, not an interpretation of it: EVERYONE is
-// stored verbatim so replyRecipients stays the single place that decides what a recipient
+// stored verbatim so replyAudience stays the single place that decides what a recipient
 // list means.
 test("a recipients value of EVERYONE is queued verbatim, not flattened away", async () => {
   const { queue, producer } = await build({
