@@ -280,6 +280,53 @@ export function channelDefaultRecipients(channel) {
   return null;
 }
 
+/** Twist's pseudo-group for "everyone who replied or reacted" — narrow, thread-scoped. */
+const REPLIED_OR_REACTED_GROUP = 2;
+
+/**
+ * Who a post that has NO trigger to mirror should notify — an agent-initiated post in a
+ * thread: a cron delivery, or an agent-to-agent announce step (a coding session or
+ * sub-agent finishing). Until 0.5.11 these omitted `recipients`, and Twist's comments/add
+ * default is EVERYONE_IN_THREAD (pseudo-group 1, channel-wide): live 2026-09-14 three
+ * announce posts in a 32-member channel's thread each notified all 32 (`groups=[1]`)
+ * while the human replies in the same thread correctly notified one person.
+ *
+ * The thread's own audience is the narrow, obvious choice: `recipients` (the users the
+ * thread was addressed to) plus its creator (Twist never lists you among your own
+ * recipients), minus the bot, plus the thread's `groups` verbatim — except pseudo-group 1,
+ * which is the very fan-out being avoided. When that leaves nothing, fall back to
+ * pseudo-group 2 ("everyone who replied or reacted"), which Twist accepts on comments/add
+ * (verified live for replyAudience) and stays thread-scoped. Never null: this IS the
+ * fallback, so an unexpected shape degrades to group 2 rather than to everyone.
+ *
+ * @param {{recipients?: unknown, groups?: unknown, creator?: unknown}} thread
+ * @param {number|string} botUserId
+ * @returns {{recipients: number[], groups: number[]}}
+ */
+export function threadFallbackAudience(thread, botUserId) {
+  const bot = userId(botUserId);
+  const recipients = [];
+  const seen = new Set();
+  const add = (raw) => {
+    const id = userId(raw);
+    if (id === null || id === bot || seen.has(id)) return;
+    seen.add(id);
+    recipients.push(id);
+  };
+  if (Array.isArray(thread?.recipients)) for (const raw of thread.recipients) add(raw);
+  add(thread?.creator);
+  const groups = [];
+  if (Array.isArray(thread?.groups)) {
+    for (const raw of thread.groups) {
+      const id = userId(raw);
+      if (id === null || id === EVERYONE_IN_THREAD_GROUP || groups.includes(id)) continue;
+      groups.push(id);
+    }
+  }
+  if (!recipients.length && !groups.length) groups.push(REPLIED_OR_REACTED_GROUP);
+  return { recipients, groups };
+}
+
 /** A Twist user id as a number, or null if the value is not one. */
 function userId(value) {
   if (typeof value === "number") return Number.isInteger(value) ? value : null;

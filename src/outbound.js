@@ -3,7 +3,7 @@
 // "thread:<id>" or "conv:<id>" (optionally prefixed "twist:").
 import { createTwistClient } from "./twist-client.js";
 import { resolveTwistAccount } from "./config.js";
-import { parseTarget, resolveOutboundTarget, channelDefaultRecipients, stripPreHeaderNarration, isBareCronFailureAlert, isCronMetaRecap } from "./routing.js";
+import { parseTarget, resolveOutboundTarget, channelDefaultRecipients, threadFallbackAudience, stripPreHeaderNarration, isBareCronFailureAlert, isCronMetaRecap } from "./routing.js";
 import { findRecentSelfPost } from "./recap-receipt.js";
 
 export { parseTarget };
@@ -12,27 +12,39 @@ export { parseTarget };
 const CHANNEL_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const _channelCache = new Map();
 
+/** Channel default recipients for a channel id, cached (TTL 5 min); null when none configured. */
+async function cachedChannelDefaults(client, channelId) {
+  const cached = _channelCache.get(String(channelId));
+  if (cached && Date.now() < cached.expiresAt) return cached.recipients;
+  const channel = await client.getChannel(channelId);
+  const recipients = channelDefaultRecipients(channel);
+  _channelCache.set(String(channelId), { recipients, expiresAt: Date.now() + CHANNEL_CACHE_TTL_MS });
+  return recipients;
+}
+
 /**
- * Resolve the channel's default recipients for a given thread id.
- * Caches by channel id (TTL 5 min). Returns null on any error or when the
- * channel has no default recipients configured — falls back to Twist default.
+ * Who a post with nothing to mirror should notify, for a thread: the channel's configured
+ * default recipients when it has them, else the thread's own audience (see
+ * threadFallbackAudience) — never Twist's EVERYONE_IN_THREAD default. Returns null only
+ * when even the thread cannot be read; the caller then omits the field and logs it.
  */
-async function resolveThreadRecipients(client, threadId) {
+async function resolveThreadAudience(client, threadId, botUserId) {
+  let thread;
   try {
-    const thread = await client.getThread(threadId);
-    const channelId = thread?.channel_id;
-    if (!channelId) return null;
-
-    const cached = _channelCache.get(String(channelId));
-    if (cached && Date.now() < cached.expiresAt) return cached.recipients;
-
-    const channel = await client.getChannel(channelId);
-    const recipients = channelDefaultRecipients(channel);
-    _channelCache.set(String(channelId), { recipients, expiresAt: Date.now() + CHANNEL_CACHE_TTL_MS });
-    return recipients;
-  } catch {
-    return null; // tolerate API errors — fall back to Twist default
+    thread = await client.getThread(threadId);
+  } catch (err) {
+    console.warn(`[twist] thread ${threadId} unreadable while resolving the audience (${String(err).slice(0, 80)}) — posting with Twist's default`);
+    return null;
   }
+  if (thread?.channel_id) {
+    try {
+      const defaults = await cachedChannelDefaults(client, thread.channel_id);
+      if (defaults) return { recipients: defaults, groups: [] };
+    } catch {
+      // channel unreadable — the thread's own audience still applies
+    }
+  }
+  return threadFallbackAudience(thread, botUserId);
 }
 
 /**
@@ -42,7 +54,7 @@ async function resolveThreadRecipients(client, threadId) {
  * logged loudly (console → gateway logs) so a wrongly-eaten message is
  * diagnosable, never a silent black hole.
  */
-export async function postToTwist({ client, kind, id, text, audience }) {
+export async function postToTwist({ client, kind, id, text, audience, botUserId }) {
   if (isBareCronFailureAlert(text)) {
     console.warn(`[twist] suppressed bare cron failure alert to ${kind}:${id} (redundant with Job Failure Alert): ${String(text).slice(0, 160)}`);
     return { messageId: undefined, suppressed: true };
@@ -53,9 +65,14 @@ export async function postToTwist({ client, kind, id, text, audience }) {
   }
   if (kind === "thread") {
     // `audience` mirrors the triggering post (see replyAudience); undefined means there is
-    // nothing to mirror, so the channel's default participants (or Twist's own default) apply.
-    const resolved = audience !== undefined ? audience : { recipients: await resolveThreadRecipients(client, id), groups: [] };
-    const res = await client.addThreadComment(id, body, { recipients: resolved.recipients, groups: resolved.groups });
+    // nothing to mirror — a cron delivery or an agent-to-agent announce — so the channel's
+    // configured defaults or the thread's own audience apply (resolveThreadAudience), never
+    // Twist's EVERYONE_IN_THREAD default.
+    const resolved = audience !== undefined ? audience : await resolveThreadAudience(client, id, botUserId);
+    if (audience === undefined) {
+      console.warn(`[twist] agent-initiated post to thread:${id} — audience ${resolved ? `recipients=${JSON.stringify(resolved.recipients)} groups=${JSON.stringify(resolved.groups)}` : "Twist default (thread unreadable)"}`);
+    }
+    const res = await client.addThreadComment(id, body, resolved ? { recipients: resolved.recipients, groups: resolved.groups } : {});
     return { messageId: res?.id != null ? String(res.id) : undefined };
   }
   const res = await client.addConversationMessage(id, body);
@@ -101,7 +118,7 @@ export const twistOutbound = {
         console.warn(`[twist] suppressed cron meta-recap to ${kind}:${id} (no recent bot post found — claim unverified, run reported not-delivered): ${String(text).slice(0, 160)}`);
         return { messageId: undefined, suppressed: true };
       }
-      return await postToTwist({ client, kind, id, text });
+      return await postToTwist({ client, kind, id, text, botUserId: account.botUserId });
     },
   },
 };
