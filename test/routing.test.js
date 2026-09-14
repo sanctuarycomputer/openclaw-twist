@@ -23,6 +23,7 @@ import {
   routingPeer,
   channelDefaultRecipients,
   replyAudience,
+  threadFallbackAudience,
 } from "../src/routing.js";
 
 const BOT = 634870; // Stacksbot
@@ -507,4 +508,17 @@ test("isCronMetaRecap: header-less 'already delivered' recaps are recognised, re
     null,
   ];
   for (const k of keep) assert.equal(isCronMetaRecap(k), false, String(k).slice(0, 40));
+});
+
+test("threadFallbackAudience: the thread's own addressees + creator, minus the bot, groups minus EVERYONE_IN_THREAD (live 2026-09-14 shape)", () => {
+  // thread 8047386 in _.Operations: recipients [Hugh, X], creator Y, no groups; the three announce posts went out as groups=[1] → 32 people
+  assert.deepEqual(threadFallbackAudience({ recipients: [427360, 952288], groups: [], creator: 854561 }, BOT), { recipients: [427360, 952288, 854561], groups: [] });
+  assert.deepEqual(threadFallbackAudience({ recipients: [427360, BOT, "427360"], groups: [1, 7], creator: BOT }, BOT), { recipients: [427360], groups: [7] });
+});
+
+test("threadFallbackAudience: nothing to address → pseudo-group 2 (replied or reacted), never group 1, never null", () => {
+  assert.deepEqual(threadFallbackAudience({ recipients: [], groups: [1], creator: BOT }, BOT), { recipients: [], groups: [2] });
+  assert.deepEqual(threadFallbackAudience({}, BOT), { recipients: [], groups: [2] });
+  assert.deepEqual(threadFallbackAudience(undefined, BOT), { recipients: [], groups: [2] });
+  assert.deepEqual(threadFallbackAudience({ recipients: "EVERYONE", groups: "x", creator: "nope" }, BOT), { recipients: [], groups: [2] });
 });

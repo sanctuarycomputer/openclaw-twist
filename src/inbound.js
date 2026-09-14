@@ -204,6 +204,7 @@ export async function handleTwistInbound({ message, account, cfg, runtime, clien
             id: message.kind === "thread" ? message.threadId : message.conversationId,
             text: body,
             audience,
+            botUserId: account.botUserId,
           });
           if (!res?.suppressed) statusSink?.({ lastOutboundAt: Date.now() });
           onDelivery?.(res?.suppressed ? { suppressed: "cron-alert" } : { delivered: true });
