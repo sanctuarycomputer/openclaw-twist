@@ -9,28 +9,11 @@ import {
 import { resolveInboundRouteEnvelopeBuilderWithRuntime } from "openclaw/plugin-sdk/inbound-envelope";
 import { getTwistRuntime } from "./runtime.js";
 import { resolveRequireMention } from "./config.js";
-import { contentMentionsBot, cleanTwistMarkup, stripIncompleteTurnFallback, replyAudience } from "./routing.js";
+import { contentMentionsBot, stripIncompleteTurnFallback, replyAudience } from "./routing.js";
+import { buildInboundBodies } from "./agent-body.js";
 import { postToTwist } from "./outbound.js";
 
 const CHANNEL_ID = "twist";
-
-// Render the surrounding Twist context (thread title, channel, prior comments)
-// so the agent operates with full context, not just the bare mention.
-function buildTwistContextBlock(message) {
-  const lines = [];
-  if (message.kind === "thread") {
-    const where = message.channelName ? ` in #${message.channelName}` : "";
-    lines.push(`[Twist thread: "${message.threadTitle ?? "(untitled)"}"${where} · thread_id ${message.threadId}]`);
-  } else if (message.kind === "groupdm") {
-    lines.push(`[Twist group conversation · conversation_id ${message.conversationId}]`);
-  }
-  const transcript = message.transcript ?? [];
-  if (transcript.length) {
-    lines.push("", "Conversation so far:");
-    for (const t of transcript) lines.push(`${t.name}: ${cleanTwistMarkup(t.content)}`);
-  }
-  return lines.length ? lines.join("\n") : "";
-}
 
 const twistIngressIdentity = defineStableChannelIngressIdentity({
   key: "twist-id",
@@ -151,19 +134,20 @@ export async function handleTwistInbound({ message, account, cfg, runtime, clien
   const audience = replyAudience(message, account.botUserId) ?? undefined;
 
   const fromLabel = message.senderName || String(message.senderId);
-  const contextBlock = buildTwistContextBlock(message);
-  const bodyText = contextBlock ? `${contextBlock}\n\nNew message from ${fromLabel}:\n${rawBody}` : rawBody;
-  const { storePath, body } = buildEnvelope({
-    channel: "Twist",
-    from: fromLabel,
+  // Body (envelope) AND BodyForAgent (what the model reads) both carry the context block;
+  // RawBody/CommandBody stay bare. openclaw's finalizer falls back to CommandBody for the
+  // prompt when BodyForAgent is unset — which is how the transcript silently never reached
+  // the model before 0.5.10. See agent-body.js.
+  const { storePath, bodies } = buildInboundBodies({
+    message,
+    rawBody,
+    fromLabel,
     timestamp: message.timestamp,
-    body: bodyText,
+    buildEnvelope,
   });
 
   const ctxPayload = core.channel.reply.finalizeInboundContext({
-    Body: body,
-    RawBody: rawBody,
-    CommandBody: rawBody,
+    ...bodies,
     From: `twist:${message.peerId}`,
     To: `twist:${message.peerId}`,
     SessionKey: route.sessionKey,
