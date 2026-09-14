@@ -9,7 +9,7 @@ import {
 import { resolveInboundRouteEnvelopeBuilderWithRuntime } from "openclaw/plugin-sdk/inbound-envelope";
 import { getTwistRuntime } from "./runtime.js";
 import { resolveRequireMention } from "./config.js";
-import { contentMentionsBot, stripIncompleteTurnFallback, replyAudience } from "./routing.js";
+import { contentMentionsBot, cleanTwistMarkup, stripIncompleteTurnFallback, replyAudience } from "./routing.js";
 import { buildInboundBodies } from "./agent-body.js";
 import { postToTwist } from "./outbound.js";
 
