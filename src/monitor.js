@@ -25,7 +25,7 @@ import { admissionVerdict, handleTwistInbound } from "./inbound.js";
 import { postToTwist } from "./outbound.js";
 import { createQueueStore } from "./queue.js";
 import { createProducer } from "./producer.js";
-import { createConsumer, REPLAY_HORIZON_MS } from "./consumer.js";
+import { createConsumer, REPLAY_HORIZON_MS, ALERT_HEADER, isRepeatIncident } from "./consumer.js";
 import {
   MIN_WEBHOOK_TOKEN_LENGTH,
   createHintDebouncer,
@@ -348,6 +348,15 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
   const alert = async (text) => {
     try {
       const { kind, id } = resolveOutboundTarget(null, account.defaultTo);
+      // An incident alert already in the thread within 6h is not posted again (restarts reset in-process flags).
+      // A failed read never blocks the alert.
+      const recent = String(text).startsWith(ALERT_HEADER)
+        ? await (kind === "conv" ? client.getConversationMessages(id, { limit: 30 }) : client.getThreadComments(id, { limit: 30 })).catch(() => [])
+        : [];
+      if (isRepeatIncident(recent, text, { botUserId, nowMs: Date.now() })) {
+        log(`alert not repeated (already posted within 6h): ${String(text).split("\n")[1] ?? ""}`.slice(0, 200));
+        return;
+      }
       await postToTwist({ client, kind, id, text });
     } catch (err) {
       log(`alert delivery failed: ${String(err)}`);
