@@ -7,6 +7,47 @@ export const MAX_ATTEMPTS = 6;
 export const MAX_GLOBAL_TURNS = 3;
 export const HIGH_WATER = 50;
 export const HUNG_TURN_ALERT_MS = 30 * 60_000;
+// Ops alerts about the inbox itself open with the report header (the Observe sensor skips its own output by it)
+// and say in plain words what is affected and who is waiting (Stacksbot reader contract, 2026-09-29: the
+// full-disk night posted 11 "twist queue: … persist failed for conv-msg:… — stranded until restart" lines
+// about old backlog nobody was waiting on).
+export const ALERT_HEADER = "# Twist Inbox via [Stacksbot](https://app.notion.com/p/329131fea2c780718aa8f222b25c76e8)";
+const ago = (ms) => {
+  const m = Math.max(1, Math.round(ms / 60_000));
+  return m < 90 ? `${m} min` : `${Math.round(m / 60)} hours`;
+};
+const names = (items) => {
+  const ns = [...new Set(items.map((i) => i.senderName || "someone"))];
+  return ns.length <= 3 ? ns.join(", ").replace(/, ([^,]*)$/, " and $1") : `${ns.slice(0, 3).join(", ")} and ${ns.length - 3} others`;
+};
+/** The inbox can't be saved: one alert per incident, naming who is actually waiting (or saying nobody is). */
+export function storageAlertText(waiting) {
+  const who = waiting.length
+    ? `${names(waiting)} ${waiting.length === 1 && new Set(waiting.map((i) => i.senderName)).size === 1 ? "is" : "are"} waiting for a reply until it's fixed.`
+    : "Nobody is waiting yet (only old messages it was setting aside were affected), but new messages will stall until it's fixed.";
+  return `${ALERT_HEADER}\nNeeds Hugh: the bot can't save its Twist inbox (the disk may be full). ${who}`;
+}
+export const INCIDENT_REPEAT_MS = 6 * 3600_000;
+/** An incident alert's identity: header + first sentence, numbers masked ("247 messages" ≡ "251 messages"). */
+export const incidentKey = (text) => {
+  const [head, body = ""] = String(text ?? "").split("\n");
+  return `${head}\n${(body.split(/(?<=\.)\s/)[0] ?? "").replace(/\d+/g, "#")}`;
+};
+/**
+ * Did the bot already post this incident alert in the last INCIDENT_REPEAT_MS? `comments` are the target thread's
+ * recent comments. The in-process flags reset on every restart (the high-water alert posted 6 times in an hour
+ * on 2026-09-29, once per restart), so the thread itself is the memory. Only header-carrying incident alerts dedupe.
+ */
+export function isRepeatIncident(comments, text, { botUserId, nowMs, windowMs = INCIDENT_REPEAT_MS } = {}) {
+  if (!String(text ?? "").startsWith(ALERT_HEADER)) return false;
+  const key = incidentKey(text);
+  return (comments ?? []).some((c) => String(c.creator) === String(botUserId) && nowMs - Number(c.posted_ts) * 1000 < windowMs && incidentKey(c.content) === key);
+}
+/** Too many messages waiting for a reply: one alert per incident, with the oldest. */
+export function backlogAlertText(waiting, nowMs) {
+  const oldest = [...waiting].sort((a, b) => (a.postedTs ?? 0) - (b.postedTs ?? 0))[0];
+  return `${ALERT_HEADER}\nNeeds Hugh: ${waiting.length} messages are waiting for a reply (more than ${HIGH_WATER}), so replies are backed up. The oldest is from ${oldest?.senderName || "someone"}, waiting ${ago(nowMs - (oldest?.postedTs ?? 0) * 1000)}.`;
+}
 // Replay horizon: an item older than this WHEN IT IS CLAIMED is never answered, only
 // recorded as skipped:stale. Forward pagination means a lagging cursor (or a long outage)
 // now drains its entire gap instead of silently truncating it — correct for delivery, but
@@ -60,6 +101,19 @@ export function syncSkipReason(item, nowMs, botUserId) {
 export function createConsumer({ queue, botUserId, now, log, classifyPeer, admission, runTurn, probe, react, alert, replyInPlace, inFlight = new Map() }) {
   const settlePromises = new Set(); // test-only visibility into in-flight settle() work; see idle()
   let highWaterAlerted = false;
+  let storageAlerted = false; // one storage alert per process; monitor's alert() dedupes across restarts
+
+  /** Queued items someone is actually waiting on: not backlog, stale or unmentioned (those are only set aside). */
+  const waitingItems = () => queue.itemsInState("queued").filter((i) => !syncSkipReason(i, now(), botUserId));
+
+  async function storageFailed(err, item) {
+    log(`queue persist failed${item ? ` for ${item.id}` : ""}: ${String(err)}`);
+    if (storageAlerted) return;
+    storageAlerted = true;
+    const waiting = waitingItems();
+    if (item && !syncSkipReason(item, now(), botUserId) && !waiting.some((w) => w.id === item.id)) waiting.push(item);
+    await safeAlert(storageAlertText(waiting));
+  }
   let ticking = false; // reentrancy guard: tick() must never run two claim passes concurrently
 
   // Best-effort reaction: never let a reaction failure (network blip, sync throw from a
@@ -233,12 +287,13 @@ export function createConsumer({ queue, botUserId, now, log, classifyPeer, admis
         await queue.transition(item.id, { state: "skipped", reason }, now());
       } catch (err) {
         // The item is still `queued`, so the next pass would hand it straight back. Bail out
-        // like a failed claim rather than hammering a store that can't persist this tick.
-        log(`skip persist failed for ${item.id}: ${String(err)}`);
-        await alert(`twist queue: skip persist failed for ${item.id} — stranded until restart`).catch(() => {});
-        return;
+        // like a failed claim rather than hammering a store that can't persist this tick. The item itself was
+        // being set aside (nobody is waiting on it): the alert is about the STORE, once, not about this item.
+        await storageFailed(err, null);
+        return false;
       }
     }
+    return true;
   }
 
   return {
@@ -279,9 +334,12 @@ export function createConsumer({ queue, botUserId, now, log, classifyPeer, admis
       if (ticking) return; // a concurrent tick() call is a no-op, not a second claim pass
       ticking = true;
       try {
-        if (!highWaterAlerted && queue.nonTerminalCount() > HIGH_WATER) {
+        // Depth counts only messages someone is waiting on: 247 queued backlog items on 2026-09-29 were old
+        // messages the drain could not set aside (the disk was full), not a wedged consumer.
+        const waiting = waitingItems();
+        if (!highWaterAlerted && waiting.length > HIGH_WATER) {
           highWaterAlerted = true;
-          await alert(`twist queue: depth ${queue.nonTerminalCount()} exceeds high-water ${HIGH_WATER} — consumer may be wedged`).catch(() => {});
+          await safeAlert(backlogAlertText(waiting, now()));
         }
         for (const [peerId, f] of inFlight) {
           if (!f.hungAlerted && now() - f.startedAt > HUNG_TURN_ALERT_MS) {
@@ -291,10 +349,15 @@ export function createConsumer({ queue, botUserId, now, log, classifyPeer, admis
         }
         // Drain first, claim second: the whole point is that an unanswerable backlog never
         // stands between a mention and its turn, so the mention is claimable in THIS tick.
-        await drainSyncSkippable();
+        // A store that can't persist a skip can't persist a claim either: don't claim this tick. (On 2026-09-29
+        // the drain bailed and the claim loop then picked up the very backlog it had failed to set aside.)
+        if (!(await drainSyncSkippable())) return;
+        const passed = new Set();
         while (true) {
-          const item = queue.selectClaimable(now(), new Set(inFlight.keys()), MAX_GLOBAL_TURNS - inFlight.size);
+          const item = queue.selectClaimable(now(), new Set([...inFlight.keys(), ...passed]), MAX_GLOBAL_TURNS - inFlight.size);
           if (!item) break;
+          // Never claim what the drain would set aside (it can reappear here if it became skippable mid-tick).
+          if (syncSkipReason(item, now(), botUserId)) { passed.add(item.peerId); continue; }
           // Reserve the peer slot BEFORE the (awaited) claim persist, so a claim that's slow
           // to persist can't let another loop iteration double-claim the same peer.
           inFlight.set(item.peerId, { id: item.id, startedAt: now(), hungAlerted: false });
@@ -303,8 +366,7 @@ export function createConsumer({ queue, botUserId, now, log, classifyPeer, admis
             claimed = await queue.transition(item.id, { state: "processing", claimedAt: now(), attempts: item.attempts + 1 });
           } catch (err) {
             inFlight.delete(item.peerId);
-            log(`claim persist failed for ${item.id}: ${String(err)}`);
-            await alert(`twist queue: claim persist failed for ${item.id} — stranded until restart`).catch(() => {});
+            await storageFailed(err, item);
             break; // don't keep hammering a store that's failing to persist this tick
           }
           const p = settle(claimed)
