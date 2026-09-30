@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createQueueStore } from "../src/queue.js";
 import { createConsumer, BACKOFF_MS, MAX_ATTEMPTS, MAX_GLOBAL_TURNS, HIGH_WATER, HUNG_TURN_ALERT_MS, REPLAY_HORIZON_MS, isPermanentError, syncSkipReason } from "../src/consumer.js";
-import { storageAlertText, isRepeatIncident, incidentKey, ALERT_HEADER } from "../src/consumer.js";
+import { storageAlertText, isRepeatIncident, incidentKey, ALERT_HEADER, backlogAlertText, hungTurnAlertText } from "../src/consumer.js";
 
 const BOT = 634870;
 const T0 = 1_785_900_000_000;
@@ -220,7 +220,7 @@ test("boot recovery dead-letters a poison orphan instead of requeueing it foreve
   await consumer.recoverOrphans();
   assert.equal(queue.get("conv-msg:1").state, "failed"); // not "queued"
   assert.equal(calls.alerts.length, 1);
-  assert.match(calls.alerts[0], /failed after 6 attempts/);
+  assert.match(calls.alerts[0], /^# Twist Inbox via \[Stacksbot\]\(.*\)\nNeeds Hugh: the bot couldn't answer .* message after 6 tries and has given up on it/);
   assert.equal(calls.replies.length, 1);                 // in-place apology
   assert.ok(calls.reacts.some((r) => r[2] === "❌"));
 });
@@ -326,7 +326,8 @@ test("HIGH_WATER alert fires once when queue depth exceeds the threshold, not ag
   const backlog = calls.alerts.filter((a) => a.includes("messages are waiting for a reply"));
   assert.equal(backlog.length, 1);
   assert.match(backlog[0], /^# Twist Inbox via \[Stacksbot\]\(/);
-  assert.match(backlog[0], /Needs Hugh: 51 messages are waiting for a reply \(more than 50\), so replies are backed up\. The oldest is from Hugh/);
+  assert.match(backlog[0], /Needs Hugh: the bot has stopped keeping up with Twist: 51 messages are waiting for a reply \(more than 50\)\. The oldest is from Hugh/);
+  assert.match(backlog[0], /restart the service on Render\.$/);
   await consumer.tick();
   await flushMicrotasks();
   assert.equal(calls.alerts.filter((a) => a.includes("messages are waiting for a reply")).length, 1); // no re-alert
@@ -499,10 +500,11 @@ test("hung-turn alert fires once after HUNG_TURN_ALERT_MS, not again next tick",
   clock.t += HUNG_TURN_ALERT_MS + 1;
   await consumer.tick();
   await flushMicrotasks();
-  assert.equal(calls.alerts.filter((a) => a.includes("running >")).length, 1);
+  assert.equal(calls.alerts.filter((a) => a.includes("has been running for over 30 minutes")).length, 1);
+  assert.match(calls.alerts.find((a) => a.includes("has been running")), /^# Twist Inbox via \[Stacksbot\]\(.*\)\nNeeds Hugh: /);
   await consumer.tick();
   await flushMicrotasks();
-  assert.equal(calls.alerts.filter((a) => a.includes("running >")).length, 1); // no re-alert
+  assert.equal(calls.alerts.filter((a) => a.includes("has been running for over 30 minutes")).length, 1); // no re-alert
   release();
   await consumer.idle();
 });
@@ -546,8 +548,11 @@ test("a full disk while claiming a real mention: the storage alert names who is 
 test("isRepeatIncident: the same incident within 6h is not posted again, even with different counts; others always post", () => {
   const nowMs = T0;
   const a = storageAlertText([]);
-  const b = `${ALERT_HEADER}\nNeeds Hugh: 247 messages are waiting for a reply (more than 50), so replies are backed up. The oldest is from X, waiting 3 hours.`;
+  const b = backlogAlertText([{ senderName: "X", postedTs: nowMs / 1000 - 3 * 3600 }, ...Array.from({ length: 246 }, () => ({ senderName: "X", postedTs: nowMs / 1000 }))], nowMs);
   const b2 = b.replace("247", "251").replace("3 hours", "4 hours").replace("from X", "from Y");
+  assert.match(b, /247 messages/);
+  const h = hungTurnAlertText(30);
+  assert.equal(isRepeatIncident([{ creator: BOT, posted_ts: nowMs / 1000 - 600, content: h }], hungTurnAlertText(30), { botUserId: BOT, nowMs }), true, "a hung turn alerts once per incident, across restarts");
   const posted = [{ creator: BOT, posted_ts: nowMs / 1000 - 3600, content: a }, { creator: BOT, posted_ts: nowMs / 1000 - 600, content: b }];
   assert.equal(isRepeatIncident(posted, a, { botUserId: BOT, nowMs }), true);
   assert.equal(isRepeatIncident(posted, b2, { botUserId: BOT, nowMs }), true, "counts and names don't make it a new incident");

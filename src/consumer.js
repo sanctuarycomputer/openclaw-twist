@@ -43,10 +43,23 @@ export function isRepeatIncident(comments, text, { botUserId, nowMs, windowMs = 
   const key = incidentKey(text);
   return (comments ?? []).some((c) => String(c.creator) === String(botUserId) && nowMs - Number(c.posted_ts) * 1000 < windowMs && incidentKey(c.content) === key);
 }
-/** Too many messages waiting for a reply: one alert per incident, with the oldest. */
+/**
+ * Too many messages waiting for a reply: one alert per incident, with the oldest, and what to do (Stacksbot
+ * alerts-thread diet, 2026-09-30: every post in the ops thread says who acts and how).
+ */
 export function backlogAlertText(waiting, nowMs) {
   const oldest = [...waiting].sort((a, b) => (a.postedTs ?? 0) - (b.postedTs ?? 0))[0];
-  return `${ALERT_HEADER}\nNeeds Hugh: ${waiting.length} messages are waiting for a reply (more than ${HIGH_WATER}), so replies are backed up. The oldest is from ${oldest?.senderName || "someone"}, waiting ${ago(nowMs - (oldest?.postedTs ?? 0) * 1000)}.`;
+  return `${ALERT_HEADER}\nNeeds Hugh: the bot has stopped keeping up with Twist: ${waiting.length} messages are waiting for a reply (more than ${HIGH_WATER}). The oldest is from ${oldest?.senderName || "someone"}, waiting ${ago(nowMs - (oldest?.postedTs ?? 0) * 1000)}. If it hasn't drained in 30 minutes, restart the service on Render.`;
+}
+
+/** A message that will never be answered (retries exhausted): one alert per message. */
+export function deadLetterAlertText(item, attempts, errText) {
+  return `${ALERT_HEADER}\nNeeds Hugh: the bot couldn't answer ${item?.senderName || "someone"}'s message after ${attempts} tries and has given up on it (they were told it's flagged). Error: ${String(errText ?? "").replace(/\s+/g, " ").slice(0, 240)}`;
+}
+
+/** One reply has been running too long: the bot may be stuck. One alert per incident. */
+export function hungTurnAlertText(minutes) {
+  return `${ALERT_HEADER}\nNeeds Hugh: a reply has been running for over ${minutes} minutes, so the bot may be stuck. If it hasn't finished in another 30 minutes, restart the service on Render.`;
 }
 // Replay horizon: an item older than this WHEN IT IS CLAIMED is never answered, only
 // recorded as skipped:stale. Forward pagination means a lagging cursor (or a long outage)
@@ -188,7 +201,7 @@ export function createConsumer({ queue, botUserId, now, log, classifyPeer, admis
     await safeReact(item, "add", "❌");
     await queue.transition(item.id, { state: "failed", lastError: errText }, now());
     await replyInPlace(item, "I hit an error answering this and have exhausted retries — it's been flagged for review.").catch(() => {});
-    await alert(`twist queue: item ${item.id} (${item.peerId}) failed after ${attempts} attempts: ${errText.slice(0, 300)}`).catch(() => {});
+    await alert(deadLetterAlertText(item, attempts, errText)).catch(() => {});
   }
 
   // Bookkeeping ON TOP OF an already-failed turn: classify the error and record the verdict
@@ -344,7 +357,8 @@ export function createConsumer({ queue, botUserId, now, log, classifyPeer, admis
         for (const [peerId, f] of inFlight) {
           if (!f.hungAlerted && now() - f.startedAt > HUNG_TURN_ALERT_MS) {
             f.hungAlerted = true;
-            await alert(`twist queue: turn for ${f.id} (${peerId}) running > ${HUNG_TURN_ALERT_MS / 60000}min`).catch(() => {});
+            log(`turn for ${f.id} (${peerId}) running > ${HUNG_TURN_ALERT_MS / 60000}min`);
+            await alert(hungTurnAlertText(HUNG_TURN_ALERT_MS / 60000)).catch(() => {});
           }
         }
         // Drain first, claim second: the whole point is that an unanswerable backlog never
