@@ -217,6 +217,7 @@ export async function handleTwistInbound({ message, account, cfg, runtime, clien
           onDelivery?.({ failed: true });
         }
       },
+      observeMessageSent: true,
       onError: (err, info) => {
         runtime.error?.(`twist ${info?.kind ?? "reply"} delivery failed: ${String(err)}`);
       },
