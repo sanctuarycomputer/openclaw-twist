@@ -1,5 +1,5 @@
-// Transport-only sweep: everything new gets enqueued by id; no policy here beyond the two
-// loop guards (self posts, and posts by other bots — see bot-senders.js).
+// Transport-only sweep: everything new gets enqueued by id; no policy here beyond the loop
+// guards (self posts, posts by other bots — see bot-senders.js — and muted peers, mutes.js).
 // Cursor = refetch bound only. Invariant: cursor advances only after the
 // enqueue batch is durably persisted, so nothing below a cursor is un-enqueued.
 import { newInboundItems, advanceCursor } from "./routing.js";
@@ -24,8 +24,11 @@ export const MAX_PAGES_PER_POLL = 10;
  *   Items from a Twist bot account are dropped before they are enqueued, so no turn ever
  *   starts. The cursor still moves over them (advanceCursor reads the raw page), so they are
  *   not refetched. Omitted = nothing is dropped.
+ * @param {ReturnType<typeof import("./mutes.js").createMuteList>} [deps.mutes]
+ *   Items in a muted conversation or thread are dropped the same way, before they are
+ *   enqueued or acked, with the cursor still moving over them. Omitted = nothing is muted.
  */
-export function createProducer({ client, queue, cursors, botUserId, freshSinceTs, now, log, abortSignal, fastAck = async () => {}, botSenders }) {
+export function createProducer({ client, queue, cursors, botUserId, freshSinceTs, now, log, abortSignal, fastAck = async () => {}, botSenders, mutes }) {
   const isBacklog = (firstSight, postedTs) => firstSight && !(typeof postedTs === "number" && postedTs >= freshSinceTs);
 
   /**
@@ -53,6 +56,13 @@ export function createProducer({ client, queue, cursors, botUserId, freshSinceTs
       items = items.filter((it) => {
         if (!botSenders.isBot(it.senderId)) return true;
         botSenders.noteDropped(it);
+        return false;
+      });
+    }
+    if (mutes && items.length) {
+      items = items.filter((it) => {
+        if (!mutes.isMuted(it.peerId)) return true;
+        mutes.noteDropped(it);
         return false;
       });
     }

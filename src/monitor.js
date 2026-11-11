@@ -26,6 +26,8 @@ import { postToTwist } from "./outbound.js";
 import { createQueueStore } from "./queue.js";
 import { createProducer } from "./producer.js";
 import { createBotSenders } from "./bot-senders.js";
+import { createMuteList, muteFilePath } from "./mutes.js";
+import { createLoopBreaker } from "./loop-breaker.js";
 import { createConsumer, REPLAY_HORIZON_MS, ALERT_HEADER, isRepeatIncident } from "./consumer.js";
 import {
   MIN_WEBHOOK_TOKEN_LENGTH,
@@ -137,6 +139,10 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
   const queue = queueEntry.store;
   // Process-lived (the producer is rebuilt per cycle): holds the cached workspace bot set.
   const botSenders = createBotSenders({ client, log, allowBots: account.config.allowBots === true });
+  // The shared mute list (Spend Guard + loop breaker). Re-read cheaply on change, so an
+  // unmute in the file takes effect within seconds without a restart.
+  const guards = account.loopGuards;
+  const mutes = createMuteList({ path: muteFilePath(process.env), neverMute: guards.neverMute, log });
 
   // ---------------------------------------------------------------- helpers
 
@@ -366,6 +372,21 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
     }
   };
 
+  // A Critical goes where Hugh reads (his DM, by default), not the ops thread he doesn't.
+  // If that post fails it still goes out, through the ordinary alert path.
+  const critical = async (text) => {
+    try {
+      const { kind, id } = resolveOutboundTarget(guards.criticalTo, account.defaultTo);
+      await postToTwist({ client, kind, id, text, botUserId });
+    } catch (err) {
+      log(`critical alert to ${guards.criticalTo} failed, sending it to the ops thread instead: ${String(err)}`);
+      await alert(text);
+    }
+  };
+  // Monitor-lived: a restart resets the windows (at most one more window of turns); the
+  // mutes it writes persist in the file.
+  const loopBreaker = createLoopBreaker({ mutes, notify: critical, config: guards.loopBreaker, log });
+
   // The dead-letter apology answers the same message the reply would have, so it owes the
   // same audience: without this, an answer that fails notifies MORE people than one that
   // succeeds — the exact fan-out this mirrors away from.
@@ -384,13 +405,15 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
   // queue and cursor stores it is handed. Declared here rather than at the top of the
   // function so `fastAck` (and the helpers it leans on) are already in scope.
   const makeProducer = (signal) =>
-    createProducer({ client, queue, cursors, botUserId, freshSinceTs, now: Date.now, log, abortSignal: signal, fastAck, botSenders });
+    createProducer({ client, queue, cursors, botUserId, freshSinceTs, now: Date.now, log, abortSignal: signal, fastAck, botSenders, mutes });
 
   const consumer = createConsumer({
     queue, botUserId, now: Date.now, log,
     classifyPeer, admission, runTurn, probe, react, alert, replyInPlace,
     inFlight: queueEntry.inFlight, // shared across restarts — see QUEUE_STORES
     isBotSender: (item) => botSenders.isBot(item.senderId),
+    isMuted: (item) => mutes.isMuted(item.peerId),
+    loopBreaker,
   });
 
   // ------------------------------------------------------------------ poll loop

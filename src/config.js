@@ -2,6 +2,7 @@
 import { readFileSync } from "node:fs";
 import { createTopLevelChannelConfigAdapter } from "openclaw/plugin-sdk/channel-config-helpers";
 import { resolveWebhookIngressConfig } from "./webhook.js";
+import { resolveLoopGuardConfig } from "./loop-breaker.js";
 
 export const SECTION_KEY = "twist";
 export const DEFAULT_ACCOUNT_ID = "default";
@@ -67,6 +68,8 @@ export function resolveTwistAccount(cfg) {
     webhookToken,
     webhookEnabled: webhookIngress.enabled,
     webhookDisabledReason: webhookIngress.enabled ? undefined : webhookIngress.reason,
+    // neverMute / criticalTo / loopBreaker, defaults applied (see loop-breaker.js).
+    loopGuards: resolveLoopGuardConfig(section),
     configured: Boolean(token && workspaceId && botUserId),
   };
 }
@@ -89,6 +92,9 @@ export const twistConfigAdapter = createTopLevelChannelConfigAdapter({
     "webhook",
     "webhookToken",
     "allowBots",
+    "neverMute",
+    "criticalTo",
+    "loopBreaker",
   ],
   resolveAllowFrom: (account) => account.config.allowFrom,
   formatAllowFrom: (allowFrom) => (allowFrom ?? []).map((e) => String(e)),

@@ -64,7 +64,22 @@
           "defaultTo": { "type": "string" },
           "webhook": { "type": "string" },
           "webhookToken": { "type": "string" },
-          "allowBots": { "type": "boolean" }
+          "allowBots": { "type": "boolean" },
+          "neverMute": {
+            "type": "array",
+            "items": { "type": "string", "pattern": "^(conv|thread):[0-9]+$" }
+          },
+          "criticalTo": { "type": "string" },
+          "loopBreaker": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": { "type": "boolean" },
+              "maxTurns": { "type": "integer", "minimum": 1 },
+              "windowMinutes": { "type": "integer", "minimum": 1 },
+              "muteHours": { "type": "number", "exclusiveMinimum": 0 }
+            }
+          }
         }
       },
       "uiHints": {
@@ -100,6 +115,18 @@
         "webhook": {
           "label": "Webhook path",
           "help": "Optional gateway route for Twist outgoing webhooks, e.g. \"/twist/events\". A delivery only HINTS which container to re-poll; the poll loop stays the source of truth. Requires webhookToken — unset either one and no route is registered."
+        },
+        "neverMute": {
+          "label": "Never mute",
+          "help": "Peers a mute is never honoured for, as \"conv:<id>\" or \"thread:<id>\" (default Hugh's DM and the ops thread). A loop there is alerted, never muted."
+        },
+        "criticalTo": {
+          "label": "Critical alert target",
+          "help": "Where loop-breaker Criticals go, e.g. \"conv:1367817\" (the default). Falls back to the ordinary alert target if that post fails."
+        },
+        "loopBreaker": {
+          "label": "Loop breaker",
+          "help": "Mute a conversation or thread that gets more than maxTurns replies within windowMinutes (default 40 in 30), for muteHours (default 6), via twist-muted.json."
         },
         "webhookToken": {
           "label": "Webhook token",
