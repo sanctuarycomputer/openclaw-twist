@@ -1,12 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createQueueStore } from "../src/queue.js";
 import { createCursorStore } from "../src/state.js";
 import { createProducer, MAX_PAGES_PER_POLL } from "../src/producer.js";
 import { createBotSenders, ADA_BOT_USER_ID, MISS_REFRESH_MS } from "../src/bot-senders.js";
+import { createMuteList } from "../src/mutes.js";
 
 const BOT = 634870;
 const NOW_MS = 1_785_900_000_000;
@@ -40,12 +41,12 @@ function fakeClient(state) {
     },
   };
 }
-async function build(state, { logs, fastAck, botSenders } = {}) {
+async function build(state, { logs, fastAck, botSenders, mutes } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "twistp-"));
   const queue = createQueueStore(join(dir, "queue.json"));
   const cursors = createCursorStore(join(dir, "cursors.json"));
   await queue.load(); await cursors.load();
-  const producer = createProducer({ client: fakeClient(state), queue, cursors, botUserId: BOT, freshSinceTs: FRESH_TS, now: () => NOW_MS, log: (m) => logs?.push(m), fastAck, botSenders });
+  const producer = createProducer({ client: fakeClient(state), queue, cursors, botUserId: BOT, freshSinceTs: FRESH_TS, now: () => NOW_MS, log: (m) => logs?.push(m), fastAck, botSenders, mutes });
   return { queue, cursors, producer };
 }
 const MENTION = `[Bot](twist-mention://${BOT}) ping`;
@@ -705,4 +706,45 @@ test("bot senders: a failed lookup is retried after MISS_REFRESH_MS, not every p
   assert.equal(bots.isBot(BOT_USER), true);
   await bots.prime([BOT_USER]); // known now: cached until the TTL
   assert.equal(state.userCalls.length, 2);
+});
+
+// ------------------------------------------------------------------- mute list
+
+// A muted conversation or thread is dropped exactly where bot senders are: never queued,
+// never acked, and the cursor still walks past it so the next poll does not refetch it.
+test("mute list: a muted conversation and thread are dropped, the cursor advances, other peers still enqueue", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "twistm-"));
+  const path = join(dir, "twist-muted.json");
+  const entry = { kind: "dm", reason: "spend", mutedAt: "2026-11-10T00:00:00Z", until: null, by: "spend-guard" };
+  writeFileSync(path, JSON.stringify({ version: 1, conversations: { 9: entry }, threads: { 7: { ...entry, kind: "thread" } } }));
+  const logs = [];
+  const mutes = createMuteList({ path, log: (m) => logs.push(m), now: () => NOW_MS });
+  const state = {
+    convs: [{ conversation_id: 9 }, { conversation_id: 10 }],
+    convMsgs: {
+      9: [
+        { id: 701, obj_index: 0, creator: 427360, creator_name: "Loopy", posted_ts: FRESH_TS + 1, content: "again" },
+        { id: 702, obj_index: 1, creator: 427360, creator_name: "Loopy", posted_ts: FRESH_TS + 2, content: "again" },
+      ],
+      10: [{ id: 801, obj_index: 0, creator: 427361, posted_ts: FRESH_TS + 3, content: "hi" }],
+    },
+    threads: [{ thread_id: 7, channel_id: 3, direct_mention: true }],
+    threadObjs: { 7: { id: 7, title: "t", content: MENTION, creator: 427360, posted_ts: FRESH_TS } },
+    threadComments: { 7: [{ id: 90, obj_index: 1, creator: 427360, posted_ts: FRESH_TS + 4, content: MENTION }] },
+  };
+  const acked = [];
+  const { queue, cursors, producer } = await build(state, { logs, mutes, fastAck: async (it) => acked.push(it.id) });
+  await producer.pollOnce();
+  assert.equal(queue.has("conv-msg:701"), false);
+  assert.equal(queue.has("conv-msg:702"), false);
+  assert.equal(queue.has("thread-comment:90"), false);
+  assert.equal(queue.has("thread-post:7"), false);
+  assert.equal(queue.has("conv-msg:801"), true);
+  assert.deepEqual(acked, ["conv-msg:801"]);
+  assert.equal(cursors.getCursor("conversations", 9), 1);
+  assert.equal(cursors.getCursor("threads", 7), 1);
+  // Rate-limited: one line for the muted conversation (+1 counted), one for the thread.
+  const drops = logs.filter((l) => l.startsWith("dropped "));
+  assert.equal(drops.length, 2);
+  assert.match(drops[0], /conv-msg:701 in muted conv:9 \(by spend-guard/);
 });

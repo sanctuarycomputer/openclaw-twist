@@ -19,7 +19,7 @@ function baseItem(id, over = {}) {
     firstSightBacklog: false, state: "queued", attempts: 0, nextAttemptAt: 0, enqueuedAt: T0, ...over,
   };
 }
-async function harness({ items = [], clock = { t: T0 }, runTurn, probe, classifyPeer, admission, queue: sharedQueue, inFlight, calls: sharedCalls, isBotSender } = {}) {
+async function harness({ items = [], clock = { t: T0 }, runTurn, probe, classifyPeer, admission, queue: sharedQueue, inFlight, calls: sharedCalls, isBotSender, isMuted, loopBreaker } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "twistc-"));
   const queue = sharedQueue ?? createQueueStore(join(dir, "queue.json"));
   if (!sharedQueue) await queue.load();
@@ -29,6 +29,8 @@ async function harness({ items = [], clock = { t: T0 }, runTurn, probe, classify
     queue, botUserId: BOT, now: () => clock.t, log: () => {},
     ...(inFlight ? { inFlight } : {}),
     ...(isBotSender ? { isBotSender } : {}),
+    ...(isMuted ? { isMuted } : {}),
+    ...(loopBreaker ? { loopBreaker } : {}),
     classifyPeer: classifyPeer ?? (async () => "groupdm"),
     admission: admission ?? (async () => ({ admit: true, admission: "dispatch", commandAuthorized: false })),
     runTurn: runTurn ?? (async (item) => { calls.turns.push(item.id); }),
@@ -588,4 +590,55 @@ test("syncSkipReason: bot-sender wins over every other reason; no predicate = ne
   const item = baseItem("conv-msg:1", { firstSightBacklog: true });
   assert.equal(syncSkipReason(item, T0, BOT, () => true), "bot-sender");
   assert.equal(syncSkipReason(item, T0, BOT), "backlog");
+});
+
+// ------------------------------------------------------------------- mutes + loop breaker
+
+// Items queued before their peer was muted drain as skipped:muted, quietly (one summary line
+// per peer, no reaction calls): a muted peer is usually muted because it was flooding.
+test("muted: queued items in a muted peer drain as skipped:muted with no turn and no reactions; other peers answered", async () => {
+  const { queue, consumer, calls } = await harness({
+    classifyPeer: async () => "dm",
+    isMuted: (item) => item.peerId === "conv:9",
+    items: [
+      baseItem("conv-msg:1", { peerId: "conv:9", conversationId: 9 }),
+      baseItem("conv-msg:2", { peerId: "conv:9", conversationId: 9 }),
+      baseItem("conv-msg:3", { peerId: "conv:3" }),
+    ],
+  });
+  await drain(consumer);
+  assert.equal(queue.get("conv-msg:1").reason, "muted");
+  assert.equal(queue.get("conv-msg:2").reason, "muted");
+  assert.deepEqual(calls.turns, ["conv-msg:3"]);
+  assert.equal(calls.reacts.some(([id]) => id !== "conv-msg:3"), false);
+});
+
+test("syncSkipReason: muted comes right after bot-sender", () => {
+  const item = baseItem("conv-msg:1", { firstSightBacklog: true });
+  assert.equal(syncSkipReason(item, T0, BOT, () => false, () => true), "muted");
+  assert.equal(syncSkipReason(item, T0, BOT, () => true, () => true), "bot-sender");
+});
+
+test("loop breaker: a turn it refuses is skipped as muted, never dispatched; admitted turns run", async () => {
+  const asked = [];
+  const { queue, consumer, calls } = await harness({
+    classifyPeer: async () => "dm",
+    loopBreaker: { admit: async (item, { kind }) => { asked.push([item.id, kind]); return item.id !== "conv-msg:2"; } },
+    items: [baseItem("conv-msg:1"), baseItem("conv-msg:2", { peerId: "conv:2" })],
+  });
+  await drain(consumer);
+  assert.deepEqual(calls.turns, ["conv-msg:1"]);
+  assert.equal(queue.get("conv-msg:2").state, "skipped");
+  assert.equal(queue.get("conv-msg:2").reason, "muted");
+  assert.deepEqual(asked.sort(), [["conv-msg:1", "dm"], ["conv-msg:2", "dm"]], "asked with the classified kind");
+});
+
+test("loop breaker: never asked about an item another policy already skips", async () => {
+  const asked = [];
+  const { consumer } = await harness({
+    loopBreaker: { admit: async (item) => { asked.push(item.id); return true; } },
+    items: [baseItem("conv-msg:1", { content: "no mention" })], // groupdm without a mention
+  });
+  await drain(consumer);
+  assert.deepEqual(asked, []);
 });

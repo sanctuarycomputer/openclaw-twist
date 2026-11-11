@@ -36,7 +36,7 @@ This channel **polls** Twist's unread endpoints on an interval (default 15s) fro
 
 A producer/queue/consumer pipeline replaces a single fetch-decide-dispatch pass:
 
-- **Producer** (transport only): every poll, enqueues every new message/comment by Twist's globally-unique id. Enqueue is idempotent — an id already in the queue, live or tombstoned, is a no-op — so a cursor bug now causes a harmless refetch, not lost messages. No policy at this layer, only the two loop guards: self-post exclusion, and **posts by other bots** (any Twist user whose record has `bot: true`, plus Twist's Ada Bot, id 2601, by id) are dropped before they are enqueued, in DMs and threads alike. The cursor still moves past them, and each drop is logged (at most one line per bot per minute). Two bots that answer each other never stop: Ada auto-replies to every DM message, and from 2026-10-02 it and Stacksbot traded ~748k messages before anyone noticed. Bot items queued before the guard existed are drained as `skipped:bot-sender`. Fetches **page forward from the cursor** (ascending, up to 10 pages per container per poll) rather than grabbing the newest N — a burst bigger than one fetch window is drained across polls instead of being skipped. A thread's opening post is enqueued too (id `thread-post:<threadId>`), so a thread created by @mentioning the bot gets answered.
+- **Producer** (transport only): every poll, enqueues every new message/comment by Twist's globally-unique id. Enqueue is idempotent — an id already in the queue, live or tombstoned, is a no-op — so a cursor bug now causes a harmless refetch, not lost messages. No policy at this layer, only the two loop guards: self-post exclusion, and **posts by other bots** (any Twist user whose record has `bot: true`, plus Twist's Ada Bot, id 2601, by id) are dropped before they are enqueued, in DMs and threads alike. The cursor still moves past them, and each drop is logged (at most one line per bot per minute). Two bots that answer each other never stop: Ada auto-replies to every DM message, and from 2026-10-02 it and Stacksbot traded ~748k messages before anyone noticed. Bot items queued before the guard existed are drained as `skipped:bot-sender`. Items in a **muted** conversation or thread are dropped at the same place, the same way (see [Loop guards](#loop-guards)). Fetches **page forward from the cursor** (ascending, up to 10 pages per container per poll) rather than grabbing the newest N — a burst bigger than one fetch window is drained across polls instead of being skipped. A thread's opening post is enqueued too (id `thread-post:<threadId>`), so a thread created by @mentioning the bot gets answered.
 - **Queue**: a persistent state machine, one record per message. States: `queued → processing → done | skipped | failed`. Every transition is durably persisted (tmp-file + fsync + atomic rename) before its side effects proceed.
 - **Consumer**: claims `queued` items oldest-first, at most **one turn per peer** at a time (keeps a thread/DM's turns ordered and its session coherent — a busy peer's next mention waits instead of being dropped) and at most **3 turns globally** (box/spend protection). Policy — mention check, admission gate — is evaluated at claim time and recorded as a terminal `skipped` state, never silently dropped. Each tick starts with a **skip-drain pre-pass**: items the policy can condemn without any lookup (backlog, stale, a thread comment with no mention) are settled terminally before any claiming, and deliberately outside the per-peer and global-turn gates — a skip runs no agent and touches no session, so neither gate has anything to protect. A cold thread's whole unanswerable history therefore drains in a single poll (instead of one item per poll), the mention behind it is claimed in that same pass, and the drain still works when every turn slot is busy or the peer already has a turn running.
 
@@ -50,6 +50,7 @@ Skip reasons (all logged, none silent):
 | `admission:<verdict>` | OpenCLAW's ingress gate returned a non-dispatch verdict. |
 | `gone` | The trigger no longer exists on Twist (deleted message, permanent 4xx). Non-retryable. |
 | `bot-sender` | The sender is a Twist bot account. Normally dropped by the producer before it is queued; this catches items queued before that guard. Summarized in one log line per drain, and no ⏳ cleanup. |
+| `muted` | The conversation or thread is in the [mute list](#loop-guards): queued before the mute landed, or the turn that tripped the loop breaker. Summarized in one log line per peer per drain, and no ⏳ cleanup. |
 
 **Retries:** a failed turn rides a backoff ladder — 30s, 2m, 10m, 1h, 1h — up to 6 attempts. The ⏳ stays on the message across the whole ladder (the item is still going to be answered); it's only cleared when the outcome is final. A turn that delivered **nothing** counts as a failure, not an answer, and goes back on the ladder: that covers a turn whose only output was OpenCLAW's `incomplete_turn` placeholder ("⚠️ Agent couldn't generate a response…", which is never posted) and a turn whose only reply threw on the way to Twist. Otherwise a transient flake silently consumes the request. When the placeholder *trails real content* (OpenCLAW appends it to tool-presentation output), only the placeholder line is stripped — the real content ships and the turn counts as answered, because retrying it would post that content twice. Once retries are exhausted the item goes `failed` **loudly**: a ❌ reaction, an in-place reply telling the sender it hit an error, and an alert to the ops thread. Nobody is left wondering if they were ignored.
 
@@ -58,6 +59,24 @@ Skip reasons (all logged, none silent):
 **Backpressure:** if the non-terminal queue depth exceeds 50, a one-shot alert fires to the ops thread — a wedged consumer must not be silent.
 
 **Corrupt store:** if the queue file is unreadable (half-written crash, hand-edited, wrong shape), it's quarantined to `queue.json.corrupt-<timestamp>` and the queue starts empty rather than boot-looping the account; cursors still bound what gets refetched, so this can't cause old messages to be re-answered. The cursor file gets the same treatment (`cursors.json.corrupt-<timestamp>`), and both files are written tmp-file + fsync + atomic rename, so neither is ever partial at rest. Losing cursors is safe: every thread/conversation reads as first sight again, and the 2h grace window baselines the backlog away.
+
+### Loop guards
+
+A reply that triggers a reply never stops on its own. From 2026-10-02 to 11-10 the bot and Twist's Ada Bot traded ~748k messages (~$28k) in one DM. Three guards, from cheapest to broadest:
+
+1. **Bot senders** (above): a Twist user flagged `bot: true`, and Ada (id 2601) by id, is never answered.
+2. **Mute list**: `$OPENCLAW_STATE_DIR/twist-muted.json`, shared with Stacksbot's Spend Guard (which owns the contract, in the stacksbot repo's `scripts/lib/twist-mute.mjs`). No `OPENCLAW_STATE_DIR` means no file, and nothing is muted.
+   ```json
+   { "version": 1,
+     "conversations": { "1349360": { "kind": "dm", "reason": "…", "mutedAt": "2026-11-10T00:00:00Z", "until": null, "by": "spend-guard" } },
+     "threads": { "<threadId>": { "…": "same shape" } } }
+   ```
+   An entry mutes while `until` is null or in the future. Items in a muted conversation or thread are dropped before they are queued or acked (the cursor still moves past them, one log line per peer per minute); items already queued drain as `skipped:muted`. The file is re-stat'd at most every 10s and re-read only when it changed, so an edit takes effect within seconds, no restart. A missing or corrupt file mutes nothing and is logged once. **`neverMute` peers are never muted** (default Hugh's DM, `conv:1367817`, and the ops thread, `thread:7882650`): a mute there is ignored with a warning, because it would cut Hugh off from the bot.
+3. **Loop breaker**: catches a fast loop with a counterpart that is *not* flagged as a bot (another integration posting as a normal user, an auto-responder), which the Spend Guard only sees about once a day. Turns about to be dispatched are counted per conversation or thread over a rolling window; the turn that takes a peer past `loopBreaker.maxTurns` (default 40) within `windowMinutes` (default 30) is not dispatched. The breaker then:
+   - writes the peer into the mute file for `muteHours` (default 6), `by: "twist-loop-breaker"`, with the counts as the reason. The write is a merge (re-read, tmp-file + fsync + rename) that never removes or rewrites another writer's entry. If the file can't be written (unset path, unreadable file, another writer owns the entry), the peer is muted in memory until the same time or the next restart;
+   - sends **one Critical** to `criticalTo` (default Hugh's DM, `conv:1367817`; Hugh doesn't read the ops thread), in plain words: where, who is on the other side, how many replies in how many minutes, muted until when, and how to undo it (delete or edit the entry in `twist-muted.json`, or `node scripts/twist-mute.mjs unmute <id>` in the stacksbot repo). If that post fails, the ordinary alert path carries it.
+
+   A `neverMute` peer that trips is **alerted, never muted**, at most once per `muteHours`. A peer whose breaker mute was **cut short by hand** is not re-muted for `muteHours` after the unmute (the next trip alerts instead), so an unmute sticks. Counts are in memory: a restart resets the windows, while the mutes persist in the file.
 
 ### Webhook ingress (optional, off by default)
 
@@ -127,6 +146,7 @@ Requests are guarded the same way the host's bundled webhook channels guard thei
 
 - `.state/cursors.json` — per-thread/conversation fetch cursor. A refetch-bound optimization only, not a dedup source of truth. Twist's own read state is never mutated by it.
 - `.state/queue.json` — the durable queue. Source of truth for what's been seen and its outcome.
+- `$OPENCLAW_STATE_DIR/twist-muted.json` — the shared [mute list](#loop-guards). Written by the Spend Guard and the loop breaker, read by the producer and consumer. Safe to edit by hand; a corrupt file mutes nothing.
 - `.state/webhook-trace.jsonl` — webhook latency breadcrumbs, one JSON line per accepted hint (`{t, k, e}`: receive time, container key, and the event's own `posted_ts` when the payload carried one). Pure diagnostics: never read back by the pipeline, rotated at ~1MB (one previous generation kept), and safe to delete at any time. `e` comes from the **unsigned** payload and is used only to split Twist's delivery latency from ours — never as a cursor, freshness input, or dedup key.
 
 ### Migration
@@ -205,6 +225,12 @@ See [`openclaw.twist.example.json5`](./openclaw.twist.example.json5) for a fully
 | `groupPolicy` | enum | `open` | `open` \| `allowlist` \| `disabled` |
 | `groups."*".requireMention` | boolean | `true` | Require `@mention` in groups/threads |
 | `allowBots` | boolean | `false` | Answer posts from Twist bot accounts (`bot: true`). Off by default: two bots answering each other loop forever. Ada Bot (id 2601) is denied even when this is on. |
+| `neverMute` | string[] | `["conv:1367817", "thread:7882650"]` | Peers (`conv:<id>` / `thread:<id>`) a [mute](#loop-guards) is never honoured for. A loop there is alerted, never muted. |
+| `criticalTo` | string | `"conv:1367817"` | Where loop-breaker Criticals go. Falls back to the ordinary alert target if the post fails. |
+| `loopBreaker.enabled` | boolean | `true` | Turn the [loop breaker](#loop-guards) off. The mute file is still honoured. |
+| `loopBreaker.maxTurns` | int | `40` | Turns per peer allowed inside the window; the next one trips it. |
+| `loopBreaker.windowMinutes` | int | `30` | Rolling window the turns are counted over. |
+| `loopBreaker.muteHours` | number | `6` | How long a tripped peer stays muted. |
 | `defaultTo` | string | — | Default delivery target for cron/proactive messages (e.g. `"thread:7882650"` or `"conv:123"`). Falls back to `TWIST_DEFAULT_TO` env var. |
 | `webhook` | string | — | Optional gateway route path for [webhook ingress](#webhook-ingress-optional-off-by-default), e.g. `"/twist/events"`. Falls back to `TWIST_WEBHOOK_PATH`. |
 | `webhookToken` | string | — | Shared secret presented as `?token=…`. Falls back to `TWIST_WEBHOOK_TOKEN`. Required alongside `webhook` — set one without the other and nothing is registered. **Minimum 24 characters**; shorter tokens are refused with an error and ingress stays off. |
@@ -226,7 +252,7 @@ This channel does **not** require the MCP server — it handles inbound routing 
 npm test          # routing + queue + producer + consumer + cursor-store suites (no network, no SDK needed)
 ```
 
-`node --test` covers the whole ingestion pipeline without touching the network: routing rules and markup (`routing.test.js`), the durable store's persistence/dedup/pruning/quarantine (`queue.test.js`), forward pagination and first-sight baselining (`producer.test.js`), the delivery state machine — retries, dead-lettering, per-peer and global concurrency, crash recovery (`consumer.test.js`), and cursor durability (`state.test.js`). The pure logic (routing rules, mention/self-filtering, cursor advancement, target parsing, markup cleaning) lives in `src/routing.js`. SDK-coupled code (`src/channel.js`, `src/inbound.js`, `src/monitor.js`) is validated by loading in a running gateway.
+`node --test` covers the whole ingestion pipeline without touching the network: routing rules and markup (`routing.test.js`), the durable store's persistence/dedup/pruning/quarantine (`queue.test.js`), forward pagination and first-sight baselining (`producer.test.js`), the delivery state machine — retries, dead-lettering, per-peer and global concurrency, crash recovery (`consumer.test.js`), cursor durability (`state.test.js`), and the loop guards — mute file reading and merging (`mutes.test.js`) and the per-peer loop breaker (`loop-breaker.test.js`). The pure logic (routing rules, mention/self-filtering, cursor advancement, target parsing, markup cleaning) lives in `src/routing.js`. SDK-coupled code (`src/channel.js`, `src/inbound.js`, `src/monitor.js`) is validated by loading in a running gateway.
 
 For local iteration against your own gateway, you can symlink the host SDK so standalone `node` imports resolve (gitignored):
 ```bash
