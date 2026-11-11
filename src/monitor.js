@@ -25,6 +25,7 @@ import { admissionVerdict, handleTwistInbound } from "./inbound.js";
 import { postToTwist } from "./outbound.js";
 import { createQueueStore } from "./queue.js";
 import { createProducer } from "./producer.js";
+import { createBotSenders } from "./bot-senders.js";
 import { createConsumer, REPLAY_HORIZON_MS, ALERT_HEADER, isRepeatIncident } from "./consumer.js";
 import {
   MIN_WEBHOOK_TOKEN_LENGTH,
@@ -134,6 +135,8 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
   const queueEntry = acquireQueueStore(queuePath, log);
   await queueEntry.ready;
   const queue = queueEntry.store;
+  // Process-lived (the producer is rebuilt per cycle): holds the cached workspace bot set.
+  const botSenders = createBotSenders({ client, log, allowBots: account.config.allowBots === true });
 
   // ---------------------------------------------------------------- helpers
 
@@ -381,12 +384,13 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
   // queue and cursor stores it is handed. Declared here rather than at the top of the
   // function so `fastAck` (and the helpers it leans on) are already in scope.
   const makeProducer = (signal) =>
-    createProducer({ client, queue, cursors, botUserId, freshSinceTs, now: Date.now, log, abortSignal: signal, fastAck });
+    createProducer({ client, queue, cursors, botUserId, freshSinceTs, now: Date.now, log, abortSignal: signal, fastAck, botSenders });
 
   const consumer = createConsumer({
     queue, botUserId, now: Date.now, log,
     classifyPeer, admission, runTurn, probe, react, alert, replyInPlace,
     inFlight: queueEntry.inFlight, // shared across restarts — see QUEUE_STORES
+    isBotSender: (item) => botSenders.isBot(item.senderId),
   });
 
   // ------------------------------------------------------------------ poll loop

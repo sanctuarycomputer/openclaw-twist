@@ -63,7 +63,8 @@
           },
           "defaultTo": { "type": "string" },
           "webhook": { "type": "string" },
-          "webhookToken": { "type": "string" }
+          "webhookToken": { "type": "string" },
+          "allowBots": { "type": "boolean" }
         }
       },
       "uiHints": {

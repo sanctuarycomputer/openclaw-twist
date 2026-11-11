@@ -92,8 +92,12 @@ export function isPermanentError(err) {
  * Conversation items are deliberately NOT decided here beyond backlog/stale: the mention
  * requirement depends on whether the conversation is a 1:1 DM (open) or a group DM
  * (mention-only), and that is an awaited lookup.
+ *
+ * `bot-sender` comes first: the producer already drops bot posts, so this only catches what
+ * was queued before it did (or by a producer without the guard).
  */
-export function syncSkipReason(item, nowMs, botUserId) {
+export function syncSkipReason(item, nowMs, botUserId, isBotSender = () => false) {
+  if (isBotSender(item)) return "bot-sender";
   if (item.firstSightBacklog) return "backlog";
   // postedTs is in seconds.
   if (nowMs - (item.postedTs ?? 0) * 1000 > REPLAY_HORIZON_MS) return "stale";
@@ -111,20 +115,20 @@ export function syncSkipReason(item, nowMs, botUserId) {
  *   `processing` in the store, but OTHER queued items on that same peer would still look
  *   claimable to a consumer whose own inFlight map is empty. Defaults to a private Map.
  */
-export function createConsumer({ queue, botUserId, now, log, classifyPeer, admission, runTurn, probe, react, alert, replyInPlace, inFlight = new Map() }) {
+export function createConsumer({ queue, botUserId, now, log, classifyPeer, admission, runTurn, probe, react, alert, replyInPlace, inFlight = new Map(), isBotSender = () => false }) {
   const settlePromises = new Set(); // test-only visibility into in-flight settle() work; see idle()
   let highWaterAlerted = false;
   let storageAlerted = false; // one storage alert per process; monitor's alert() dedupes across restarts
 
   /** Queued items someone is actually waiting on: not backlog, stale or unmentioned (those are only set aside). */
-  const waitingItems = () => queue.itemsInState("queued").filter((i) => !syncSkipReason(i, now(), botUserId));
+  const waitingItems = () => queue.itemsInState("queued").filter((i) => !syncSkipReason(i, now(), botUserId, isBotSender));
 
   async function storageFailed(err, item) {
     log(`queue persist failed${item ? ` for ${item.id}` : ""}: ${String(err)}`);
     if (storageAlerted) return;
     storageAlerted = true;
     const waiting = waitingItems();
-    if (item && !syncSkipReason(item, now(), botUserId) && !waiting.some((w) => w.id === item.id)) waiting.push(item);
+    if (item && !syncSkipReason(item, now(), botUserId, isBotSender) && !waiting.some((w) => w.id === item.id)) waiting.push(item);
     await safeAlert(storageAlertText(waiting));
   }
   let ticking = false; // reentrancy guard: tick() must never run two claim passes concurrently
@@ -154,7 +158,7 @@ export function createConsumer({ queue, botUserId, now, log, classifyPeer, admis
   // the sync checks are cheap. They run BEFORE the (network-hitting) peer classification and
   // the mention test: a backlog or stale item costs nothing to drop.
   async function policyVerdict(item) {
-    const sync = syncSkipReason(item, now(), botUserId);
+    const sync = syncSkipReason(item, now(), botUserId, isBotSender);
     if (sync) return { skip: sync };
     const kind = item.kind === "conv" ? await classifyPeer(item) : "thread";
     if (kind !== "dm" && !contentMentionsBot(item.content, botUserId)) return { skip: "no-mention", kind };
@@ -288,14 +292,19 @@ export function createConsumer({ queue, botUserId, now, log, classifyPeer, admis
    * due, and short-circuiting its ladder here would change retry semantics.
    */
   async function drainSyncSkippable() {
+    let botSkips = 0;
     for (const item of queue.itemsInState("queued")) {
       if (item.nextAttemptAt > now()) continue;
-      const reason = syncSkipReason(item, now(), botUserId);
+      const reason = syncSkipReason(item, now(), botUserId, isBotSender);
       if (!reason) continue;
-      log(`skip ${item.id} (${item.peerId}): ${reason}`);
+      // Bot items can be queued by the thousand (a bot loop), so they get one summary line
+      // and no ⏳ cleanup: nobody is watching a bot's message, and a reaction call per item
+      // is exactly the burst a rate limiter punishes.
+      if (reason === "bot-sender") botSkips++;
+      else log(`skip ${item.id} (${item.peerId}): ${reason}`);
       // A stale item may be wearing an ingestion ⏳ (backlog is never acked, and an
       // unmentioned thread item was never ack-worthy) — clear it so it doesn't leak.
-      if (wasFastAcked(item)) await safeReact(item, "remove", "⏳");
+      if (reason !== "bot-sender" && wasFastAcked(item)) await safeReact(item, "remove", "⏳");
       try {
         await queue.transition(item.id, { state: "skipped", reason }, now());
       } catch (err) {
@@ -306,6 +315,7 @@ export function createConsumer({ queue, botUserId, now, log, classifyPeer, admis
         return false;
       }
     }
+    if (botSkips) log(`skipped ${botSkips} queued item(s) from bots: bots are never answered`);
     return true;
   }
 
@@ -371,7 +381,7 @@ export function createConsumer({ queue, botUserId, now, log, classifyPeer, admis
           const item = queue.selectClaimable(now(), new Set([...inFlight.keys(), ...passed]), MAX_GLOBAL_TURNS - inFlight.size);
           if (!item) break;
           // Never claim what the drain would set aside (it can reappear here if it became skippable mid-tick).
-          if (syncSkipReason(item, now(), botUserId)) { passed.add(item.peerId); continue; }
+          if (syncSkipReason(item, now(), botUserId, isBotSender)) { passed.add(item.peerId); continue; }
           // Reserve the peer slot BEFORE the (awaited) claim persist, so a claim that's slow
           // to persist can't let another loop iteration double-claim the same peer.
           inFlight.set(item.peerId, { id: item.id, startedAt: now(), hungAlerted: false });
