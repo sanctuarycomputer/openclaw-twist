@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { createQueueStore } from "../src/queue.js";
 import { createCursorStore } from "../src/state.js";
 import { createProducer, MAX_PAGES_PER_POLL } from "../src/producer.js";
+import { createBotSenders, ADA_BOT_USER_ID, MISS_REFRESH_MS } from "../src/bot-senders.js";
 
 const BOT = 634870;
 const NOW_MS = 1_785_900_000_000;
@@ -32,14 +33,19 @@ function fakeClient(state) {
       return state.threadObjs?.[id];
     },
     markThreadRead: async (id, idx) => { (state.marked ??= []).push([id, idx]); },
+    getWorkspaceUsers: async () => {
+      (state.userCalls ??= []).push(1);
+      if (state.usersThrow) throw new Error("workspaces/get_users exploded");
+      return state.users ?? [];
+    },
   };
 }
-async function build(state, { logs, fastAck } = {}) {
+async function build(state, { logs, fastAck, botSenders } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "twistp-"));
   const queue = createQueueStore(join(dir, "queue.json"));
   const cursors = createCursorStore(join(dir, "cursors.json"));
   await queue.load(); await cursors.load();
-  const producer = createProducer({ client: fakeClient(state), queue, cursors, botUserId: BOT, freshSinceTs: FRESH_TS, now: () => NOW_MS, log: (m) => logs?.push(m), fastAck });
+  const producer = createProducer({ client: fakeClient(state), queue, cursors, botUserId: BOT, freshSinceTs: FRESH_TS, now: () => NOW_MS, log: (m) => logs?.push(m), fastAck, botSenders });
   return { queue, cursors, producer };
 }
 const MENTION = `[Bot](twist-mention://${BOT}) ping`;
@@ -583,4 +589,120 @@ test("the sweep's own signal reaches fastAck, so a hung reaction is cancellable"
   await producer.sweepContainer({ kind: "conversation", id: 9 });
   assert.equal(seen.length, 1);
   assert.equal(seen[0][1], controller.signal, "fastAck receives the sweep's signal, not undefined");
+});
+
+// ------------------------------------------------------------------- bot senders
+
+// 2026-10-02 → 11-10: Ada Bot auto-replied to every message in its DM with the bot, the bot
+// answered every Ada message, and the pair traded ~748k messages. A bot's post must never
+// become a queue item, and the cursor must still move past it so it is not refetched.
+const HUMAN = 427360;
+const BOT_USER = 55501;
+const withBots = (state, logs) => {
+  const client = fakeClient(state);
+  return createBotSenders({ client, log: (m) => logs?.push(m), now: () => NOW_MS });
+};
+
+test("bot senders: a Twist bot's DM messages are dropped, the human's dispatched, cursor advances past both", async () => {
+  const logs = [];
+  const state = {
+    users: [{ id: HUMAN, bot: false }, { id: BOT_USER, bot: true }],
+    convs: [{ conversation_id: 9 }],
+    convMsgs: { 9: [
+      { id: 501, obj_index: 0, creator: BOT_USER, creator_name: "Some Bot", posted_ts: FRESH_TS + 100, content: "beep" },
+      { id: 502, obj_index: 1, creator: HUMAN, posted_ts: FRESH_TS + 101, content: "hey bot" },
+      { id: 503, obj_index: 2, creator: BOT_USER, posted_ts: FRESH_TS + 102, content: "beep again" },
+    ] },
+  };
+  const acked = [];
+  const { queue, cursors, producer } = await build(state, { logs, botSenders: withBots(state, logs), fastAck: async (it) => acked.push(it.id) });
+  await producer.pollOnce();
+  assert.equal(queue.has("conv-msg:501"), false);
+  assert.equal(queue.has("conv-msg:503"), false);
+  assert.equal(queue.has("conv-msg:502"), true);
+  assert.deepEqual(acked, ["conv-msg:502"]); // a dropped item is never ⏳-acked either
+  assert.equal(cursors.getCursor("conversations", 9), 2);
+  // One line per bot per minute, carrying the count it stands for — a flood can't spam.
+  const drops = logs.filter((l) => l.startsWith("dropped "));
+  assert.equal(drops.length, 1);
+  assert.match(drops[0], /conv-msg:501 from bot Some Bot \(55501\)/);
+});
+
+test("bot senders: Ada Bot (2601) is dropped even when the user lookup fails; humans still pass", async () => {
+  const logs = [];
+  const state = {
+    usersThrow: true,
+    convs: [{ conversation_id: 1349360 }],
+    convMsgs: { 1349360: [
+      { id: 601, obj_index: 0, creator: ADA_BOT_USER_ID, creator_name: "Ada Bot", posted_ts: FRESH_TS + 100, content: "Sorry, I don't know the answer" },
+      { id: 602, obj_index: 1, creator: HUMAN, posted_ts: FRESH_TS + 101, content: "hi" },
+    ] },
+  };
+  const { queue, cursors, producer } = await build(state, { logs, botSenders: withBots(state, logs) });
+  await producer.pollOnce();
+  assert.equal(queue.has("conv-msg:601"), false);
+  assert.equal(queue.has("conv-msg:602"), true); // a failed lookup fails OPEN for people
+  assert.equal(cursors.getCursor("conversations", 1349360), 1);
+  assert.ok(logs.some((l) => l.startsWith("bot-sender lookup failed")));
+});
+
+test("bot senders: thread comments and a bot-authored opening post are dropped too; the read marker still moves", async () => {
+  const state = {
+    users: [{ id: HUMAN, bot: false }, { id: BOT_USER, bot: true }],
+    threads: [{ thread_id: 7, channel_id: 3, direct_mention: true }],
+    threadObjs: { 7: { id: 7, title: "Billing", content: MENTION, creator: BOT_USER, posted_ts: FRESH_TS + 50 } },
+    threadComments: { 7: [
+      { id: 88, obj_index: 1, creator: BOT_USER, posted_ts: FRESH_TS + 60, content: MENTION },
+      { id: 89, obj_index: 2, creator: HUMAN, posted_ts: FRESH_TS + 61, content: MENTION },
+    ] },
+  };
+  const { queue, cursors, producer } = await build(state, { botSenders: withBots(state) });
+  await producer.pollOnce();
+  assert.equal(queue.has("thread-post:7"), false);
+  assert.equal(queue.has("thread-comment:88"), false);
+  assert.equal(queue.has("thread-comment:89"), true);
+  assert.equal(cursors.getCursor("threads", 7), 2);
+  assert.deepEqual(state.marked, [[7, 2]]);
+});
+
+test("bot senders: forward pages drop bots and the cursor walks the whole page; lookups are cached", async () => {
+  const state = {
+    users: [{ id: HUMAN, bot: false }, { id: ADA_BOT_USER_ID, bot: true }],
+    convs: [{ conversation_id: 9 }],
+    convMsgs: { 9: msgRun(1, 40).map((m) => (m.obj_index % 2 ? { ...m, creator: ADA_BOT_USER_ID } : m)) },
+  };
+  const { queue, cursors, producer } = await build(state, { botSenders: withBots(state) });
+  await cursors.setCursor("conversations", 9, 0);
+  await producer.pollOnce();
+  await producer.pollOnce();
+  assert.equal(queue.itemsInState("queued").length, 20);
+  assert.ok(queue.itemsInState("queued").every((i) => i.senderId === HUMAN));
+  assert.equal(cursors.getCursor("conversations", 9), 40);
+  assert.equal(state.userCalls.length, 1); // one users fetch, not one per page or poll
+});
+
+test("bot senders: allowBots answers flagged bots again, but never Ada", async () => {
+  const state = { users: [{ id: BOT_USER, bot: true }] };
+  const bots = createBotSenders({ client: fakeClient(state), log: () => {}, now: () => NOW_MS, allowBots: true });
+  await bots.prime([BOT_USER]);
+  assert.equal(bots.isBot(BOT_USER), false);
+  assert.equal(bots.isBot(ADA_BOT_USER_ID), true);
+  assert.equal(state.userCalls, undefined); // no lookup needed when bots are allowed
+});
+
+test("bot senders: a failed lookup is retried after MISS_REFRESH_MS, not every poll, and then recognizes bots", async () => {
+  const clock = { t: NOW_MS };
+  const state = { usersThrow: true, users: [{ id: BOT_USER, bot: true }] };
+  const bots = createBotSenders({ client: fakeClient(state), log: () => {}, now: () => clock.t });
+  await bots.prime([BOT_USER]);
+  await bots.prime([BOT_USER]);
+  assert.equal(state.userCalls.length, 1);
+  assert.equal(bots.isBot(BOT_USER), false); // unknown while the lookup is down: fail open
+  state.usersThrow = false;
+  clock.t += MISS_REFRESH_MS;
+  await bots.prime([BOT_USER]);
+  assert.equal(state.userCalls.length, 2);
+  assert.equal(bots.isBot(BOT_USER), true);
+  await bots.prime([BOT_USER]); // known now: cached until the TTL
+  assert.equal(state.userCalls.length, 2);
 });

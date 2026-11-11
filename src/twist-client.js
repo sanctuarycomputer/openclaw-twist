@@ -146,6 +146,9 @@ export function createTwistClient({ token, workspaceId, fetchImpl = fetch }) {
     /** Thread metadata (channel_id, title, etc.). */
     getThread: (id, signal) => request("threads/getone", { query: { id }, signal }),
 
+    /** Workspace members, each with a `bot` flag (read by the bot-sender guard). */
+    getWorkspaceUsers: (signal) => request("workspaces/get_users", { query: { id: workspaceId }, signal }),
+
     /** Channel metadata (name, etc.). */
     getChannel: (id, signal) => request("channels/getone", { query: { id }, signal }),
 

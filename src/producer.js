@@ -1,4 +1,5 @@
-// Transport-only sweep: everything new gets enqueued by id; no policy here.
+// Transport-only sweep: everything new gets enqueued by id; no policy here beyond the two
+// loop guards (self posts, and posts by other bots — see bot-senders.js).
 // Cursor = refetch bound only. Invariant: cursor advances only after the
 // enqueue batch is durably persisted, so nothing below a cursor is un-enqueued.
 import { newInboundItems, advanceCursor } from "./routing.js";
@@ -19,8 +20,12 @@ export const MAX_PAGES_PER_POLL = 10;
  *   that latency independent of queue depth. WHICH items actually get a reaction is not
  *   decided here (this layer stays transport-only) — the injected implementation applies
  *   the mention/DM rules. Defaults to a no-op.
+ * @param {ReturnType<typeof import("./bot-senders.js").createBotSenders>} [deps.botSenders]
+ *   Items from a Twist bot account are dropped before they are enqueued, so no turn ever
+ *   starts. The cursor still moves over them (advanceCursor reads the raw page), so they are
+ *   not refetched. Omitted = nothing is dropped.
  */
-export function createProducer({ client, queue, cursors, botUserId, freshSinceTs, now, log, abortSignal, fastAck = async () => {} }) {
+export function createProducer({ client, queue, cursors, botUserId, freshSinceTs, now, log, abortSignal, fastAck = async () => {}, botSenders }) {
   const isBacklog = (firstSight, postedTs) => firstSight && !(typeof postedTs === "number" && postedTs >= freshSinceTs);
 
   /**
@@ -41,6 +46,16 @@ export function createProducer({ client, queue, cursors, botUserId, freshSinceTs
    * rather than holding the process open for.
    */
   async function enqueueAcked(items) {
+    // Every sweep path funnels through here (pages, first-sight windows, opening posts), so
+    // one filter covers DMs, group DMs and thread comments alike.
+    if (botSenders && items.length) {
+      await botSenders.prime(items.map((it) => it.senderId), abortSignal);
+      items = items.filter((it) => {
+        if (!botSenders.isBot(it.senderId)) return true;
+        botSenders.noteDropped(it);
+        return false;
+      });
+    }
     const fresh = items.filter((it) => !queue.has(it.id));
     await queue.enqueueAll(fresh, now());
     // Unconditionally — including when we added nothing. The caller advances the cursor

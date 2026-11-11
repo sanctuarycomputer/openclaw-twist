@@ -19,7 +19,7 @@ function baseItem(id, over = {}) {
     firstSightBacklog: false, state: "queued", attempts: 0, nextAttemptAt: 0, enqueuedAt: T0, ...over,
   };
 }
-async function harness({ items = [], clock = { t: T0 }, runTurn, probe, classifyPeer, admission, queue: sharedQueue, inFlight, calls: sharedCalls } = {}) {
+async function harness({ items = [], clock = { t: T0 }, runTurn, probe, classifyPeer, admission, queue: sharedQueue, inFlight, calls: sharedCalls, isBotSender } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "twistc-"));
   const queue = sharedQueue ?? createQueueStore(join(dir, "queue.json"));
   if (!sharedQueue) await queue.load();
@@ -28,6 +28,7 @@ async function harness({ items = [], clock = { t: T0 }, runTurn, probe, classify
   const consumer = createConsumer({
     queue, botUserId: BOT, now: () => clock.t, log: () => {},
     ...(inFlight ? { inFlight } : {}),
+    ...(isBotSender ? { isBotSender } : {}),
     classifyPeer: classifyPeer ?? (async () => "groupdm"),
     admission: admission ?? (async () => ({ admit: true, admission: "dispatch", commandAuthorized: false })),
     runTurn: runTurn ?? (async (item) => { calls.turns.push(item.id); }),
@@ -560,4 +561,31 @@ test("isRepeatIncident: the same incident within 6h is not posted again, even wi
   assert.equal(isRepeatIncident([{ ...posted[0], creator: 427360 }], a, { botUserId: BOT, nowMs }), false, "a person quoting it doesn't count");
   assert.equal(isRepeatIncident(posted, "twist queue: turn for x running > 30min", { botUserId: BOT, nowMs }), false, "non-incident alerts never dedupe");
   assert.equal(incidentKey(b), incidentKey(b2));
+});
+
+// ------------------------------------------------------------------- bot senders
+
+// Items a bot loop queued before the producer guard existed must drain, not be answered —
+// and quietly: no per-item reaction call, since there can be thousands.
+test("bot-sender: queued items from a bot are skipped in the drain with no turn and no reactions; humans still answered", async () => {
+  const { queue, consumer, calls } = await harness({
+    classifyPeer: async () => "dm",
+    isBotSender: (item) => String(item.senderId) === "2601",
+    items: [
+      baseItem("conv-msg:1", { senderId: 2601, senderName: "Ada Bot", content: "Sorry, I don't know the answer" }),
+      baseItem("conv-msg:2", { senderId: 2601, senderName: "Ada Bot", content: "X was added to garden3d" }),
+      baseItem("conv-msg:3", { peerId: "conv:3" }),
+    ],
+  });
+  await drain(consumer);
+  assert.equal(queue.get("conv-msg:1").reason, "bot-sender");
+  assert.equal(queue.get("conv-msg:2").reason, "bot-sender");
+  assert.deepEqual(calls.turns, ["conv-msg:3"]);
+  assert.equal(calls.reacts.some(([id]) => id !== "conv-msg:3"), false);
+});
+
+test("syncSkipReason: bot-sender wins over every other reason; no predicate = never a bot", () => {
+  const item = baseItem("conv-msg:1", { firstSightBacklog: true });
+  assert.equal(syncSkipReason(item, T0, BOT, () => true), "bot-sender");
+  assert.equal(syncSkipReason(item, T0, BOT), "backlog");
 });

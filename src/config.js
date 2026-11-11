@@ -88,6 +88,7 @@ export const twistConfigAdapter = createTopLevelChannelConfigAdapter({
     "defaultTo",
     "webhook",
     "webhookToken",
+    "allowBots",
   ],
   resolveAllowFrom: (account) => account.config.allowFrom,
   formatAllowFrom: (allowFrom) => (allowFrom ?? []).map((e) => String(e)),
