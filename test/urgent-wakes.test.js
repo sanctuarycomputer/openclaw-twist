@@ -486,3 +486,30 @@ test("bot filter: sender_name is null when the item has none", () => {
   assert.equal(w.facts.sender_name, null);
   assertContractRow(w);
 });
+
+test("each wake reads the clock once: its id, time and day file agree under a ticking clock", async () => {
+  // Every now() call moves the clock 1 ms, so a second read would show in the row.
+  const tick = (start) => { let t = start; return () => t++; };
+  const seen = [];
+  const mutes = createMuteList({ path: null, log: () => {}, now: () => NOW });
+  const breaker = createLoopBreaker({
+    mutes,
+    notify: async () => ({ messageId: "1", dm: true }),
+    config: LB_CONFIG,
+    log: () => {},
+    now: tick(NOW),
+    env: { OPENCLAW_STATE_DIR: "/x" },
+    appendWake: (row, opts) => { seen.push({ row, opts }); return true; },
+  });
+  for (let i = 0; i < 3; i++) await breaker.admit({ id: `t${i}`, kind: "conv", peerId: "conv:1", senderId: 1, senderName: "A" }, { kind: "dm" });
+  assert.equal(seen.length, 1);
+  const { row, opts } = seen[0];
+  assert.equal(row.id, `8:twist:conv:1:${Date.parse(row.at)}`);
+  assert.equal(opts.nowMs, Date.parse(row.at));
+
+  const dir = tmp();
+  const bots = createBotSenders({ client: { getWorkspaceUsers: async () => [] }, log: () => {}, now: tick(NOW), env: { OPENCLAW_STATE_DIR: dir } });
+  bots.noteDropped({ id: "m", peerId: "conv:1", senderId: 2601, senderName: "Ada" });
+  const [w] = wakesOf(dir);
+  assert.equal(w.id, `8:twist:conv:1:2601:${Date.parse(w.at)}`);
+});
