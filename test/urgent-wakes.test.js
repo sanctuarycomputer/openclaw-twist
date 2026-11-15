@@ -425,6 +425,7 @@ test("bot filter: bots.json after a good lookup only", async () => {
   const s = botSetup();
   await s.bots.prime([5]);
   assert.deepEqual(JSON.parse(readFileSync(s.botsPath, "utf8")), { at: new Date(NOW).toISOString(), ids: ["2601", "77"] });
+  const firstIno = statSync(s.botsPath).ino;
   const before = readFileSync(s.botsPath);
   s.state.fail = true;
   s.clock.t += USERS_TTL_MS;
@@ -436,6 +437,8 @@ test("bot filter: bots.json after a good lookup only", async () => {
   s.clock.t += MISS_REFRESH_MS;
   await s.bots.prime([5]);
   assert.deepEqual(JSON.parse(readFileSync(s.botsPath, "utf8")).ids, ["9"]);
+  assert.notEqual(statSync(s.botsPath).ino, firstIno, "replaced by rename, not rewritten in place");
+  assert.deepEqual(readdirSync(join(s.dir, "urgent")), ["bots.json"]);
 });
 
 test("bot filter: one wake per sender per 30 minutes, each a contract row", () => {
@@ -444,6 +447,8 @@ test("bot filter: one wake per sender per 30 minutes, each a contract row", () =
   const drop = (senderId, senderName, peerId = "conv:1349360") => s.bots.noteDropped({ id: `m${s.clock.t}`, peerId, senderId, senderName });
   drop(2601, "Ada");
   drop(77, "Zap");
+  s.clock.t = NOW + 60_000;
+  drop(2601, "Ada", "thread:5"); // the same bot in another peer: still the sender's one wake
   s.clock.t = NOW + BOT_WAKE_MS - 1;
   drop(2601, "Ada");
   s.clock.t = NOW + BOT_WAKE_MS;
@@ -468,9 +473,10 @@ test("bot filter: one wake per sender per 30 minutes, each a contract row", () =
     facts: { by: "twist-bot-filter", sender: "2601", sender_name: "Ada" },
   });
   assert.equal(wakes[2].subject, "twist:thread:9");
-  // The drop log keeps its own one-minute rhythm, independent of the wakes: Ada's drops at 0 and
-  // 29:59.999 are logged, the one 1 ms later is counted into the next line instead.
-  assert.equal(s.logs.filter((l) => /^dropped .* from bot Ada/.test(l)).length, 2);
+  assert.equal(wakesOf(s.dir).filter((w) => w.subject === "twist:thread:5").length, 0);
+  // The drop log keeps its own one-minute rhythm, independent of the wakes: Ada's drops at 0,
+  // 1:00 and 29:59.999 are logged, the one 1 ms later is counted into the next line instead.
+  assert.equal(s.logs.filter((l) => /^dropped .* from bot Ada/.test(l)).length, 3);
 });
 
 test("bot filter: sender_name is null when the item has none", () => {
