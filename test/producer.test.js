@@ -601,7 +601,7 @@ const HUMAN = 427360;
 const BOT_USER = 55501;
 const withBots = (state, logs) => {
   const client = fakeClient(state);
-  return createBotSenders({ client, log: (m) => logs?.push(m), now: () => NOW_MS });
+  return createBotSenders({ client, log: (m) => logs?.push(m), now: () => NOW_MS, env: {} });
 };
 
 test("bot senders: a Twist bot's DM messages are dropped, the human's dispatched, cursor advances past both", async () => {
@@ -684,7 +684,7 @@ test("bot senders: forward pages drop bots and the cursor walks the whole page; 
 
 test("bot senders: allowBots answers flagged bots again, but never Ada", async () => {
   const state = { users: [{ id: BOT_USER, bot: true }] };
-  const bots = createBotSenders({ client: fakeClient(state), log: () => {}, now: () => NOW_MS, allowBots: true });
+  const bots = createBotSenders({ client: fakeClient(state), log: () => {}, now: () => NOW_MS, allowBots: true, env: {} });
   await bots.prime([BOT_USER]);
   assert.equal(bots.isBot(BOT_USER), false);
   assert.equal(bots.isBot(ADA_BOT_USER_ID), true);
@@ -694,7 +694,7 @@ test("bot senders: allowBots answers flagged bots again, but never Ada", async (
 test("bot senders: a failed lookup is retried after MISS_REFRESH_MS, not every poll, and then recognizes bots", async () => {
   const clock = { t: NOW_MS };
   const state = { usersThrow: true, users: [{ id: BOT_USER, bot: true }] };
-  const bots = createBotSenders({ client: fakeClient(state), log: () => {}, now: () => clock.t });
+  const bots = createBotSenders({ client: fakeClient(state), log: () => {}, now: () => clock.t, env: {} });
   await bots.prime([BOT_USER]);
   await bots.prime([BOT_USER]);
   assert.equal(state.userCalls.length, 1);

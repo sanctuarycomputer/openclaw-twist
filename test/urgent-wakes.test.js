@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { appendUrgentWake, MAX_LINE_BYTES, subjectOfPeer, urgentDir, writeBots } from "../src/urgent-wakes.js";
 import { createMuteList } from "../src/mutes.js";
+import { BOT_WAKE_MS, createBotSenders, MISS_REFRESH_MS, USERS_TTL_MS } from "../src/bot-senders.js";
 import { createCriticalNotifier, createLoopBreaker, loopAlertText } from "../src/loop-breaker.js";
 
 // Stacksbot's docs/contracts/urgent.md 1.0 fake, vendored byte for byte from
@@ -395,4 +396,76 @@ test("createCriticalNotifier: the post's id, whether it was a DM, or null after 
     "critical alert to conv:1367817 failed, sending it to the ops thread instead: Error: 503",
     "critical alert to conv:1367817 failed, sending it to the ops thread instead: Error: bad target",
   ]);
+});
+
+// ---- The bot filter: bots.json and bot-drop wakes (Task 3) ----
+
+function botSetup({ users = [{ id: 2601, bot: true }, { id: 77, bot: true }, { id: 5 }] } = {}) {
+  const dir = tmp();
+  const clock = { t: NOW };
+  const state = { users, fail: false };
+  const client = { getWorkspaceUsers: async () => { if (state.fail) throw new Error("503"); return state.users; } };
+  const logs = [];
+  const bots = createBotSenders({ client, log: (m) => logs.push(m), now: () => clock.t, env: { OPENCLAW_STATE_DIR: dir } });
+  return { dir, clock, state, bots, logs, botsPath: join(dir, "urgent", "bots.json") };
+}
+
+test("bot filter: bots.json after a good lookup only", async () => {
+  const s = botSetup();
+  await s.bots.prime([5]);
+  assert.deepEqual(JSON.parse(readFileSync(s.botsPath, "utf8")), { at: new Date(NOW).toISOString(), ids: ["2601", "77"] });
+  const before = readFileSync(s.botsPath);
+  s.state.fail = true;
+  s.clock.t += USERS_TTL_MS;
+  await s.bots.prime([5]);
+  assert.ok(s.logs.some((l) => /bot-sender lookup failed/.test(l)), "the lookup did run and fail");
+  assert.deepEqual(readFileSync(s.botsPath), before, "a failed lookup leaves the last good file");
+  s.state.fail = false;
+  s.state.users = [{ id: 9, bot: true }];
+  s.clock.t += MISS_REFRESH_MS;
+  await s.bots.prime([5]);
+  assert.deepEqual(JSON.parse(readFileSync(s.botsPath, "utf8")).ids, ["9"]);
+});
+
+test("bot filter: one wake per sender per 30 minutes, each a contract row", () => {
+  assert.equal(BOT_WAKE_MS, 30 * 60_000);
+  const s = botSetup();
+  const drop = (senderId, senderName, peerId = "conv:1349360") => s.bots.noteDropped({ id: `m${s.clock.t}`, peerId, senderId, senderName });
+  drop(2601, "Ada");
+  drop(77, "Zap");
+  s.clock.t = NOW + BOT_WAKE_MS - 1;
+  drop(2601, "Ada");
+  s.clock.t = NOW + BOT_WAKE_MS;
+  drop(2601, "Ada", "thread:9");
+  const wakes = wakesOf(s.dir);
+  assert.deepEqual(wakes.map((w) => w.id), [
+    `8:twist:conv:1349360:2601:${NOW}`,
+    `8:twist:conv:1349360:77:${NOW}`,
+    `8:twist:thread:9:2601:${NOW + BOT_WAKE_MS}`,
+  ]);
+  for (const w of wakes) {
+    assertContractRow(w);
+    assert.deepEqual([w.source, w.signal], ["floor", 8]);
+    for (const k of ["dm_posted", "message_id", "verdict"]) assert.equal(Object.hasOwn(w, k), false, k);
+  }
+  assert.deepEqual(wakes[0], {
+    id: `8:twist:conv:1349360:2601:${NOW}`,
+    at: new Date(NOW).toISOString(),
+    source: "floor",
+    signal: 8,
+    subject: "twist:conv:1349360",
+    facts: { by: "twist-bot-filter", sender: "2601", sender_name: "Ada" },
+  });
+  assert.equal(wakes[2].subject, "twist:thread:9");
+  // The drop log keeps its own one-minute rhythm, independent of the wakes: Ada's drops at 0 and
+  // 29:59.999 are logged, the one 1 ms later is counted into the next line instead.
+  assert.equal(s.logs.filter((l) => /^dropped .* from bot Ada/.test(l)).length, 2);
+});
+
+test("bot filter: sender_name is null when the item has none", () => {
+  const s = botSetup();
+  s.bots.noteDropped({ id: "m1", peerId: "conv:1", senderId: 2601 });
+  const [w] = wakesOf(s.dir);
+  assert.equal(w.facts.sender_name, null);
+  assertContractRow(w);
 });
