@@ -138,14 +138,15 @@ export function createLoopBreaker({ mutes, notify, config = DEFAULT_LOOP_BREAKER
   async function alertAndWake(text, facts, outcome, written = false) {
     const sent = await notify(text);
     try {
+      const at = now(); // one clock read: the id, the time and the day file agree
       const subject = subjectOfPeer(facts.peerId);
       const target = peerTarget(facts.peerId);
       const did = written && target;
       const dmPosted = Boolean(sent?.dm && sent?.messageId);
       const ok = appendWake(
         {
-          id: `8:${subject}:${now()}`,
-          at: new Date(now()).toISOString(),
+          id: `8:${subject}:${at}`,
+          at: new Date(at).toISOString(),
           source: "floor",
           signal: 8,
           subject,
@@ -162,7 +163,7 @@ export function createLoopBreaker({ mutes, notify, config = DEFAULT_LOOP_BREAKER
             outcome,
           },
         },
-        { env, nowMs: now() },
+        { env, nowMs: at },
       );
       if (!ok) log(`urgent wake not written for ${facts.peerId}`);
     } catch (err) {

@@ -75,18 +75,19 @@ export function createBotSenders({ client, log, now = Date.now, allowBots = fals
       const d = drops.get(key) ?? { loggedAt: -Infinity, suppressed: 0, wokeAt: -Infinity };
       drops.set(key, d);
       if (now() - d.wokeAt >= BOT_WAKE_MS) {
-        d.wokeAt = now();
+        const at = now(); // one clock read: the id, the time and the day file agree
+        d.wokeAt = at;
         const subject = subjectOfPeer(item.peerId);
         appendUrgentWake(
           {
-            id: `8:${subject}:${key}:${now()}`,
-            at: new Date(now()).toISOString(),
+            id: `8:${subject}:${key}:${at}`,
+            at: new Date(at).toISOString(),
             source: "floor",
             signal: 8,
             subject,
             facts: { by: "twist-bot-filter", sender: key, sender_name: item.senderName ?? null },
           },
-          { env, nowMs: now() },
+          { env, nowMs: at },
         );
       }
       if (now() - d.loggedAt < DROP_LOG_MS) { d.suppressed++; return; }

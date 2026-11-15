@@ -178,7 +178,7 @@ test("appendUrgentWake: nothing off the box, and never throws", () => {
   assert.equal(appendUrgentWake({ id: "a", facts: {} }, { env: throwingEnv, nowMs: NOW }), false);
   // Only a plain object is a row (readers skip anything else).
   const objDir = tmp();
-  for (const notRow of [null, [1], "s", 7]) assert.equal(appendUrgentWake(notRow, { env: { OPENCLAW_STATE_DIR: objDir }, nowMs: NOW }), false);
+  for (const notRow of [null, [1], "s", 7, new Date(0), { toJSON: () => [1] }]) assert.equal(appendUrgentWake(notRow, { env: { OPENCLAW_STATE_DIR: objDir }, nowMs: NOW }), false);
   assert.equal(existsSync(join(objDir, "urgent", "wakes-2026-11-13.jsonl")), false);
   const cyclic = { id: "c", facts: {} };
   cyclic.facts.self = cyclic;
@@ -343,7 +343,8 @@ test("loop breaker: a peer already muted by someone else gets no undoable lever"
   const [w] = wakesOf(s.dir);
   assertContractRow(w);
   assert.deepEqual([w.facts.outcome, w.facts.lever, w.facts.lever_args], ["muted", "propose", {}]);
-  assert.match(s.alerts[0].text, /I've stopped answering it until/);
+  const tripAt = NOW + 2000;
+  assert.equal(s.alerts[0].text, loopAlertText({ peerId: "conv:1349360", kind: "dm", senderName: "Ada Bot", turns: 3, minutes: 1, outcome: "muted", untilMs: tripAt + 6 * HOUR }));
 });
 
 test("loop breaker: a memory-only mute gets no undoable lever", async () => {
@@ -352,7 +353,11 @@ test("loop breaker: a memory-only mute gets no undoable lever", async () => {
   const [w] = wakesOf(s.dir);
   assertContractRow(w);
   assert.deepEqual([w.facts.outcome, w.facts.lever, w.facts.lever_args], ["memory-only", "propose", {}]);
-  assert.match(s.alerts[0].text, /or the next restart/);
+  const tripAt = NOW + 2000;
+  assert.equal(
+    s.alerts[0].text,
+    loopAlertText({ peerId: "conv:1349360", kind: "dm", senderName: "Ada Bot", turns: 3, minutes: 1, outcome: "memory-only", untilMs: tripAt + 6 * HOUR, why: "no mute file (OPENCLAW_STATE_DIR is unset)" }),
+  );
 });
 
 test("loop breaker: a fault in the wake path changes nothing else", async () => {
@@ -375,11 +380,17 @@ test("loop breaker: a fault in the wake path changes nothing else", async () => 
   assert.ok(unwritable.logs.some((l) => l === "urgent wake not written for conv:1349360"));
 });
 
-test("loop breaker: the wake goes where env says, and nowhere without it", async () => {
-  const off = breakerSetup({ env: {} });
-  assert.equal(await off.trip(), false);
-  assert.equal(off.alerts.length, 1);
-  assert.equal(existsSync(join(off.dir, "urgent")), false);
+test("loop breaker: the wake goes where its env says", async () => {
+  const env = { OPENCLAW_STATE_DIR: "/somewhere" };
+  const seen = [];
+  const s = breakerSetup({ env, appendWake: (row, opts) => { seen.push({ row, opts }); return true; } });
+  assert.equal(await s.trip(), false);
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].opts.env, env, "the breaker's own env, not process.env");
+  const tripAt = NOW + 2000;
+  assert.equal(seen[0].opts.nowMs, tripAt);
+  assert.deepEqual([seen[0].row.id, seen[0].row.at], [`8:twist:conv:1349360:${tripAt}`, new Date(tripAt).toISOString()]);
+  assert.equal(s.logs.filter((l) => /urgent wake not written/.test(l)).length, 0);
 });
 
 test("createCriticalNotifier: the post's id, whether it was a DM, or null after the fallback", async () => {
