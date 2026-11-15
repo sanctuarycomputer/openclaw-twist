@@ -5,6 +5,8 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFile
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { appendUrgentWake, MAX_LINE_BYTES, subjectOfPeer, urgentDir, writeBots } from "../src/urgent-wakes.js";
+import { createMuteList } from "../src/mutes.js";
+import { createCriticalNotifier, createLoopBreaker, loopAlertText } from "../src/loop-breaker.js";
 
 // Stacksbot's docs/contracts/urgent.md 1.0 fake, vendored byte for byte from
 // scripts/stacksbot-sync/test/fixtures/urgent/wakes-sample.jsonl.
@@ -204,4 +206,179 @@ test("writeBots: an atomic { at, ids } snapshot", () => {
 test("subjectOfPeer: the queue's peer ids become the contract's Twist subjects", () => {
   assert.equal(subjectOfPeer("conv:1349360"), "twist:conv:1349360");
   assert.equal(subjectOfPeer("thread:9"), "twist:thread:9");
+});
+
+// ---- The loop breaker's anchor wake (Task 2) ----
+
+const LB_CONFIG = { enabled: true, maxTurns: 2, windowMinutes: 30, muteHours: 6 };
+const HOUR = 3600_000;
+
+function breakerSetup({ notify = async () => ({ messageId: "4242", dm: true }), neverMute, file, mutePath, appendWake, env } = {}) {
+  const dir = tmp();
+  const path = mutePath === undefined ? join(dir, "twist-muted.json") : mutePath;
+  if (file && path) writeFileSync(path, JSON.stringify(file));
+  const clock = { t: NOW };
+  const logs = [];
+  const alerts = [];
+  const mutes = createMuteList({ path, neverMute, log: () => {}, now: () => clock.t });
+  const breaker = createLoopBreaker({
+    mutes,
+    notify: async (text) => {
+      alerts.push({ text, wakesBefore: wakesOf(dir).length });
+      return notify(text);
+    },
+    config: LB_CONFIG,
+    log: (m) => logs.push(m),
+    now: () => clock.t,
+    env: env ?? { OPENCLAW_STATE_DIR: dir },
+    ...(appendWake ? { appendWake } : {}),
+  });
+  /** Three turns 1s apart: the third trips (maxTurns 2). → the third admit's verdict. */
+  const trip = async (peerId = "conv:1349360", kind = "dm", senderName = "Ada Bot") => {
+    let last;
+    for (let i = 0; i < 3; i++) {
+      last = await breaker.admit({ id: `x${i}:${clock.t}`, kind: peerId.startsWith("conv:") ? "conv" : "thread", peerId, senderId: 2601, senderName }, { kind });
+      clock.t += 1000;
+    }
+    return last;
+  };
+  return { dir, path, clock, logs, alerts, breaker, trip };
+}
+
+test("loop breaker: a muting trip appends the anchor wake after notify", async () => {
+  const s = breakerSetup();
+  assert.equal(await s.trip(), false);
+  assert.equal(s.alerts.length, 1);
+  assert.equal(s.alerts[0].wakesBefore, 0, "the wake is appended after notify resolved");
+  const [w, ...rest] = wakesOf(s.dir);
+  assert.equal(rest.length, 0);
+  assertContractRow(w);
+  const tripAt = NOW + 2000;
+  assert.deepEqual(w, {
+    id: `8:twist:conv:1349360:${tripAt}`,
+    at: new Date(tripAt).toISOString(),
+    source: "floor",
+    signal: 8,
+    subject: "twist:conv:1349360",
+    dm_posted: true,
+    message_id: "4242",
+    facts: {
+      by: "twist-loop-breaker",
+      title: "Loop in my DM with Ada Bot (conversation 1349360)",
+      what: "I answered 3 messages there in 1 minutes.",
+      lever: "mute-conversation",
+      lever_args: { conversation: "1349360" },
+      turns: 3,
+      minutes: 1,
+      outcome: "muted",
+    },
+  });
+  // The alert itself is exactly today's text.
+  assert.equal(s.alerts[0].text, loopAlertText({ peerId: "conv:1349360", kind: "dm", senderName: "Ada Bot", turns: 3, minutes: 1, outcome: "muted", untilMs: tripAt + 6 * HOUR }));
+});
+
+test("loop breaker: a thread trip names the thread", async () => {
+  const s = breakerSetup();
+  await s.trip("thread:9", "thread", "Zapier");
+  const [w] = wakesOf(s.dir);
+  assertContractRow(w);
+  assert.equal(w.subject, "twist:thread:9");
+  assert.deepEqual([w.facts.title, w.facts.lever, w.facts.lever_args], ["Loop in thread 9", "mute-conversation", { thread: "9" }]);
+});
+
+test("loop breaker: no message id, or not a DM, means no DM was posted", async () => {
+  for (const result of [null, undefined, { messageId: undefined, dm: true }, { messageId: "", dm: true }, { messageId: "5", dm: false }, { messageId: "5" }]) {
+    const s = breakerSetup({ notify: async () => result });
+    await s.trip();
+    const [w] = wakesOf(s.dir);
+    assertContractRow(w);
+    assert.deepEqual([w.dm_posted, w.message_id], [false, null], JSON.stringify(result));
+  }
+});
+
+test("loop breaker: protected and held trips wake once per alert, with nothing to undo", async () => {
+  const p = breakerSetup({ neverMute: ["conv:1349360"] });
+  assert.equal(await p.trip(), true);
+  assert.equal(await p.trip(), true); // re-trips inside muteHours: no DM, so no wake
+  assert.equal(p.alerts.length, 1);
+  const pw = wakesOf(p.dir);
+  assert.equal(pw.length, 1);
+  assertContractRow(pw[0]);
+  assert.deepEqual([pw[0].facts.outcome, pw[0].facts.lever, pw[0].facts.lever_args, pw[0].dm_posted], ["protected", "propose", {}, true]);
+  assert.equal(p.alerts[0].text, loopAlertText({ peerId: "conv:1349360", kind: "dm", senderName: "Ada Bot", turns: 3, minutes: 1, outcome: "protected" }));
+
+  // Held: the breaker's own entry, cut short by hand an hour after it was set.
+  const mutedAt = new Date(NOW - 2 * HOUR).toISOString();
+  const until = new Date(NOW - HOUR).toISOString();
+  const h = breakerSetup({ file: { version: 1, conversations: { 1349360: { kind: "dm", mutedAt, until, by: "twist-loop-breaker", reason: "x" } }, threads: {} } });
+  assert.equal(await h.trip(), true);
+  assert.equal(await h.trip(), true);
+  assert.equal(h.alerts.length, 1);
+  const hw = wakesOf(h.dir);
+  assert.equal(hw.length, 1);
+  assertContractRow(hw[0]);
+  assert.deepEqual([hw[0].facts.outcome, hw[0].facts.lever, hw[0].facts.lever_args], ["held", "propose", {}]);
+  assert.equal(h.alerts[0].text, loopAlertText({ peerId: "conv:1349360", kind: "dm", senderName: "Ada Bot", turns: 3, minutes: 1, outcome: "held", heldSince: until }));
+});
+
+test("loop breaker: a peer already muted by someone else gets no undoable lever", async () => {
+  const entry = { kind: "dm", mutedAt: new Date(NOW - HOUR).toISOString(), until: null, by: "spend-guard", reason: "spend" };
+  const s = breakerSetup({ file: { version: 1, conversations: { 1349360: entry }, threads: {} } });
+  assert.equal(await s.trip(), false);
+  const [w] = wakesOf(s.dir);
+  assertContractRow(w);
+  assert.deepEqual([w.facts.outcome, w.facts.lever, w.facts.lever_args], ["muted", "propose", {}]);
+  assert.match(s.alerts[0].text, /I've stopped answering it until/);
+});
+
+test("loop breaker: a memory-only mute gets no undoable lever", async () => {
+  const s = breakerSetup({ mutePath: null });
+  assert.equal(await s.trip(), false);
+  const [w] = wakesOf(s.dir);
+  assertContractRow(w);
+  assert.deepEqual([w.facts.outcome, w.facts.lever, w.facts.lever_args], ["memory-only", "propose", {}]);
+  assert.match(s.alerts[0].text, /or the next restart/);
+});
+
+test("loop breaker: a fault in the wake path changes nothing else", async () => {
+  const thrower = breakerSetup({ appendWake: () => { throw new Error("disk on fire"); } });
+  assert.equal(await thrower.trip(), false, "the tripping turn is still blocked");
+  assert.equal(thrower.alerts.length, 1);
+  assert.ok(thrower.logs.some((l) => /urgent wake not written for conv:1349360: Error: disk on fire/.test(l)));
+  assert.ok(!thrower.logs.some((l) => /loop breaker failed/.test(l)));
+
+  const badResult = breakerSetup({ notify: async () => ({ messageId: "1", get dm() { throw new Error("getter"); } }) });
+  assert.equal(await badResult.trip(), false);
+  assert.equal(badResult.alerts.length, 1);
+  assert.ok(badResult.logs.some((l) => /urgent wake not written/.test(l)));
+
+  const file = join(tmp(), "not-a-dir");
+  writeFileSync(file, "x");
+  const unwritable = breakerSetup({ env: { OPENCLAW_STATE_DIR: file } });
+  assert.equal(await unwritable.trip(), false);
+  assert.equal(unwritable.alerts.length, 1);
+  assert.ok(unwritable.logs.some((l) => l === "urgent wake not written for conv:1349360"));
+});
+
+test("loop breaker: the wake goes where env says, and nowhere without it", async () => {
+  const off = breakerSetup({ env: {} });
+  assert.equal(await off.trip(), false);
+  assert.equal(off.alerts.length, 1);
+  assert.equal(existsSync(join(off.dir, "urgent")), false);
+});
+
+test("createCriticalNotifier: the post's id, whether it was a DM, or null after the fallback", async () => {
+  const fallbacks = [];
+  const logs = [];
+  const make = (post) => createCriticalNotifier({ post, fallback: async (t) => { fallbacks.push(t); }, log: (l) => logs.push(l), to: "conv:1367817" });
+  assert.deepEqual(await make(async () => ({ messageId: "7", kind: "conv" }))("hi"), { messageId: "7", dm: true });
+  assert.deepEqual(await make(async () => ({ messageId: "8", kind: "thread" }))("hi"), { messageId: "8", dm: false });
+  assert.equal(fallbacks.length, 0);
+  assert.equal(await make(async () => { throw new Error("503"); })("rejected"), null);
+  assert.equal(await make(() => { throw new Error("bad target"); })("thrown"), null);
+  assert.deepEqual(fallbacks, ["rejected", "thrown"]);
+  assert.deepEqual(logs, [
+    "critical alert to conv:1367817 failed, sending it to the ops thread instead: Error: 503",
+    "critical alert to conv:1367817 failed, sending it to the ops thread instead: Error: bad target",
+  ]);
 });

@@ -10,6 +10,7 @@
 // turns. The mute itself persists, because it is in the file.
 import { ALERT_HEADER } from "./consumer.js";
 import { DEFAULT_NEVER_MUTE, isLive, peerTarget } from "./mutes.js";
+import { appendUrgentWake, subjectOfPeer } from "./urgent-wakes.js";
 
 export const LOOP_BREAKER_BY = "twist-loop-breaker";
 export const DEFAULT_LOOP_BREAKER = Object.freeze({ enabled: true, maxTurns: 40, windowMinutes: 30, muteHours: 6 });
@@ -68,12 +69,40 @@ export function loopAlertText(t) {
 }
 
 /**
+ * The Critical alert sender. Posts to `criticalTo` and returns the post's id, and whether that
+ * target is a conversation (Hugh's DM), so the loop breaker's wake can tell Stacksbot's Urgent
+ * runner which message to adopt. If that post fails (or the target can't be resolved) the text
+ * still goes out through the ordinary alert path, the ops thread, and the result is null: no DM.
+ * @param {object} deps
+ * @param {(text: string) => Promise<{messageId?: string, kind?: string}>} deps.post
+ * @param {(text: string) => Promise<void>} deps.fallback
+ * @param {(line: string) => void} deps.log
+ * @param {string} deps.to  the configured target, for the log line
+ * @returns {(text: string) => Promise<{messageId: string|undefined, dm: boolean} | null>}
+ */
+export function createCriticalNotifier({ post, fallback, log, to }) {
+  return async (text) => {
+    try {
+      const res = await post(text);
+      return { messageId: res?.messageId, dm: res?.kind === "conv" };
+    } catch (err) {
+      log(`critical alert to ${to} failed, sending it to the ops thread instead: ${String(err)}`);
+      await fallback(text);
+      return null;
+    }
+  };
+}
+
+/**
  * @param {object} deps
  * @param {ReturnType<typeof import("./mutes.js").createMuteList>} deps.mutes
- * @param {(text: string) => Promise<void>} deps.notify  posts the Critical alert; must not throw
+ * @param {(text: string) => Promise<{messageId?: string, dm?: boolean} | null | void>} deps.notify
+ *   posts the Critical alert; must not throw
  * @param {{enabled:boolean, maxTurns:number, windowMinutes:number, muteHours:number}} deps.config
+ * @param {object} [deps.env] where the Urgent wake goes ($OPENCLAW_STATE_DIR); process.env by default
+ * @param {typeof appendUrgentWake} [deps.appendWake] injectable for tests
  */
-export function createLoopBreaker({ mutes, notify, config = DEFAULT_LOOP_BREAKER, log, now = Date.now }) {
+export function createLoopBreaker({ mutes, notify, config = DEFAULT_LOOP_BREAKER, log, now = Date.now, env = process.env, appendWake = appendUrgentWake }) {
   const windowMs = config.windowMinutes * 60_000;
   const muteMs = config.muteHours * 3600_000;
   const turns = new Map(); // peerId -> dispatch times inside the window, oldest first
@@ -99,19 +128,61 @@ export function createLoopBreaker({ mutes, notify, config = DEFAULT_LOOP_BREAKER
     return cutShort && now() - until < muteMs ? e.until : null;
   }
 
+  /**
+   * Send the Critical, then leave Stacksbot's Urgent runner a wake (signal 8) naming it, so the
+   * runner adopts this DM as the incident's thread instead of sending its own. The lever is
+   * what this trip did: mute-conversation only when it wrote the mute to the file (the runner's
+   * undo removes that entry); otherwise propose, nothing to undo. Nothing in the wake path can
+   * change the trip's outcome: a fault there is logged and dropped.
+   */
+  async function alertAndWake(text, facts, outcome, written = false) {
+    const sent = await notify(text);
+    try {
+      const subject = subjectOfPeer(facts.peerId);
+      const target = peerTarget(facts.peerId);
+      const did = written && target;
+      const dmPosted = Boolean(sent?.dm && sent?.messageId);
+      const ok = appendWake(
+        {
+          id: `8:${subject}:${now()}`,
+          at: new Date(now()).toISOString(),
+          source: "floor",
+          signal: 8,
+          subject,
+          dm_posted: dmPosted,
+          message_id: dmPosted ? sent.messageId : null,
+          facts: {
+            by: LOOP_BREAKER_BY,
+            title: `Loop in ${where(facts)}`,
+            what: `I answered ${facts.turns} messages there in ${facts.minutes} minutes.`,
+            lever: did ? "mute-conversation" : "propose",
+            lever_args: did ? (target.bucket === "threads" ? { thread: target.id } : { conversation: target.id }) : {},
+            turns: facts.turns,
+            minutes: facts.minutes,
+            outcome,
+          },
+        },
+        { env, nowMs: now() },
+      );
+      if (!ok) log(`urgent wake not written for ${facts.peerId}`);
+    } catch (err) {
+      log(`urgent wake not written for ${facts.peerId}: ${String(err)}`);
+    }
+  }
+
   async function trip(item, kind, times) {
     const peerId = String(item.peerId);
     const facts = { peerId, kind, senderName: item.senderName, turns: times.length, minutes: Math.max(1, Math.ceil((now() - times[0]) / 60_000)) };
     turns.delete(peerId); // a trip starts a fresh window: the next one needs another maxTurns+1
     if (mutes.isProtected(peerId)) {
       log(`loop breaker: ${peerId} tripped (${facts.turns} turns in ${facts.minutes}min) but is in neverMute: alert only`);
-      if (alertDue(peerId)) await notify(loopAlertText({ ...facts, outcome: "protected" }));
+      if (alertDue(peerId)) await alertAndWake(loopAlertText({ ...facts, outcome: "protected" }), facts, "protected");
       return true;
     }
     const held = heldSince(peerId);
     if (held) {
       log(`loop breaker: ${peerId} tripped (${facts.turns} turns in ${facts.minutes}min) but was unmuted by hand at ${held}: alert only`);
-      if (alertDue(peerId)) await notify(loopAlertText({ ...facts, outcome: "held", heldSince: held }));
+      if (alertDue(peerId)) await alertAndWake(loopAlertText({ ...facts, outcome: "held", heldSince: held }), facts, "held");
       return true;
     }
     const untilMs = now() + muteMs;
@@ -124,7 +195,8 @@ export function createLoopBreaker({ mutes, notify, config = DEFAULT_LOOP_BREAKER
     });
     log(`loop breaker: muted ${peerId} until ${new Date(untilMs).toISOString()} (${facts.turns} turns in ${facts.minutes}min)${res.written ? "" : `; not written to the file: ${res.why}`}`);
     const alreadyMuted = !res.written && /^already muted/.test(res.why ?? "");
-    await notify(loopAlertText({ ...facts, outcome: res.written || alreadyMuted ? "muted" : "memory-only", untilMs, why: res.why }));
+    const outcome = res.written || alreadyMuted ? "muted" : "memory-only";
+    await alertAndWake(loopAlertText({ ...facts, outcome, untilMs, why: res.why }), facts, outcome, res.written === true);
     return false;
   }
 

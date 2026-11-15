@@ -27,7 +27,7 @@ import { createQueueStore } from "./queue.js";
 import { createProducer } from "./producer.js";
 import { createBotSenders } from "./bot-senders.js";
 import { createMuteList, muteFilePath } from "./mutes.js";
-import { createLoopBreaker } from "./loop-breaker.js";
+import { createCriticalNotifier, createLoopBreaker } from "./loop-breaker.js";
 import { createConsumer, REPLAY_HORIZON_MS, ALERT_HEADER, isRepeatIncident } from "./consumer.js";
 import {
   MIN_WEBHOOK_TOKEN_LENGTH,
@@ -374,15 +374,16 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
 
   // A Critical goes where Hugh reads (his DM, by default), not the ops thread he doesn't.
   // If that post fails it still goes out, through the ordinary alert path.
-  const critical = async (text) => {
-    try {
+  // It returns the post's id, so the loop breaker's Urgent wake can name the DM (loop-breaker.js).
+  const critical = createCriticalNotifier({
+    to: guards.criticalTo,
+    log,
+    fallback: alert,
+    post: async (text) => {
       const { kind, id } = resolveOutboundTarget(guards.criticalTo, account.defaultTo);
-      await postToTwist({ client, kind, id, text, botUserId });
-    } catch (err) {
-      log(`critical alert to ${guards.criticalTo} failed, sending it to the ops thread instead: ${String(err)}`);
-      await alert(text);
-    }
-  };
+      return { ...(await postToTwist({ client, kind, id, text, botUserId })), kind };
+    },
+  });
   // Monitor-lived: a restart resets the windows (at most one more window of turns); the
   // mutes it writes persist in the file.
   const loopBreaker = createLoopBreaker({ mutes, notify: critical, config: guards.loopBreaker, log });
