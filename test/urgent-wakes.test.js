@@ -118,9 +118,11 @@ test("appendUrgentWake: 4096 bytes including the newline is the limit", () => {
   assert.equal(appendUrgentWake(exact, { env, nowMs: NOW }), true);
   assert.equal(appendUrgentWake({ ...rowOfLineBytes(4097), id: "over" }, { env, nowMs: NOW }), true);
   const [a, b] = wakesOf(dir);
-  assert.deepEqual(a.facts, exact.facts);
+  assert.deepEqual(a, exact);
   assert.equal(Buffer.byteLength(`${JSON.stringify(a)}\n`), 4096);
-  assert.deepEqual([b.id, b.facts], ["over", { truncated: true }]);
+  // Only facts is replaced: every other field of the row is kept as it was.
+  assert.deepEqual(b, { ...rowOfLineBytes(4097), id: "over", facts: { truncated: true } });
+  assertContractRow(b);
   // Multi-byte text counts in bytes, not characters.
   assert.equal(appendUrgentWake({ id: "é", facts: { s: "é".repeat(2100) } }, { env, nowMs: NOW }), true);
   assert.deepEqual(wakesOf(dir).at(-1).facts, { truncated: true });
@@ -134,14 +136,21 @@ test("appendUrgentWake: opens for append, one write per row; a short write ends 
   const dir = tmp();
   const env = { OPENCLAW_STATE_DIR: dir };
   const calls = [];
-  const spy = { ...nodeFs, openSync: (p, flag) => { calls.push(["open", flag]); return nodeFs.openSync(p, flag); }, writeSync: (fd, data) => { calls.push(["write", String(data).length]); return nodeFs.writeSync(fd, data); } };
+  const spy = {
+    ...nodeFs,
+    openSync: (p, flag) => { calls.push(["open", flag]); return nodeFs.openSync(p, flag); },
+    writeSync: (fd, data) => { calls.push(["write", String(data).length]); return nodeFs.writeSync(fd, data); },
+    closeSync: (fd) => { calls.push(["close"]); return nodeFs.closeSync(fd); },
+  };
   assert.equal(appendUrgentWake({ id: "a", facts: {} }, { env, nowMs: NOW, fs: spy }), true);
-  assert.deepEqual(calls.map((c) => c[0]), ["open", "write"]);
+  assert.deepEqual(calls.map((c) => c[0]), ["open", "write", "close"]);
   assert.equal(calls[0][1], "a");
 
   const writes = [];
+  let closed = 0;
   const short = {
     ...nodeFs,
+    closeSync: (fd) => { closed++; return nodeFs.closeSync(fd); },
     writeSync: (fd, data) => {
       writes.push(Buffer.isBuffer(data) ? data.toString() : data);
       if (writes.length === 1) return nodeFs.writeSync(fd, data.subarray(0, 5));
@@ -151,6 +160,7 @@ test("appendUrgentWake: opens for append, one write per row; a short write ends 
   assert.equal(appendUrgentWake({ id: "torn", facts: {} }, { env, nowMs: NOW, fs: short }), false);
   assert.equal(writes.length, 2);
   assert.equal(writes[1], "\n");
+  assert.equal(closed, 1, "the file is closed on the short-write path too");
   // The fragment is ended, so the next row starts on its own line.
   assert.equal(appendUrgentWake({ id: "next", facts: {} }, { env, nowMs: NOW }), true);
   const lines = readFileSync(join(dir, "urgent", "wakes-2026-11-13.jsonl"), "utf8").split("\n");
@@ -165,6 +175,10 @@ test("appendUrgentWake: nothing off the box, and never throws", () => {
   assert.equal(appendUrgentWake({ id: "a", facts: {} }, { env: { OPENCLAW_STATE_DIR: file }, nowMs: NOW }), false);
   const throwingEnv = { get OPENCLAW_STATE_DIR() { throw new Error("boom"); } };
   assert.equal(appendUrgentWake({ id: "a", facts: {} }, { env: throwingEnv, nowMs: NOW }), false);
+  // Only a plain object is a row (readers skip anything else).
+  const objDir = tmp();
+  for (const notRow of [null, [1], "s", 7]) assert.equal(appendUrgentWake(notRow, { env: { OPENCLAW_STATE_DIR: objDir }, nowMs: NOW }), false);
+  assert.equal(existsSync(join(objDir, "urgent", "wakes-2026-11-13.jsonl")), false);
   const cyclic = { id: "c", facts: {} };
   cyclic.facts.self = cyclic;
   assert.equal(appendUrgentWake(cyclic, { env: { OPENCLAW_STATE_DIR: tmp() }, nowMs: NOW }), false);

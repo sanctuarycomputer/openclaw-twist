@@ -23,16 +23,18 @@ export function urgentDir(env = process.env) {
 }
 
 const lineOf = (row) => Buffer.from(`${JSON.stringify(row)}\n`);
+const isPlainObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 
 /**
  * Append one wake row to today's (UTC) wakes file. → whether the whole line was written.
  * A line over MAX_LINE_BYTES is retried once with `facts: { truncated: true }`, then refused.
+ * A row that is not a plain object is refused (readers skip any line that isn't one).
  * Never throws: a wake that can't be written must not stop the guard that raised it.
  */
 export function appendUrgentWake(row, { env = process.env, nowMs = Date.now(), fs = nodeFs } = {}) {
   try {
     const dir = urgentDir(env);
-    if (!dir) return false;
+    if (!dir || !isPlainObject(row)) return false;
     let buf = lineOf(row);
     if (buf.length > MAX_LINE_BYTES) buf = lineOf({ ...row, facts: { truncated: true } });
     if (buf.length > MAX_LINE_BYTES) return false;
