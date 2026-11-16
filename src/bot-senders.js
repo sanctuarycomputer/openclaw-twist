@@ -3,6 +3,11 @@
 // and from 2026-10-02 it and Stacksbot traded ~748k messages in one DM before anyone
 // noticed. Self-post exclusion (isSelfAuthored) cannot catch this; only the sender's
 // Twist `bot` flag can.
+//
+// For Stacksbot's Urgent tier (urgent-wakes.js) it also writes the looked-up bot ids to
+// bots.json, which the watcher's signal 3 reads, and leaves the Urgent judge a wake when it
+// drops a bot: at most one per sender per BOT_WAKE_MS. Nothing is posted.
+import { appendUrgentWake, subjectOfPeer, writeBots } from "./urgent-wakes.js";
 
 // Ada Bot, Twist's help/billing bot. Denied by id regardless of what the user lookup says,
 // so the one bot we know loops is blocked even when that lookup is down.
@@ -12,24 +17,26 @@ const HARD_DENIED = new Set([String(ADA_BOT_USER_ID)]);
 export const USERS_TTL_MS = 6 * 3600_000; // bot flags almost never change
 export const MISS_REFRESH_MS = 10 * 60_000; // an unknown sender may refresh early, this often at most
 export const DROP_LOG_MS = 60_000; // one drop line per sender per minute; the rest are counted
+export const BOT_WAKE_MS = 30 * 60_000; // one Urgent wake per dropped sender per 30 minutes
 
 /**
  * @param {object} deps
  * @param {{getWorkspaceUsers: (signal?: AbortSignal) => Promise<any>}} deps.client
  * @param {boolean} [deps.allowBots] `channels.twist.allowBots`: true answers bots again
  *   (the hard-denied ids stay denied).
+ * @param {object} [deps.env] where bots.json and the wakes go ($OPENCLAW_STATE_DIR); process.env by default
  *
  * A failed lookup keeps the last good set and treats unknown senders as human: failing
  * closed would silence every person in the workspace whenever `workspaces/get_users` blips,
  * and the bot we know loops is denied by id anyway.
  */
-export function createBotSenders({ client, log, now = Date.now, allowBots = false }) {
+export function createBotSenders({ client, log, now = Date.now, allowBots = false, env = process.env }) {
   let botIds = new Set();
   let knownIds = new Set();
   let fetchedAt = -Infinity; // last SUCCESSFUL lookup
   let attemptedAt = -Infinity; // last lookup of any outcome
   let inFlight = null;
-  const drops = new Map(); // senderId -> {loggedAt, suppressed}
+  const drops = new Map(); // senderId -> {loggedAt, suppressed, wokeAt}
 
   async function refresh(signal) {
     attemptedAt = now();
@@ -39,6 +46,7 @@ export function createBotSenders({ client, log, now = Date.now, allowBots = fals
       botIds = new Set(users.filter((u) => u?.bot).map((u) => String(u.id)));
       knownIds = new Set(users.map((u) => String(u?.id)));
       fetchedAt = now();
+      writeBots(botIds, { env, nowMs: now() }); // a failed write leaves the watcher its last good copy
     } catch (err) {
       // Retried after MISS_REFRESH_MS (see prime): not every poll while the endpoint is down,
       // and not 6h later either, so one aborted cycle can't hide every bot but Ada for hours.
@@ -64,8 +72,24 @@ export function createBotSenders({ client, log, now = Date.now, allowBots = fals
     /** One log line per sender per DROP_LOG_MS, carrying how many drops it stood for. */
     noteDropped(item) {
       const key = String(item.senderId);
-      const d = drops.get(key) ?? { loggedAt: -Infinity, suppressed: 0 };
+      const d = drops.get(key) ?? { loggedAt: -Infinity, suppressed: 0, wokeAt: -Infinity };
       drops.set(key, d);
+      if (now() - d.wokeAt >= BOT_WAKE_MS) {
+        const at = now(); // one clock read: the id, the time and the day file agree
+        d.wokeAt = at;
+        const subject = subjectOfPeer(item.peerId);
+        appendUrgentWake(
+          {
+            id: `8:${subject}:${key}:${at}`,
+            at: new Date(at).toISOString(),
+            source: "floor",
+            signal: 8,
+            subject,
+            facts: { by: "twist-bot-filter", sender: key, sender_name: item.senderName ?? null },
+          },
+          { env, nowMs: at },
+        );
+      }
       if (now() - d.loggedAt < DROP_LOG_MS) { d.suppressed++; return; }
       const more = d.suppressed ? ` (+${d.suppressed} more since the last line)` : "";
       log(`dropped ${item.id} from bot ${item.senderName ?? key} (${key}) in ${item.peerId}: bots are never answered${more}`);

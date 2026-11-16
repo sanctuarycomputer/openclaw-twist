@@ -78,6 +78,11 @@ A reply that triggers a reply never stops on its own. From 2026-10-02 to 11-10 t
 
    A `neverMute` peer that trips is **alerted, never muted**, at most once per `muteHours`. A peer whose breaker mute was **cut short by hand** is not re-muted for `muteHours` after the unmute (the next trip alerts instead), so an unmute sticks. Counts are in memory: a restart resets the windows, while the mutes persist in the file.
 
+**Urgent wakes (Stacksbot).** The guards keep acting and alerting on their own; they also leave Stacksbot's Urgent runner a note of what they did, so its incident thread is the breaker's own Critical rather than a second DM. Contract: `docs/contracts/urgent.md` 1.0 in the stacksbot repo; the code is `src/urgent-wakes.js`. No `OPENCLAW_STATE_DIR`, nothing is written. Nothing here changes what is posted or to whom.
+- Every loop-breaker trip that sends the Critical appends one wake (`source: "floor"`, `signal: 8`, subject `twist:conv:<id>` or `twist:thread:<id>`) after the post, with `dm_posted: true` and the post's `message_id` when the post went to a conversation (Hugh's DM) and returned a message id, else `dm_posted: false` and `message_id: null`. Its `facts.lever` is `mute-conversation` only when this trip wrote the mute to the file, otherwise `propose`.
+- A dropped bot message appends one wake per sender per 30 minutes (`facts.by: "twist-bot-filter"`), for the judge; nothing is DMed.
+- Each successful bot lookup replaces `bots.json` with the bot user ids, for the watcher's "is this a person" check.
+
 ### Webhook ingress (optional, off by default)
 
 If the gateway is reachable from the internet, Twist's **outgoing webhooks** can cut the "someone mentioned the bot → the bot starts working" latency from up to one poll interval down to a couple of seconds. It is a *progressive enhancement*: it changes **nothing** about how messages are ingested, only *when*.
@@ -147,6 +152,8 @@ Requests are guarded the same way the host's bundled webhook channels guard thei
 - `.state/cursors.json` — per-thread/conversation fetch cursor. A refetch-bound optimization only, not a dedup source of truth. Twist's own read state is never mutated by it.
 - `.state/queue.json` — the durable queue. Source of truth for what's been seen and its outcome.
 - `$OPENCLAW_STATE_DIR/twist-muted.json` — the shared [mute list](#loop-guards). Written by the Spend Guard and the loop breaker, read by the producer and consumer. Safe to edit by hand; a corrupt file mutes nothing.
+- `$OPENCLAW_STATE_DIR/urgent/wakes-YYYY-MM-DD.jsonl` — [Urgent wakes](#loop-guards), shared with Stacksbot's other writers (UTC day). One JSON line per wake, at most 4096 bytes, appended with `O_APPEND` in one write; never rewritten, truncated or deleted by this plugin.
+- `$OPENCLAW_STATE_DIR/urgent/bots.json` — `{ at, ids }`, the looked-up Twist bot ids. This plugin is its only writer (temp file + rename); Stacksbot's watcher reads it.
 - `.state/webhook-trace.jsonl` — webhook latency breadcrumbs, one JSON line per accepted hint (`{t, k, e}`: receive time, container key, and the event's own `posted_ts` when the payload carried one). Pure diagnostics: never read back by the pipeline, rotated at ~1MB (one previous generation kept), and safe to delete at any time. `e` comes from the **unsigned** payload and is used only to split Twist's delivery latency from ours — never as a cursor, freshness input, or dedup key.
 
 ### Migration
@@ -252,7 +259,7 @@ This channel does **not** require the MCP server — it handles inbound routing 
 npm test          # routing + queue + producer + consumer + cursor-store suites (no network, no SDK needed)
 ```
 
-`node --test` covers the whole ingestion pipeline without touching the network: routing rules and markup (`routing.test.js`), the durable store's persistence/dedup/pruning/quarantine (`queue.test.js`), forward pagination and first-sight baselining (`producer.test.js`), the delivery state machine — retries, dead-lettering, per-peer and global concurrency, crash recovery (`consumer.test.js`), cursor durability (`state.test.js`), and the loop guards — mute file reading and merging (`mutes.test.js`) and the per-peer loop breaker (`loop-breaker.test.js`). The pure logic (routing rules, mention/self-filtering, cursor advancement, target parsing, markup cleaning) lives in `src/routing.js`. SDK-coupled code (`src/channel.js`, `src/inbound.js`, `src/monitor.js`) is validated by loading in a running gateway.
+`node --test` covers the whole ingestion pipeline without touching the network: routing rules and markup (`routing.test.js`), the durable store's persistence/dedup/pruning/quarantine (`queue.test.js`), forward pagination and first-sight baselining (`producer.test.js`), the delivery state machine — retries, dead-lettering, per-peer and global concurrency, crash recovery (`consumer.test.js`), cursor durability (`state.test.js`), and the loop guards — mute file reading and merging (`mutes.test.js`) and the per-peer loop breaker (`loop-breaker.test.js`) — and the Urgent wakes and `bots.json` (`urgent-wakes.test.js`, which checks every row against the vendored contract fixture `test/fixtures/urgent/wakes-sample.jsonl`). The pure logic (routing rules, mention/self-filtering, cursor advancement, target parsing, markup cleaning) lives in `src/routing.js`. SDK-coupled code (`src/channel.js`, `src/inbound.js`, `src/monitor.js`) is validated by loading in a running gateway.
 
 For local iteration against your own gateway, you can symlink the host SDK so standalone `node` imports resolve (gitignored):
 ```bash
