@@ -11,6 +11,7 @@
 import { ALERT_HEADER } from "./consumer.js";
 import { DEFAULT_NEVER_MUTE, isLive, peerTarget } from "./mutes.js";
 import { appendUrgentWake, subjectOfPeer } from "./urgent-wakes.js";
+import { emitFailure, stdoutSink } from "./failure-line.js";
 
 export const LOOP_BREAKER_BY = "twist-loop-breaker";
 export const DEFAULT_LOOP_BREAKER = Object.freeze({ enabled: true, maxTurns: 40, windowMinutes: 30, muteHours: 6 });
@@ -73,12 +74,14 @@ export function loopAlertText(t) {
  * target is a conversation (Hugh's DM), so the loop breaker's wake can tell Stacksbot's Urgent
  * runner which message to adopt. If that post fails (or the target can't be resolved) the text
  * still goes out through the ordinary alert path, the ops thread, and the result is null: no DM.
+ * When that path held the text back as a repeat (it resolved `false`), the result says so:
+ * `{ messageId: undefined, dm: false, held: true }`, so the loop breaker's line is not alerted.
  * @param {object} deps
  * @param {(text: string) => Promise<{messageId?: string, kind?: string}>} deps.post
- * @param {(text: string) => Promise<void>} deps.fallback
+ * @param {(text: string) => Promise<boolean|void>} deps.fallback  resolves false when it held a repeat back
  * @param {(line: string) => void} deps.log
  * @param {string} deps.to  the configured target, for the log line
- * @returns {(text: string) => Promise<{messageId: string|undefined, dm: boolean} | null>}
+ * @returns {(text: string) => Promise<{messageId: string|undefined, dm: boolean, held?: true} | null>}
  */
 export function createCriticalNotifier({ post, fallback, log, to }) {
   return async (text) => {
@@ -87,8 +90,8 @@ export function createCriticalNotifier({ post, fallback, log, to }) {
       return { messageId: res?.messageId, dm: res?.kind === "conv" };
     } catch (err) {
       log(`critical alert to ${to} failed, sending it to the ops thread instead: ${String(err)}`);
-      await fallback(text);
-      return null;
+      const r = await fallback(text);
+      return r === false ? { messageId: undefined, dm: false, held: true } : null;
     }
   };
 }
@@ -96,13 +99,15 @@ export function createCriticalNotifier({ post, fallback, log, to }) {
 /**
  * @param {object} deps
  * @param {ReturnType<typeof import("./mutes.js").createMuteList>} deps.mutes
- * @param {(text: string) => Promise<{messageId?: string, dm?: boolean} | null | void>} deps.notify
+ * @param {(text: string) => Promise<{messageId?: string, dm?: boolean, held?: boolean} | null | void>} deps.notify
  *   posts the Critical alert; must not throw
  * @param {{enabled:boolean, maxTurns:number, windowMinutes:number, muteHours:number}} deps.config
  * @param {object} [deps.env] where the Urgent wake goes ($OPENCLAW_STATE_DIR); process.env by default
  * @param {typeof appendUrgentWake} [deps.appendWake] injectable for tests
+ * @param {(line: string) => unknown} [deps.failureSink] where each trip's STACKSBOT_FAILURE line goes; the
+ *   gateway's stdout by default
  */
-export function createLoopBreaker({ mutes, notify, config = DEFAULT_LOOP_BREAKER, log, now = Date.now, env = process.env, appendWake = appendUrgentWake }) {
+export function createLoopBreaker({ mutes, notify, config = DEFAULT_LOOP_BREAKER, log, now = Date.now, env = process.env, appendWake = appendUrgentWake, failureSink = stdoutSink }) {
   const windowMs = config.windowMinutes * 60_000;
   const muteMs = config.muteHours * 3600_000;
   const turns = new Map(); // peerId -> dispatch times inside the window, oldest first
@@ -113,6 +118,22 @@ export function createLoopBreaker({ mutes, notify, config = DEFAULT_LOOP_BREAKER
     if (now() - (alertedAt.get(peerId) ?? -Infinity) < muteMs) return false;
     alertedAt.set(peerId, now());
     return true;
+  }
+
+  /**
+   * One `loop-trip` failure line per trip (contract docs/contracts/failure-line.md), at the trip time.
+   * `alertedOf` says whether this trip sent the Critical; it is read inside the `try`, so a fault in it (or in
+   * the sink) loses the line only and never changes the trip.
+   */
+  function emitTrip(at, alertedOf) {
+    try {
+      emitFailure(
+        { kind: "inbox", source: "twist-inbox-loop-breaker", what: "loop-breaker", class: "loop-trip", cause: "none", alerted: alertedOf() === true, at },
+        { sink: failureSink, now: () => at },
+      );
+    } catch {
+      // best effort: the line is lost, the trip stands
+    }
   }
 
   /**
@@ -136,7 +157,10 @@ export function createLoopBreaker({ mutes, notify, config = DEFAULT_LOOP_BREAKER
    * change the trip's outcome: a fault there is logged and dropped.
    */
   async function alertAndWake(text, facts, outcome, written = false) {
+    const tripAt = now();
     const sent = await notify(text);
+    // Alerted unless the ops thread held the fallback back as a repeat.
+    emitTrip(tripAt, () => !sent?.held);
     try {
       const at = now(); // one clock read: the id, the time and the day file agree
       const subject = subjectOfPeer(facts.peerId);
@@ -178,12 +202,14 @@ export function createLoopBreaker({ mutes, notify, config = DEFAULT_LOOP_BREAKER
     if (mutes.isProtected(peerId)) {
       log(`loop breaker: ${peerId} tripped (${facts.turns} turns in ${facts.minutes}min) but is in neverMute: alert only`);
       if (alertDue(peerId)) await alertAndWake(loopAlertText({ ...facts, outcome: "protected" }), facts, "protected");
+      else emitTrip(now(), () => false); // alerted within muteHours: a repeat window
       return true;
     }
     const held = heldSince(peerId);
     if (held) {
       log(`loop breaker: ${peerId} tripped (${facts.turns} turns in ${facts.minutes}min) but was unmuted by hand at ${held}: alert only`);
       if (alertDue(peerId)) await alertAndWake(loopAlertText({ ...facts, outcome: "held", heldSince: held }), facts, "held");
+      else emitTrip(now(), () => false); // alerted within muteHours: a repeat window
       return true;
     }
     const untilMs = now() + muteMs;

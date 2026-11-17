@@ -1,15 +1,17 @@
-// The consumer's failure lines (spec What changes 3): one `inbox` line per retry (rate-limited), dead letter,
+// The consumer's and the loop breaker's failure lines (spec What changes 3 and 4): one `inbox` line per retry (rate-limited), dead letter,
 // storage, backlog and hung-turn alert, `alerted` from the alert's result, and nothing from the item or the error
 // text but the closed `cause`.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createQueueStore } from "../src/queue.js";
 import { createConsumer, BACKOFF_MS, MAX_ATTEMPTS, HIGH_WATER, HUNG_TURN_ALERT_MS, backlogAlertText } from "../src/consumer.js";
 import { PREFIX } from "../src/failure-line.js";
 import { createOpsAlert } from "../src/ops-alert.js";
+import { createMuteList, RECHECK_MS } from "../src/mutes.js";
+import { createCriticalNotifier, createLoopBreaker } from "../src/loop-breaker.js";
 
 const BOT = 634870;
 const T0 = Date.parse("2031-03-04T05:06:07.000Z");
@@ -446,4 +448,200 @@ test("T3-4 a later tick still over high water writes no second backlog line", as
 test("T3-5 the storage cause is read from the error: a timeout says timeout", async () => {
   const s = await storageScenario({ message: "ETIMEDOUT writing the queue" });
   assert.deepEqual(parsed(s.lines), [storageLine(T0, true, "timeout")]);
+});
+
+// ------------------------------------------------------------------- the loop breaker (What changes 4)
+
+const loopLine = (at, alerted) => ({ v: 1, at: iso(at), kind: "inbox", source: "twist-inbox-loop-breaker", what: "loop-breaker", class: "loop-trip", cause: "none", alerted });
+const LOOP_PEER = "conv:4242";
+
+/**
+ * A `maxTurns: 1` breaker over a real mute file in a temp dir; wakes are captured. `notify` is the Critical's
+ * result (a function of the text; default `{ messageId: "1", dm: true }`). Lines go to `lines` unless
+ * `failureSink` is given (null: none passed, so the default sink).
+ */
+function loopHarness({ notify, neverMute, failureSink } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), "twistlbfl-"));
+  const path = join(dir, "twist-muted.json");
+  const clock = { t: T0 };
+  const lines = [];
+  const logs = [];
+  const alerts = [];
+  const wakes = [];
+  const verdicts = [];
+  const mutes = createMuteList({ path, ...(neverMute ? { neverMute } : {}), log: (m) => logs.push(m), now: () => clock.t });
+  const breaker = createLoopBreaker({
+    mutes,
+    notify: async (text) => {
+      alerts.push(text);
+      return notify ? notify(text) : { messageId: "1", dm: true };
+    },
+    config: { enabled: true, maxTurns: 1, windowMinutes: 30, muteHours: 6 },
+    log: (m) => logs.push(m),
+    now: () => clock.t,
+    env: {},
+    appendWake: (row, opts) => { wakes.push({ row, opts }); return true; },
+    ...(failureSink === null ? {} : { failureSink: failureSink ?? ((l) => lines.push(l)) }),
+  });
+  /** Two turns 1 s apart: the second trips. Returns the trip time. */
+  const trip = async (peerId = LOOP_PEER, senderName = "Ada Bot") => {
+    for (let i = 0; i < 2; i++) {
+      if (i) clock.t += 1000;
+      verdicts.push(await breaker.admit({ id: `x${i}:${clock.t}`, kind: "conv", peerId, senderId: 2601, senderName }, { kind: "dm" }));
+    }
+    const at = clock.t;
+    clock.t += 1000;
+    return at;
+  };
+  /** A person cuts the breaker's mute of `peerId` short (twist-mute.mjs sets until = now), seen after a recheck. */
+  const unmuteByHand = (peerId = LOOP_PEER) => {
+    const file = JSON.parse(readFileSync(path, "utf8"));
+    file.conversations[peerId.split(":")[1]].until = new Date(clock.t).toISOString();
+    writeFileSync(path, JSON.stringify(file));
+    clock.t += RECHECK_MS;
+  };
+  const muteFile = () => (existsSync(path) ? readFileSync(path, "utf8") : null);
+  return { dir, breaker, clock, lines, logs, alerts, wakes, verdicts, mutes, trip, unmuteByHand, muteFile };
+}
+
+const failingPost = async () => { throw new Error("503"); };
+const criticalVia = (fallbackResult) => createCriticalNotifier({ post: failingPost, fallback: async () => fallbackResult, log: () => {}, to: "conv:1367817" });
+
+test("A2.7 a trip whose Critical posts writes one loop-trip line, alerted true, at the trip time", async () => {
+  const h = loopHarness();
+  const at = await h.trip();
+  assert.deepEqual(h.verdicts, [true, false]);
+  assert.equal(h.mutes.isMuted(LOOP_PEER), true);
+  assert.deepEqual(parsed(h.lines), [loopLine(at, true)]);
+});
+
+test("A2.7 through a real createCriticalNotifier: a fallback that sent the alert is alerted true", async () => {
+  const h = loopHarness({ notify: criticalVia(undefined) });
+  const at = await h.trip();
+  assert.deepEqual(parsed(h.lines), [loopLine(at, true)]);
+  assert.equal(h.wakes.length, 1);
+  assert.equal(h.wakes[0].row.dm_posted, false);
+  assert.equal(h.wakes[0].row.message_id, null);
+});
+
+test("A2.7 through a real createCriticalNotifier: a fallback held back as a repeat is alerted false; the wake has no DM", async () => {
+  const h = loopHarness({ notify: criticalVia(false) });
+  const at = await h.trip();
+  assert.deepEqual(h.verdicts, [true, false]);
+  assert.equal(h.mutes.isMuted(LOOP_PEER), true);
+  assert.deepEqual(parsed(h.lines), [loopLine(at, false)]);
+  assert.equal(h.wakes.length, 1);
+  assert.equal(h.wakes[0].row.dm_posted, false);
+  assert.equal(h.wakes[0].row.message_id, null);
+});
+
+test("A2.7 createCriticalNotifier: a post's id; null after a fallback that sent; held after one that held back", async () => {
+  const ok = createCriticalNotifier({ post: async () => ({ messageId: "7", kind: "conv" }), fallback: async () => false, log: () => {}, to: "conv:1367817" });
+  assert.deepEqual(await ok("hi"), { messageId: "7", dm: true });
+  assert.equal(await criticalVia(undefined)("hi"), null);
+  assert.deepStrictEqual(await criticalVia(false)("hi"), { messageId: undefined, dm: false, held: true });
+});
+
+test("A2.7 a protected peer: the first trip alerts (true), a second inside muteHours sends nothing (false)", async () => {
+  const h = loopHarness({ neverMute: [LOOP_PEER] });
+  const first = await h.trip();
+  const second = await h.trip();
+  assert.deepEqual(h.verdicts, [true, true, true, true]);
+  assert.equal(h.alerts.length, 1);
+  assert.equal(h.wakes.length, 1);
+  assert.deepEqual(parsed(h.lines), [loopLine(first, true), loopLine(second, false)]);
+});
+
+test("A2.7 a held peer (its mute cut short by hand): the first held trip alerts (true), a second inside muteHours does not (false)", async () => {
+  const h = loopHarness();
+  const muted = await h.trip();
+  h.unmuteByHand();
+  const held1 = await h.trip();
+  const held2 = await h.trip();
+  assert.deepEqual(h.verdicts, [true, false, true, true, true, true]);
+  assert.equal(h.alerts.length, 2);
+  assert.match(h.alerts[1], /still answering it because someone unmuted it/);
+  assert.deepEqual(parsed(h.lines), [loopLine(muted, true), loopLine(held1, true), loopLine(held2, false)]);
+});
+
+test("A1.3 (loop half) no peer id, conversation id or sender name reaches a loop-trip line", async () => {
+  const CONV = String(9_000_000 + 41_377);
+  const SENDER = "Quillon Brackenridge";
+  const all = [];
+  const m = loopHarness();
+  await m.trip(`conv:${CONV}`, SENDER);
+  all.push(...m.lines);
+  const p = loopHarness({ neverMute: [`conv:${CONV}`] });
+  await p.trip(`conv:${CONV}`, SENDER);
+  await p.trip(`conv:${CONV}`, SENDER);
+  all.push(...p.lines);
+  assert.equal(all.length, 3, all.join(""));
+  assert.ok(m.alerts[0].includes(CONV) && m.alerts[0].includes(SENDER), "the markers were in play");
+  for (const line of all) {
+    for (const marker of [CONV, `conv:${CONV}`, SENDER, "Quillon", "Ada"]) assert.ok(!line.includes(marker), `${marker} in ${line}`);
+  }
+});
+
+/** Everything a trip does apart from its line (the logs with the run's temp dir taken out). */
+const loopOutcome = (h) => ({ verdicts: h.verdicts, alerts: h.alerts, wakes: h.wakes, mutes: h.muteFile(), logs: h.logs.map((l) => l.split(h.dir).join("<dir>")) });
+
+test("A2.7 a Critical result whose held getter throws: no line, and the trip is otherwise a plain posted one", async () => {
+  const plain = loopHarness();
+  await plain.trip();
+  const odd = loopHarness({
+    notify: () => ({ messageId: "1", dm: true, get held() { throw new Error("getter boom"); } }),
+  });
+  await odd.trip();
+  assert.deepEqual(odd.lines, []);
+  assert.deepEqual(odd.verdicts, [true, false]);
+  assert.equal(odd.mutes.isMuted(LOOP_PEER), true);
+  assert.deepEqual(loopOutcome(odd), loopOutcome(plain));
+});
+
+const LOOP_SCENARIOS = {
+  muted: async (opts) => { const h = loopHarness(opts); await h.trip(); return h; },
+  "fallback held": async (opts) => { const h = loopHarness({ notify: criticalVia(false), ...opts }); await h.trip(); return h; },
+  protected: async (opts) => { const h = loopHarness({ neverMute: [LOOP_PEER], ...opts }); await h.trip(); await h.trip(); return h; },
+  held: async (opts) => { const h = loopHarness(opts); await h.trip(); h.unmuteByHand(); await h.trip(); await h.trip(); return h; },
+};
+const LOOP_FAULTS = {
+  "a sink that throws": { failureSink: () => { throw new Error("sink down"); } },
+  "a sink returning a rejected promise": { failureSink: () => Promise.reject(new Error("x")) },
+};
+
+for (const [fault, deps] of Object.entries(LOOP_FAULTS)) {
+  test(`A2.8 ${fault} leaves every loop-breaker outcome as a working sink's`, async () => {
+    const unhandled = [];
+    const onUnhandled = (reason) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      for (const [name, scenario] of Object.entries(LOOP_SCENARIOS)) {
+        const working = await scenario({});
+        assert.ok(working.lines.length >= 1, name);
+        const broken = await scenario(deps);
+        assert.deepEqual(loopOutcome(broken), loopOutcome(working), name);
+      }
+      await new Promise((r) => setTimeout(r, 20));
+      assert.deepEqual(unhandled, []);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+}
+
+test("T3-1 (loop half) without a failureSink the loop breaker writes its line to process.stdout", async () => {
+  const realWrite = process.stdout.write;
+  const written = [];
+  process.stdout.write = function (chunk, ...rest) {
+    if (typeof chunk === "string" && chunk.startsWith(PREFIX)) { written.push(chunk); return true; }
+    return realWrite.call(this, chunk, ...rest);
+  };
+  let at;
+  try {
+    at = await loopHarness({ failureSink: null }).trip();
+  } finally {
+    process.stdout.write = realWrite;
+  }
+  assert.equal(written.length, 1, written.join(""));
+  assert.deepEqual(parsed(written), [loopLine(at, true)]);
 });
