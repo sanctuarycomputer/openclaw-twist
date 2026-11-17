@@ -457,7 +457,7 @@ const LOOP_PEER = "conv:4242";
 
 /**
  * A `maxTurns: 1` breaker over a real mute file in a temp dir; wakes are captured. `notify` is the Critical's
- * result (a function of the text; default `{ messageId: "1", dm: true }`). Lines go to `lines` unless
+ * result (a function of the text and the clock; default `{ messageId: "1", dm: true }`). Lines go to `lines` unless
  * `failureSink` is given (null: none passed, so the default sink).
  */
 function loopHarness({ notify, neverMute, failureSink } = {}) {
@@ -474,7 +474,7 @@ function loopHarness({ notify, neverMute, failureSink } = {}) {
     mutes,
     notify: async (text) => {
       alerts.push(text);
-      return notify ? notify(text) : { messageId: "1", dm: true };
+      return notify ? notify(text, clock) : { messageId: "1", dm: true };
     },
     config: { enabled: true, maxTurns: 1, windowMinutes: 30, muteHours: 6 },
     log: (m) => logs.push(m),
@@ -644,4 +644,32 @@ test("T3-1 (loop half) without a failureSink the loop breaker writes its line to
   }
   assert.equal(written.length, 1, written.join(""));
   assert.deepEqual(parsed(written), [loopLine(at, true)]);
+});
+
+test("T4-1 the loop line's at is the trip time, read before a slow Critical resolves", async () => {
+  const h = loopHarness({ notify: async (_text, clock) => { clock.t += 5_000; return { messageId: "1", dm: true }; } });
+  await h.trip();
+  const tripAt = T0 + 1000; // the second turn, which trips; the Critical then takes 5 s
+  assert.equal(h.clock.t, tripAt + 5_000 + 1000);
+  assert.deepEqual(parsed(h.lines), [loopLine(tripAt, true)]);
+  assert.equal(h.wakes[0].row.at, iso(tripAt + 5_000), "the wake keeps its own read, after notify");
+});
+
+test("T4-2 loop lines pass no rate limiter: two no-alert trips of a protected peer inside 60 s both write", async () => {
+  const h = loopHarness({ neverMute: [LOOP_PEER] });
+  const first = await h.trip();
+  const second = await h.trip();
+  const third = await h.trip();
+  assert.ok(third - second < 60_000);
+  assert.equal(h.alerts.length, 1);
+  assert.deepEqual(parsed(h.lines), [loopLine(first, true), loopLine(second, false), loopLine(third, false)]);
+});
+
+test("T4-3 a Critical that rejects: admit lets the turn through and logs it, as before; no line is written", async () => {
+  const h = loopHarness({ notify: async () => { throw new Error("post down"); } });
+  await h.trip();
+  assert.deepEqual(h.verdicts, [true, true]);
+  assert.equal(h.alerts.length, 1);
+  assert.deepEqual(h.lines, []);
+  assert.ok(h.logs.some((l) => /^loop breaker failed for x1:\d+ \(letting the turn through\): Error: post down$/.test(l)), h.logs.join("\n"));
 });

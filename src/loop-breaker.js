@@ -158,6 +158,7 @@ export function createLoopBreaker({ mutes, notify, config = DEFAULT_LOOP_BREAKER
    */
   async function alertAndWake(text, facts, outcome, written = false) {
     const tripAt = now();
+    // notify must not throw: a rejection propagates to admit's catch, which lets the turn through (as before the line), and no line is written.
     const sent = await notify(text);
     // Alerted unless the ops thread held the fallback back as a repeat.
     emitTrip(tripAt, () => !sent?.held);
