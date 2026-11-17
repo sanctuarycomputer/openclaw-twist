@@ -27,7 +27,7 @@ function baseItem(id, over = {}) {
 }
 
 /**
- * A consumer over a real queue in a temp dir. `alert` is the result a test sets: a function of (text, clock)
+ * A consumer over a real queue in a temp dir. Lines go to `lines` unless `failureSink` is given (null: none passed). `alert` is the result a test sets: a function of (text, clock)
  * whose return (or throw) is what the consumer's alert returns; the default resolves undefined, as every
  * existing stub does. `rawAlert` replaces the alert outright.
  */
@@ -51,7 +51,8 @@ async function harness({ items = [], clock = { t: T0 }, runTurn, probe, alert, r
       return alert ? alert(text, clock) : Promise.resolve(undefined);
     }),
     replyInPlace: async (item, text) => { calls.replies.push([item.id, text]); },
-    failureSink: failureSink ?? ((l) => lines.push(l)),
+    // `failureSink: null` builds the consumer without one, so it falls back to its default.
+    ...(failureSink === null ? {} : { failureSink: failureSink ?? ((l) => lines.push(l)) }),
     ...(failureLimiter ? { failureLimiter } : {}),
   });
   return { queue, consumer, calls, clock, lines, logs };
@@ -381,3 +382,68 @@ for (const [fault, deps] of Object.entries(FAULTS)) {
     }
   });
 }
+
+// ------------------------------------------------------------------- the default sink, the unlimited alert lines, one line per incident
+
+test("T3-1 without a failureSink the consumer writes its line to process.stdout", async () => {
+  const realWrite = process.stdout.write;
+  const written = [];
+  process.stdout.write = function (chunk, ...rest) {
+    if (typeof chunk === "string" && chunk.startsWith(PREFIX)) { written.push(chunk); return true; }
+    return realWrite.call(this, chunk, ...rest);
+  };
+  try {
+    await retryScenario({ attempts: 1, failureSink: null });
+  } finally {
+    process.stdout.write = realWrite;
+  }
+  assert.equal(written.length, 1, written.join(""));
+  assert.deepEqual(parsed(written), [retryLine(T0, "connection", 2)]);
+});
+
+test("T3-2/T3-3 alert lines never pass the limiter: one that refuses everything still lets them through", async () => {
+  const refuse = () => ({ admit: () => ({ write: false }), revert() {} });
+  assert.deepEqual((await retryScenario({ failureLimiter: refuse() })).lines, []); // the retry line does pass it
+  assert.deepEqual(parsed((await deadLetterScenario({ failureLimiter: refuse() })).lines), [deadLine(T0, "connection", true)]);
+  assert.deepEqual(parsed((await storageScenario({ failureLimiter: refuse() })).lines), [storageLine(T0, true)]);
+  assert.deepEqual(parsed((await backlogScenario({ failureLimiter: refuse() })).lines), [backlogLine(T0, true)]);
+  const g = await hungScenario({ failureLimiter: refuse() });
+  assert.deepEqual(parsed(g.lines), [hungLine(g.hungAt, true)]);
+});
+
+test("T3-2 two turns hung in the same tick, both alerts held back as repeats: two lines, both alerted false", async () => {
+  const g = await hungScenario({ items: [baseItem("a"), baseItem("b")], alert: async () => false });
+  assert.equal(g.calls.alerts.length, 2);
+  assert.deepEqual(parsed(g.lines), [hungLine(g.hungAt, false), hungLine(g.hungAt, false)]);
+});
+
+test("T3-4 a second storage failure in the same process writes no second line", async () => {
+  const s = await storageScenario();
+  await s.consumer.tick();
+  await flushMicrotasks();
+  assert.ok(s.logs.filter((l) => l.startsWith("queue persist failed")).length >= 2, s.logs.join("\n")); // it did fail again
+  assert.equal(s.calls.alerts.length, 1);
+  assert.deepEqual(parsed(s.lines), [storageLine(T0, true)]);
+});
+
+test("T3-4 a later tick still over high water writes no second backlog line", async () => {
+  const gates = [];
+  const b = await harness({
+    items: Array.from({ length: HIGH_WATER + 10 }, (_, i) => baseItem(`hw-${i}`)),
+    runTurn: () => new Promise((resolve) => gates.push(resolve)), // turns stay running: only 3 items leave the queue
+  });
+  await b.consumer.tick();
+  await flushMicrotasks();
+  await b.consumer.tick();
+  await flushMicrotasks();
+  assert.ok(b.queue.itemsInState("queued").length > HIGH_WATER); // still over the mark on the second tick
+  assert.equal(b.calls.alerts.length, 1);
+  assert.deepEqual(parsed(b.lines), [backlogLine(T0, true)]);
+  gates.forEach((g) => g());
+  await b.consumer.idle();
+});
+
+test("T3-5 the storage cause is read from the error: a timeout says timeout", async () => {
+  const s = await storageScenario({ message: "ETIMEDOUT writing the queue" });
+  assert.deepEqual(parsed(s.lines), [storageLine(T0, true, "timeout")]);
+});
