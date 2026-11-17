@@ -518,6 +518,9 @@ test("pin: checkWhat turn rule", () => {
   assert.equal(parse(failureLine({ kind: "turn", what: "daily-digest" })).what, "?");
   // The value is a legal name, so only the turn rule rejects it.
   assert.equal(checkWhat("job", "daily-digest"), "daily-digest");
+  // Contract §3: a turn's what is one of these five, written out (task-1 T1-1); another list's value is not.
+  for (const s of ["cron", "user", "heartbeat", "subagent", "other"]) assert.equal(checkWhat("turn", s), s, s);
+  for (const v of ["consumer", "backlog", "inbox"]) assert.equal(checkWhat("turn", v), null, v);
 });
 
 test("pin: checkWhat model rule", () => {
@@ -526,6 +529,32 @@ test("pin: checkWhat model rule", () => {
   assert.equal(parse(failureLine({ kind: "model", what: "anthropic/claude-x" })).what, "anthropic/claude-x");
   assert.equal(parse(failureLine({ kind: "model", what: "daily-digest" })).what, "?");
   assert.equal(checkWhat("job", "daily-digest"), "daily-digest");
+  // Contract §3's provider/model pattern (task-1 T1-2): more slashes and a colon after the first slash are fine;
+  // an empty or punctuation-led part is not.
+  for (const v of ["a/b/c", "openai/gpt-5:mini", "x.y_z-1/m.n_o-2"]) assert.equal(checkWhat("model", v), v, v);
+  for (const v of ["/x", "x/", "-x/y", "x/-y", ".x/y", "x/.y", "a:b/c"]) assert.equal(checkWhat("model", v), null, v);
+});
+
+test("pin: name, uuid and fid patterns", () => {
+  // A job or tool name (contract §3): starts with a letter or digit, then letters, digits and _ . / : -.
+  for (const v of ["a.b", "a/b", "a_b", "a-b", "a:b", "9"]) assert.equal(checkWhat("job", v), v, v);
+  for (const v of ["-x", "_x", ".x", "/x", ":x", "a b", "a+b"]) assert.equal(checkWhat("job", v), null, v);
+
+  // job_id and run: a lowercase uuid, the whole value.
+  const HEXY = ["a".repeat(8), "bbbb", "4ccc", "8ddd", "e".repeat(12)].join("-"); // has letters, so case shows
+  const kept = parse(failureLine({ ...PIN_F, job_id: HEXY, run: HEXY }, PIN_OPTS));
+  assert.deepEqual([kept.job_id, kept.run], [HEXY, HEXY]);
+  const bare = failureLine(PIN_F, PIN_OPTS);
+  for (const bad of [HEXY.toUpperCase(), `x${HEXY}`, `${HEXY}x`, HEXY.slice(0, -1) + "g"]) {
+    assert.equal(failureLine({ ...PIN_F, job_id: bad, run: bad }, PIN_OPTS), bare, bad);
+  }
+
+  // fid: f-<8 or 9 base-36 chars>-<4 base-36 chars>; anything else is replaced by a generated one.
+  const generated = `f-${FIXED.toString(36)}-0000`;
+  for (const fid of [`f-${"1".repeat(8)}-abcd`, `f-${"1".repeat(9)}-abcd`]) assert.equal(parse(failureLine({ ...PIN_F, fid }, PIN_OPTS)).fid, fid, fid);
+  for (const fid of [`f-${"1".repeat(7)}-abcd`, `f-${"1".repeat(10)}-abcd`, `f-${"1".repeat(8)}-abcde`, `f-${"1".repeat(8)}-abc`, `x-${"1".repeat(8)}-abcd`]) {
+    assert.equal(parse(failureLine({ ...PIN_F, fid }, PIN_OPTS)).fid, generated, fid);
+  }
 });
 
 test("pin: attempt upper bound", () => {
