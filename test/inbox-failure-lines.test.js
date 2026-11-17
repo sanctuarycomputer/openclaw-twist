@@ -1,9 +1,9 @@
 // The consumer's and the loop breaker's failure lines (spec What changes 3 and 4): one `inbox` line per retry (rate-limited), dead letter,
 // storage, backlog and hung-turn alert, `alerted` from the alert's result, and nothing from the item or the error
 // text but the closed `cause`.
-import test from "node:test";
+import test, { after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, existsSync, accessSync, rmSync, constants } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createQueueStore } from "../src/queue.js";
@@ -20,6 +20,27 @@ const MENTION = `[Bot](twist-mention://${BOT}) hello`;
 const iso = (ms) => new Date(ms).toISOString();
 const FID_RE = /^f-[0-9a-z]{8,9}-[0-9a-z]{4}$/;
 
+// Queue and mute files go on /dev/shm when it is there and writable: every queue write fsyncs, and on a busy
+// shared disk that wait was most of this file's time (ruling d-20261117-234552915). tmpfs is memory, so every
+// dir made here is removed after the file's tests, pass or fail.
+const TMP_ROOT = (() => {
+  try {
+    accessSync("/dev/shm", constants.W_OK);
+    return "/dev/shm";
+  } catch {
+    return tmpdir();
+  }
+})();
+const tempDirs = [];
+function tempDir(prefix) {
+  const dir = mkdtempSync(join(TMP_ROOT, prefix));
+  tempDirs.push(dir);
+  return dir;
+}
+after(() => {
+  for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
+});
+
 function baseItem(id, over = {}) {
   return {
     id, kind: "conv", peerId: `conv:${id}`, conversationId: 1, messageId: 500,
@@ -34,7 +55,7 @@ function baseItem(id, over = {}) {
  * existing stub does. `rawAlert` replaces the alert outright.
  */
 async function harness({ items = [], clock = { t: T0 }, runTurn, probe, alert, rawAlert, failureSink, failureLimiter } = {}) {
-  const dir = mkdtempSync(join(tmpdir(), "twistfl-"));
+  const dir = tempDir("twistfl-");
   const queue = createQueueStore(join(dir, "queue.json"));
   await queue.load();
   await queue.enqueueAll(items, clock.t);
@@ -469,7 +490,7 @@ const LOOP_PEER = "conv:4242";
  * `failureSink` is given (null: none passed, so the default sink).
  */
 function loopHarness({ notify, neverMute, failureSink } = {}) {
-  const dir = mkdtempSync(join(tmpdir(), "twistlbfl-"));
+  const dir = tempDir("twistlbfl-");
   const path = join(dir, "twist-muted.json");
   const clock = { t: T0 };
   const lines = [];
