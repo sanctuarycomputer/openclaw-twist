@@ -7,7 +7,7 @@ import { mkdtempSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createQueueStore } from "../src/queue.js";
-import { createConsumer, BACKOFF_MS, MAX_ATTEMPTS, HIGH_WATER, HUNG_TURN_ALERT_MS, backlogAlertText } from "../src/consumer.js";
+import { createConsumer, BACKOFF_MS, MAX_ATTEMPTS, HIGH_WATER, HUNG_TURN_ALERT_MS, backlogAlertText, syncSkipReason } from "../src/consumer.js";
 import { PREFIX } from "../src/failure-line.js";
 import { createOpsAlert } from "../src/ops-alert.js";
 import { createMuteList, RECHECK_MS } from "../src/mutes.js";
@@ -115,9 +115,17 @@ async function storageScenario({ message = "ENOSPC: no space left on device", it
   await h.consumer.idle();
   return h;
 }
+/** HIGH_WATER + 1 items on one peer, so a tick runs one turn, not one per item. */
+function backlogItems(make = (id, over) => baseItem(id, over), peerId = "conv:hw") {
+  return Array.from({ length: HIGH_WATER + 1 }, (_, i) => make(`hw-${i}`, { peerId }));
+}
 /** HIGH_WATER + 1 items waiting for a reply. */
 async function backlogScenario({ items, ...opts } = {}) {
-  const h = await harness({ items: items ?? Array.from({ length: HIGH_WATER + 1 }, (_, i) => baseItem(`hw-${i}`)), ...opts });
+  const h = await harness({ items: items ?? backlogItems(), ...opts });
+  const queued = h.queue.itemsInState("queued");
+  assert.ok(queued.length > HIGH_WATER, "the fixture is over the high-water mark");
+  assert.equal(new Set(queued.map((i) => i.peerId)).size, 1, "the backlog is on one peer");
+  for (const i of queued) assert.equal(syncSkipReason(i, T0, BOT), null, "no backlog item is sync-skippable");
   await once(h.consumer);
   return h;
 }
@@ -299,7 +307,7 @@ test("A2.6 a real ops alert holding back a 1 h old repeat of the backlog inciden
   const clock = { t: T0 };
   const posts = [];
   const opsLogs = [];
-  const items = Array.from({ length: HIGH_WATER + 1 }, (_, i) => baseItem(`hw-${i}`));
+  const items = backlogItems();
   const earlier = backlogAlertText(items.slice(0, 7), T0 - 3600_000);
   const rawAlert = createOpsAlert({
     target: () => ({ kind: "thread", id: 777 }),
@@ -340,7 +348,7 @@ test("A1.3 no item, comment, conversation or user id, sender name or error text 
   await poison.consumer.recoverOrphans();
   all.push(...poison.lines);
   all.push(...(await storageScenario({ message: `ENOSPC ${message}`, items: [marked("s")] })).lines);
-  all.push(...(await backlogScenario({ items: Array.from({ length: HIGH_WATER + 1 }, (_, i) => marked(`b${i}`)) })).lines);
+  all.push(...(await backlogScenario({ items: backlogItems((id, over) => marked(`b${id}`, over), `conv:${CONV}b`) })).lines);
   all.push(...(await hungScenario({ items: [marked("h")] })).lines);
   assert.equal(all.length, 6, all.join(""));
   for (const line of all) {
