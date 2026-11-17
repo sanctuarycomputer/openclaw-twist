@@ -5,6 +5,12 @@ import {
   PREFIX,
   VERSION,
   SOURCES,
+  CLASSES,
+  CAUSES,
+  SESSIONS,
+  MAX_LINE_BYTES,
+  SKEW_MS,
+  MAX_DELAY_MS,
   FIELD_ORDER,
   OPTIONAL_DROP_ORDER,
   checkWhat,
@@ -465,6 +471,153 @@ test("selectors: each vendored selector matches its own builder's text and no ot
       const body = lines.slice(1).find((l) => l.trim() !== "");
       const matching = SELECTORS.filter((o) => res[o.id].test(body)).map((o) => o.id);
       assert.deepEqual(matching, [s.id], body);
+    }
+  }
+});
+
+// Pins for the guards that only home's compare-port.mjs checked (twist-plugin-315). Each input is one that only
+// its named guard decides. Expected constants and lists are written out from the contract, never read from the module.
+const PIN_OPTS = { now: () => FIXED, rand: () => 0 };
+const PIN_F = { kind: "inbox", source: "twist-inbox-retry", what: "consumer", class: "retry", cause: "timeout" };
+const longest = (list) => list.reduce((a, b) => (b.length > a.length ? b : a));
+
+test("pin: MAX_LINE_BYTES", () => {
+  assert.equal(MAX_LINE_BYTES, 512);
+  // Contract §4: the fullest legal line is 452 bytes, and it is written whole under default options.
+  const fields = {
+    fid: `f-${(36 ** 8).toString(36)}-abcd`,
+    at: new Date(FIXED).toISOString(),
+    kind: "model",
+    source: longest(SOURCES),
+    what: "a/" + "b".repeat(78),
+    class: longest(CLASSES),
+    cause: longest(CAUSES),
+    alerted: false,
+    streak: 9999,
+    session: longest(SESSIONS),
+    job_id: UUID,
+    run: UUID,
+    attempt: 99,
+    suppressed: 999999,
+  };
+  assert.equal(fields.fid.split("-")[1].length, 9);
+  const line = failureLine(fields);
+  assert.equal(line, PREFIX + JSON.stringify({ v: 1, ...fields }) + "\n");
+  assert.equal(Object.keys(parse(line)).length, 15);
+  assert.equal(Buffer.byteLength(line), 452);
+});
+
+test("pin: PREFIX literal", () => {
+  assert.equal(PREFIX, "STACKSBOT_FAILURE ");
+  assert.ok(failureLine({ kind: "inbox" }).startsWith("STACKSBOT_FAILURE {"));
+});
+
+test("pin: checkWhat turn rule", () => {
+  assert.equal(checkWhat("turn", "cron"), "cron");
+  assert.equal(checkWhat("turn", "daily-digest"), null);
+  assert.equal(parse(failureLine({ kind: "turn", what: "daily-digest" })).what, "?");
+  // The value is a legal name, so only the turn rule rejects it.
+  assert.equal(checkWhat("job", "daily-digest"), "daily-digest");
+});
+
+test("pin: checkWhat model rule", () => {
+  assert.equal(checkWhat("model", "anthropic/claude-x"), "anthropic/claude-x");
+  assert.equal(checkWhat("model", "daily-digest"), null);
+  assert.equal(parse(failureLine({ kind: "model", what: "anthropic/claude-x" })).what, "anthropic/claude-x");
+  assert.equal(parse(failureLine({ kind: "model", what: "daily-digest" })).what, "?");
+  assert.equal(checkWhat("job", "daily-digest"), "daily-digest");
+});
+
+test("pin: attempt upper bound", () => {
+  assert.equal(parse(failureLine({ ...PIN_F, attempt: 99 }, PIN_OPTS)).attempt, 99);
+  assert.deepEqual(failureLine({ ...PIN_F, attempt: 100 }, PIN_OPTS), failureLine(PIN_F, PIN_OPTS));
+});
+
+test("pin: optional field bounds", () => {
+  const kept = [
+    ["streak", 9999],
+    ["suppressed", 999999],
+    ["attempt", 1],
+    ["streak", 1],
+    ["suppressed", 1],
+  ];
+  for (const [key, value] of kept) assert.equal(parse(failureLine({ ...PIN_F, [key]: value }, PIN_OPTS))[key], value, `${key} ${value} kept`);
+  const dropped = [
+    ["streak", 10000],
+    ["suppressed", 1000000],
+    ["attempt", 0],
+    ["streak", 0],
+    ["suppressed", 0],
+  ];
+  const bare = failureLine(PIN_F, PIN_OPTS);
+  for (const [key, value] of dropped) assert.deepEqual(failureLine({ ...PIN_F, [key]: value }, PIN_OPTS), bare, `${key} ${value} dropped`);
+});
+
+test("pin: CLASSES, CAUSES and SESSIONS are the contract's", () => {
+  // Contract §3, written out.
+  const classes = [
+    "interrupted",
+    "exec-failed",
+    "mcp-tool",
+    "incomplete-turn",
+    "subagent",
+    "timeout",
+    "session-init",
+    "unknown",
+    "unschedulable",
+    "fanout",
+    "delivery-failed",
+    "smoke-regression",
+    "capped",
+    "stale",
+    "unavailable",
+    "runaway-session",
+    "billing",
+    "fix-run-flagged",
+    "retry",
+    "dead-letter",
+    "loop-trip",
+    "storage",
+    "backlog",
+    "hung-turn",
+    "tool-error",
+    "turn-error",
+    "model-error",
+  ];
+  const causes = ["http-4xx", "http-5xx", "http-429", "timeout", "connection", "billing", "rate-limited", "bot-down", "none", "unknown"];
+  const sessions = ["cron", "user", "heartbeat", "subagent", "other"];
+  assert.deepEqual([classes.length, causes.length, sessions.length], [27, 10, 5]);
+  assert.deepEqual([...CLASSES].sort(), [...classes].sort());
+  assert.deepEqual([...CAUSES].sort(), [...causes].sort());
+  assert.deepEqual([...SESSIONS].sort(), [...sessions].sort());
+  for (const c of classes) assert.equal(parse(failureLine({ ...PIN_F, class: c }, PIN_OPTS)).class, c, c);
+  for (const c of causes) assert.equal(parse(failureLine({ ...PIN_F, cause: c }, PIN_OPTS)).cause, c, c);
+  for (const s of sessions) assert.equal(parse(failureLine({ ...PIN_F, session: s }, PIN_OPTS)).session, s, s);
+});
+
+test("pin: SKEW_MS and MAX_DELAY_MS", () => {
+  assert.equal(SKEW_MS, 60000);
+  assert.equal(MAX_DELAY_MS, 420000);
+});
+
+test("pin: enum fields need a string", () => {
+  const SENDER = "Grace " + "Hopper";
+  const asObject = (s) => ({ toString: () => s, sender: SENDER });
+  const legal = { kind: "inbox", source: "twist-inbox-retry", class: "retry", cause: "timeout", session: "cron" };
+  const control = parse(failureLine({ ...legal, what: "consumer" }, PIN_OPTS));
+  for (const key of Object.keys(legal)) assert.equal(control[key], legal[key], `${key} kept as a string`);
+  const rejected = {
+    kind: (o) => assert.equal(o.kind, "?"),
+    source: (o) => assert.equal(o.source, "?"),
+    class: (o) => assert.equal(o.class, "unknown"),
+    cause: (o) => assert.equal(o.cause, "unknown"),
+    session: (o) => assert.equal(Object.hasOwn(o, "session"), false),
+  };
+  for (const key of Object.keys(legal)) {
+    for (const bad of [asObject(legal[key]), [legal[key]]]) {
+      const line = failureLine({ ...legal, what: "consumer", [key]: bad }, PIN_OPTS);
+      rejected[key](parse(line));
+      assert.ok(!line.includes(SENDER), `${key}: no sender`);
     }
   }
 });
