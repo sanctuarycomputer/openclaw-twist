@@ -12,6 +12,7 @@ import {
   failureCause,
   createRateLimiter,
   emitFailure,
+  stdoutSink,
 } from "../src/failure-line.js";
 import { ALERT_HEADER, deadLetterAlertText, storageAlertText, backlogAlertText, hungTurnAlertText } from "../src/consumer.js";
 import { loopAlertText } from "../src/loop-breaker.js";
@@ -149,6 +150,53 @@ test("the guard: only own properties are read (inherited fields never reach the 
   const o = parse(line);
   assert.deepEqual(o, { v: 1, fid: `f-${FIXED.toString(36)}-0000`, at: new Date(FIXED).toISOString(), kind: "?", source: "?", what: "?", class: "unknown", cause: "unknown", alerted: false });
   for (const needle of [ITEM, SECRET, "1349360", UUID, "twist-inbox-retry", "consumer"]) assert.ok(!line.includes(needle), needle);
+});
+
+test("the guard: object-valued ids are never written, even when their toString is valid", () => {
+  const SENDER = "Ada " + "Lovelace";
+  const validFid = `f-${(FIXED - 1000).toString(36)}-abcd`;
+  const asObject = (s) => ({ toString: () => s, sender: SENDER });
+  const f = { kind: "inbox", source: "twist-inbox-retry", what: "consumer", class: "retry", cause: "timeout" };
+  const line = failureLine({ ...f, run: asObject(UUID), job_id: asObject(UUID), fid: asObject(validFid) }, { now: () => FIXED, rand: () => 0 });
+  const o = parse(line);
+  assert.equal(Object.hasOwn(o, "run"), false);
+  assert.equal(Object.hasOwn(o, "job_id"), false);
+  assert.equal(o.fid, `f-${FIXED.toString(36)}-0000`, "fid regenerated");
+  for (const needle of [SENDER, UUID, validFid]) assert.ok(!line.includes(needle), needle);
+  // The same values as strings are kept, so the drop above is the type check's doing.
+  const kept = parse(failureLine({ ...f, run: UUID, job_id: UUID, fid: validFid }));
+  assert.deepEqual([kept.run, kept.job_id, kept.fid], [UUID, UUID, validFid]);
+});
+
+test("the guard: what is at most 80 characters for a model too", () => {
+  const m80 = "a/" + "b".repeat(78);
+  const m81 = "a/" + "b".repeat(79);
+  assert.equal(m81.length, 81);
+  assert.equal(checkWhat("model", m80), m80);
+  assert.equal(checkWhat("model", m81), null);
+  assert.equal(parse(failureLine({ kind: "model", what: m81 })).what, "?");
+  assert.equal(parse(failureLine({ kind: "model", what: m80 })).what, m80);
+});
+
+test("the fid's time part is the clock truncated to whole ms", () => {
+  const o = parse(failureLine({ kind: "inbox" }, { now: () => FIXED + 0.5, rand: () => 0 }));
+  assert.equal(o.fid, `f-${FIXED.toString(36)}-0000`);
+});
+
+test("stdoutSink writes the line to process.stdout once", () => {
+  const line = failureLine({ kind: "inbox", source: "twist-inbox-retry", what: "consumer", class: "retry", cause: "timeout" });
+  const calls = [];
+  const original = process.stdout.write;
+  process.stdout.write = (...args) => {
+    calls.push(args);
+    return true;
+  };
+  try {
+    stdoutSink(line);
+  } finally {
+    process.stdout.write = original;
+  }
+  assert.deepEqual(calls, [[line]]);
 });
 
 test("rate limiter: the suppressed count is capped at 999999", () => {
