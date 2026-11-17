@@ -28,7 +28,8 @@ import { createProducer } from "./producer.js";
 import { createBotSenders } from "./bot-senders.js";
 import { createMuteList, muteFilePath } from "./mutes.js";
 import { createCriticalNotifier, createLoopBreaker } from "./loop-breaker.js";
-import { createConsumer, REPLAY_HORIZON_MS, ALERT_HEADER, isRepeatIncident } from "./consumer.js";
+import { createConsumer, REPLAY_HORIZON_MS } from "./consumer.js";
+import { createOpsAlert } from "./ops-alert.js";
 import {
   MIN_WEBHOOK_TOKEN_LENGTH,
   createHintDebouncer,
@@ -354,23 +355,14 @@ export async function monitorTwistProvider({ accountId, config, runtime, abortSi
     await react(item, "add", "⏳", signal); // react() is already best-effort; the producer contains throws anyway
   }
 
-  const alert = async (text) => {
-    try {
-      const { kind, id } = resolveOutboundTarget(null, account.defaultTo);
-      // An incident alert already in the thread within 6h is not posted again (restarts reset in-process flags).
-      // A failed read never blocks the alert.
-      const recent = String(text).startsWith(ALERT_HEADER)
-        ? await (kind === "conv" ? client.getConversationMessages(id, { limit: 30 }) : client.getThreadComments(id, { limit: 30 })).catch(() => [])
-        : [];
-      if (isRepeatIncident(recent, text, { botUserId, nowMs: Date.now() })) {
-        log(`alert not repeated (already posted within 6h): ${String(text).split("\n")[1] ?? ""}`.slice(0, 200));
-        return;
-      }
-      await postToTwist({ client, kind, id, text });
-    } catch (err) {
-      log(`alert delivery failed: ${String(err)}`);
-    }
-  };
+  // An incident alert already in the thread within 6h is not posted again; a failed read never blocks it (ops-alert.js).
+  const alert = createOpsAlert({
+    target: () => resolveOutboundTarget(null, account.defaultTo),
+    readRecent: (kind, id) => (kind === "conv" ? client.getConversationMessages(id, { limit: 30 }) : client.getThreadComments(id, { limit: 30 })),
+    post: ({ kind, id, text }) => postToTwist({ client, kind, id, text }),
+    botUserId,
+    log,
+  });
 
   // A Critical goes where Hugh reads (his DM, by default), not the ops thread he doesn't.
   // If that post fails it still goes out, through the ordinary alert path.

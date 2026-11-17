@@ -19,7 +19,7 @@ function setup({ config = CONFIG, file } = {}) {
   const logs = [];
   const alerts = [];
   const mutes = createMuteList({ path, log: (m) => logs.push(m), now: () => clock.t });
-  const breaker = createLoopBreaker({ mutes, notify: async (t) => { alerts.push(t); }, config, log: (m) => logs.push(m), now: () => clock.t, env: {} });
+  const breaker = createLoopBreaker({ mutes, notify: async (t) => { alerts.push(t); }, config, log: (m) => logs.push(m), now: () => clock.t, env: {}, failureSink: () => {} });
   return { path, clock, logs, alerts, mutes, breaker };
 }
 // `n` turns for one peer, `stepMs` apart; returns each admit() verdict.
@@ -124,7 +124,7 @@ test("when the file cannot be written the peer is still muted here, and the aler
 test("a fault inside the breaker lets the turn through", async () => {
   const mutes = { isProtected: () => { throw new Error("boom"); } };
   const logs = [];
-  const breaker = createLoopBreaker({ mutes, notify: async () => {}, config: { ...CONFIG, maxTurns: 1 }, log: (m) => logs.push(m), now: () => NOW, env: {} });
+  const breaker = createLoopBreaker({ mutes, notify: async () => {}, config: { ...CONFIG, maxTurns: 1 }, log: (m) => logs.push(m), now: () => NOW, env: {}, failureSink: () => {} });
   assert.equal(await breaker.admit(item("conv:1")), true);
   assert.equal(await breaker.admit(item("conv:1")), true);
   assert.ok(logs.some((l) => /loop breaker failed/.test(l)));

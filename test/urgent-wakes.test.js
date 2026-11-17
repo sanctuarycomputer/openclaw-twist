@@ -246,6 +246,7 @@ function breakerSetup({ notify = async () => ({ messageId: "4242", dm: true }), 
     log: (m) => logs.push(m),
     now: () => clock.t,
     env: env ?? { OPENCLAW_STATE_DIR: dir },
+    failureSink: () => {},
     ...(appendWake ? { appendWake } : {}),
   });
   /** Three turns 1s apart: the third trips (maxTurns 2). → the third admit's verdict. */
@@ -499,6 +500,7 @@ test("each wake reads the clock once: its id, time and day file agree under a ti
     log: () => {},
     now: tick(NOW),
     env: { OPENCLAW_STATE_DIR: "/x" },
+    failureSink: () => {},
     appendWake: (row, opts) => { seen.push({ row, opts }); return true; },
   });
   for (let i = 0; i < 3; i++) await breaker.admit({ id: `t${i}`, kind: "conv", peerId: "conv:1", senderId: 1, senderName: "A" }, { kind: "dm" });

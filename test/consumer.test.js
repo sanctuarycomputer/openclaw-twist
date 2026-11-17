@@ -38,6 +38,7 @@ async function harness({ items = [], clock = { t: T0 }, runTurn, probe, classify
     react: async (item, verb, emoji) => { calls.reacts.push([item.id, verb, emoji]); },
     alert: async (text) => { calls.alerts.push(text); },
     replyInPlace: async (item, text) => { calls.replies.push([item.id, text]); },
+    failureSink: () => {},
   });
   return { queue, consumer, calls, clock };
 }
