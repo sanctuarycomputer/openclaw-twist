@@ -533,12 +533,18 @@ test("pin: checkWhat model rule", () => {
   // an empty or punctuation-led part is not.
   for (const v of ["a/b/c", "openai/gpt-5:mini", "x.y_z-1/m.n_o-2"]) assert.equal(checkWhat("model", v), v, v);
   for (const v of ["/x", "x/", "-x/y", "x/-y", ".x/y", "x/.y", "a:b/c"]) assert.equal(checkWhat("model", v), null, v);
+  // Each part must start with a letter or digit, and the pattern is anchored at both ends (task-1 T1-4).
+  for (const c of ["_", ".", "-", ":", "/"]) {
+    assert.equal(checkWhat("model", `${c}x/y`), null, `${c}x/y`);
+    assert.equal(checkWhat("model", `x/${c}y`), null, `x/${c}y`);
+  }
+  for (const v of ["!x/y", "x/y!", "x/y z"]) assert.equal(checkWhat("model", v), null, v);
 });
 
 test("pin: name, uuid and fid patterns", () => {
   // A job or tool name (contract §3): starts with a letter or digit, then letters, digits and _ . / : -.
   for (const v of ["a.b", "a/b", "a_b", "a-b", "a:b", "9"]) assert.equal(checkWhat("job", v), v, v);
-  for (const v of ["-x", "_x", ".x", "/x", ":x", "a b", "a+b"]) assert.equal(checkWhat("job", v), null, v);
+  for (const v of ["-x", "_x", ".x", "/x", ":x", "a b", "a+b", "!x", "x!"]) assert.equal(checkWhat("job", v), null, v);
 
   // job_id and run: a lowercase uuid, the whole value.
   const HEXY = ["a".repeat(8), "bbbb", "4ccc", "8ddd", "e".repeat(12)].join("-"); // has letters, so case shows
@@ -552,7 +558,7 @@ test("pin: name, uuid and fid patterns", () => {
   // fid: f-<8 or 9 base-36 chars>-<4 base-36 chars>; anything else is replaced by a generated one.
   const generated = `f-${FIXED.toString(36)}-0000`;
   for (const fid of [`f-${"1".repeat(8)}-abcd`, `f-${"1".repeat(9)}-abcd`]) assert.equal(parse(failureLine({ ...PIN_F, fid }, PIN_OPTS)).fid, fid, fid);
-  for (const fid of [`f-${"1".repeat(7)}-abcd`, `f-${"1".repeat(10)}-abcd`, `f-${"1".repeat(8)}-abcde`, `f-${"1".repeat(8)}-abc`, `x-${"1".repeat(8)}-abcd`]) {
+  for (const fid of [`f-${"1".repeat(7)}-abcd`, `f-${"1".repeat(10)}-abcd`, `f-${"1".repeat(8)}-abcde`, `f-${"1".repeat(8)}-abc`, `x-${"1".repeat(8)}-abcd`, `xf-${"1".repeat(8)}-abcd`]) {
     assert.equal(parse(failureLine({ ...PIN_F, fid }, PIN_OPTS)).fid, generated, fid);
   }
 });
