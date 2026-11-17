@@ -1,6 +1,7 @@
 // State-machine orchestration. All effects are injected; nothing here touches
 // the network or the SDK directly, so the whole delivery guarantee is testable.
 import { contentMentionsBot, fastAckDecision } from "./routing.js";
+import { createRateLimiter, emitFailure, failureCause, stdoutSink } from "./failure-line.js";
 
 export const BACKOFF_MS = [30_000, 120_000, 600_000, 3_600_000, 3_600_000];
 export const MAX_ATTEMPTS = 6;
@@ -120,11 +121,24 @@ export function syncSkipReason(item, nowMs, botUserId, isBotSender = () => false
  * @param {ReturnType<typeof import("./loop-breaker.js").createLoopBreaker>} [deps.loopBreaker]
  *   Asked once per turn, right before it is dispatched; `false` means this turn tripped it and
  *   the peer is now muted, so the item is skipped as `muted` instead. Omitted = no breaker.
+ * @param {(line: string) => unknown} [deps.failureSink] where the failure lines go (failure-line.js); stdout by default.
+ * @param {ReturnType<typeof createRateLimiter>} [deps.failureLimiter] rate-limits the retry lines; a fresh one by default.
  */
-export function createConsumer({ queue, botUserId, now, log, classifyPeer, admission, runTurn, probe, react, alert, replyInPlace, inFlight = new Map(), isBotSender = () => false, isMuted = () => false, loopBreaker }) {
+export function createConsumer({ queue, botUserId, now, log, classifyPeer, admission, runTurn, probe, react, alert, replyInPlace, inFlight = new Map(), isBotSender = () => false, isMuted = () => false, loopBreaker, failureSink = stdoutSink, failureLimiter = createRateLimiter() }) {
   const settlePromises = new Set(); // test-only visibility into in-flight settle() work; see idle()
   let highWaterAlerted = false;
   let storageAlerted = false; // one storage alert per process; monitor's alert() dedupes across restarts
+
+  // One failure line (contract docs/contracts/failure-line.md): fixed fields only, never an id, a name or error text
+  // (`cause` is the closed class failureCause reads from it). Best effort: a broken sink or limiter changes nothing.
+  // Only the retry lines pass the limiter; alert lines are never limited (contract §7).
+  const emitLine = (fields, limiter) => {
+    try {
+      emitFailure({ kind: "inbox", ...fields }, { sink: failureSink, now, limiter });
+    } catch {
+      // emitFailure never throws; nothing to do if it ever did
+    }
+  };
 
   /** Queued items someone is actually waiting on: not backlog, stale or unmentioned (those are only set aside). */
   const waitingItems = () => queue.itemsInState("queued").filter((i) => !syncSkipReason(i, now(), botUserId, isBotSender, isMuted));
@@ -133,9 +147,11 @@ export function createConsumer({ queue, botUserId, now, log, classifyPeer, admis
     log(`queue persist failed${item ? ` for ${item.id}` : ""}: ${String(err)}`);
     if (storageAlerted) return;
     storageAlerted = true;
+    const at = now();
     const waiting = waitingItems();
     if (item && !syncSkipReason(item, now(), botUserId, isBotSender, isMuted) && !waiting.some((w) => w.id === item.id)) waiting.push(item);
-    await safeAlert(storageAlertText(waiting));
+    const alerted = (await safeAlert(storageAlertText(waiting))) !== false;
+    emitLine({ source: "twist-inbox-storage", what: "storage", class: "storage", cause: failureCause(String(err)), alerted, at });
   }
   let ticking = false; // reentrancy guard: tick() must never run two claim passes concurrently
 
@@ -150,12 +166,14 @@ export function createConsumer({ queue, botUserId, now, log, classifyPeer, admis
   }
 
   // Same contract as safeReact, for the ops alert: a failing alert channel must never
-  // escape settle() (tick() fires it and forgets).
+  // escape settle() (tick() fires it and forgets). Returns the alert's result, and true when it threw: an alert
+  // that was tried and failed still counts as alerted (failure-line contract §8); only `false` means held back.
   async function safeAlert(text) {
     try {
-      await alert(text);
+      return await alert(text);
     } catch (err) {
       log(`alert delivery failed: ${String(err)}`);
+      return true;
     }
   }
 
@@ -208,10 +226,12 @@ export function createConsumer({ queue, botUserId, now, log, classifyPeer, admis
    * branch of settle() and the poison-orphan branch of recoverOrphans().
    */
   async function deadLetter(item, errText, attempts) {
+    const at = now();
     await safeReact(item, "add", "❌");
     await queue.transition(item.id, { state: "failed", lastError: errText }, now());
     await replyInPlace(item, "I hit an error answering this and have exhausted retries — it's been flagged for review.").catch(() => {});
-    await alert(deadLetterAlertText(item, attempts, errText)).catch(() => {});
+    const alerted = await alert(deadLetterAlertText(item, attempts, errText)).then((r) => r !== false, () => true);
+    emitLine({ source: "twist-inbox-dead-letter", what: "dead-letter", class: "dead-letter", cause: failureCause(errText), alerted, at });
   }
 
   // Bookkeeping ON TOP OF an already-failed turn: classify the error and record the verdict
@@ -234,6 +254,7 @@ export function createConsumer({ queue, botUserId, now, log, classifyPeer, admis
     // reaction is idempotent, so the retry's claim-time add is a no-op.
     const delay = BACKOFF_MS[Math.min(attempts - 1, BACKOFF_MS.length - 1)];
     log(`turn failed for ${item.id} (attempt ${attempts}), retrying in ${delay}ms: ${String(err)}`);
+    emitLine({ source: "twist-inbox-retry", what: "consumer", class: "retry", cause: failureCause(String(err)), alerted: false, attempt: attempts, at: now() }, failureLimiter);
     await queue.transition(item.id, { state: "queued", nextAttemptAt: now() + delay, lastError: String(err) }, now());
   }
 
@@ -376,13 +397,17 @@ export function createConsumer({ queue, botUserId, now, log, classifyPeer, admis
         const waiting = waitingItems();
         if (!highWaterAlerted && waiting.length > HIGH_WATER) {
           highWaterAlerted = true;
-          await safeAlert(backlogAlertText(waiting, now()));
+          const at = now();
+          const alerted = (await safeAlert(backlogAlertText(waiting, at))) !== false;
+          emitLine({ source: "twist-inbox-backlog", what: "backlog", class: "backlog", cause: "none", alerted, at });
         }
         for (const [peerId, f] of inFlight) {
           if (!f.hungAlerted && now() - f.startedAt > HUNG_TURN_ALERT_MS) {
             f.hungAlerted = true;
+            const at = now();
             log(`turn for ${f.id} (${peerId}) running > ${HUNG_TURN_ALERT_MS / 60000}min`);
-            await alert(hungTurnAlertText(HUNG_TURN_ALERT_MS / 60000)).catch(() => {});
+            const alerted = await alert(hungTurnAlertText(HUNG_TURN_ALERT_MS / 60000)).then((r) => r !== false, () => true);
+            emitLine({ source: "twist-inbox-hung-turn", what: "watchdog", class: "hung-turn", cause: "none", alerted, at });
           }
         }
         // Drain first, claim second: the whole point is that an unanswerable backlog never

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createOpsAlert } from "../src/ops-alert.js";
 import { ALERT_HEADER } from "../src/consumer.js";
 
-const NOW = Date.parse("2026-11-17T12:00:00.000Z");
+const NOW = Date.parse("2031-01-01T00:00:00.000Z"); // far from any real clock, so a now() → Date.now() slip fails
 const BOT = 4242;
 const TEXT = `${ALERT_HEADER}\nNeeds Hugh: the bot has stopped keeping up with Twist: 51 messages are waiting.`;
 const TARGET = { kind: "thread", id: 777 };
