@@ -532,6 +532,8 @@ test("pin: checkWhat model rule", () => {
   // Contract §3's provider/model pattern (task-1 T1-2): more slashes and a colon after the first slash are fine;
   // an empty or punctuation-led part is not.
   for (const v of ["a/b/c", "openai/gpt-5:mini", "x.y_z-1/m.n_o-2"]) assert.equal(checkWhat("model", v), v, v);
+  // Each part may be one character, and may start with a digit (task-1 T1-6, T1-7).
+  for (const v of ["x/y", "9x/y", "x/9y", "9/9"]) assert.equal(checkWhat("model", v), v, v);
   for (const v of ["/x", "x/", "-x/y", "x/-y", ".x/y", "x/.y", "a:b/c"]) assert.equal(checkWhat("model", v), null, v);
   // Each part must start with a letter or digit, and the pattern is anchored at both ends (task-1 T1-4).
   for (const c of ["_", ".", "-", ":", "/"]) {
@@ -543,7 +545,7 @@ test("pin: checkWhat model rule", () => {
 
 test("pin: name, uuid and fid patterns", () => {
   // A job or tool name (contract §3): starts with a letter or digit, then letters, digits and _ . / : -.
-  for (const v of ["a.b", "a/b", "a_b", "a-b", "a:b", "9"]) assert.equal(checkWhat("job", v), v, v);
+  for (const v of ["a.b", "a/b", "a_b", "a-b", "a:b", "9", "x", "9a", "a9"]) assert.equal(checkWhat("job", v), v, v);
   for (const v of ["-x", "_x", ".x", "/x", ":x", "a b", "a+b", "!x", "x!"]) assert.equal(checkWhat("job", v), null, v);
 
   // job_id and run: a lowercase uuid, the whole value.
@@ -554,10 +556,20 @@ test("pin: name, uuid and fid patterns", () => {
   for (const bad of [HEXY.toUpperCase(), `x${HEXY}`, `${HEXY}x`, HEXY.slice(0, -1) + "g"]) {
     assert.equal(failureLine({ ...PIN_F, job_id: bad, run: bad }, PIN_OPTS), bare, bad);
   }
+  const groups = HEXY.split("-");
+  for (let i = 0; i < groups.length; i++) {
+    for (const g of [groups[i].slice(1), groups[i] + groups[i][0]]) {
+      const bad = groups.map((x, j) => (j === i ? g : x)).join("-");
+      assert.equal(failureLine({ ...PIN_F, job_id: bad, run: bad }, PIN_OPTS), bare, bad);
+    }
+  }
 
   // fid: f-<8 or 9 base-36 chars>-<4 base-36 chars>; anything else is replaced by a generated one.
   const generated = `f-${FIXED.toString(36)}-0000`;
-  for (const fid of [`f-${"1".repeat(8)}-abcd`, `f-${"1".repeat(9)}-abcd`]) assert.equal(parse(failureLine({ ...PIN_F, fid }, PIN_OPTS)).fid, fid, fid);
+  for (const fid of [`f-${"1".repeat(8)}-abcd`, `f-${"1".repeat(9)}-abcd`, `f-${"z".repeat(8)}-1234`]) assert.equal(parse(failureLine({ ...PIN_F, fid }, PIN_OPTS)).fid, fid, fid);
+  for (const fid of [`f-${"1".repeat(8)}-abcd`.toUpperCase(), `f-${"1".repeat(8)}-ABCD`, `f-${"1".repeat(8)}_abcd`, `f${"1".repeat(8)}-abcd`]) {
+    assert.equal(parse(failureLine({ ...PIN_F, fid }, PIN_OPTS)).fid, generated, fid);
+  }
   for (const fid of [`f-${"1".repeat(7)}-abcd`, `f-${"1".repeat(10)}-abcd`, `f-${"1".repeat(8)}-abcde`, `f-${"1".repeat(8)}-abc`, `x-${"1".repeat(8)}-abcd`, `xf-${"1".repeat(8)}-abcd`]) {
     assert.equal(parse(failureLine({ ...PIN_F, fid }, PIN_OPTS)).fid, generated, fid);
   }
