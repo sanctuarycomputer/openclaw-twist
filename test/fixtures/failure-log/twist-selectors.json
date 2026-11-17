@@ -1,0 +1,63 @@
+[
+  {
+    "id": "inbox-dead-letter",
+    "source": "twist-inbox-dead-letter",
+    "header": "Twist Inbox",
+    "destinations": [
+      "thread"
+    ],
+    "body": {
+      "source": "^Needs Hugh: the bot couldn't answer .+ message after \\d+ tries",
+      "flags": ""
+    }
+  },
+  {
+    "id": "inbox-storage",
+    "source": "twist-inbox-storage",
+    "header": "Twist Inbox",
+    "destinations": [
+      "thread"
+    ],
+    "body": {
+      "source": "^Needs Hugh: the bot can't save its Twist inbox",
+      "flags": ""
+    }
+  },
+  {
+    "id": "inbox-backlog",
+    "source": "twist-inbox-backlog",
+    "header": "Twist Inbox",
+    "destinations": [
+      "thread"
+    ],
+    "body": {
+      "source": "^Needs Hugh: the bot has stopped keeping up with Twist: ",
+      "flags": ""
+    }
+  },
+  {
+    "id": "inbox-hung-turn",
+    "source": "twist-inbox-hung-turn",
+    "header": "Twist Inbox",
+    "destinations": [
+      "thread"
+    ],
+    "body": {
+      "source": "^Needs Hugh: a reply has been running for over \\d+ minutes",
+      "flags": ""
+    }
+  },
+  {
+    "id": "inbox-loop-breaker",
+    "source": "twist-inbox-loop-breaker",
+    "header": "Twist Inbox",
+    "destinations": [
+      "dm",
+      "thread"
+    ],
+    "body": {
+      "source": "^Critical: .+ looks like a loop\\.",
+      "flags": ""
+    }
+  }
+]

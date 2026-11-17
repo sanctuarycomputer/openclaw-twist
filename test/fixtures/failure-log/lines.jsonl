@@ -1,0 +1,7 @@
+{"v":1,"fid":"f-mwkn4ao0-0001","at":"2026-11-17T12:00:00.000Z","kind":"job","source":"job-failure-alert","what":"daily-digest","class":"exec-failed","cause":"timeout","alerted":true,"streak":2,"session":"cron","job_id":"3f6b2c1e-8a4d-4f0e-9b7a-1c2d3e4f5a6b","run":"7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d"}
+{"v":1,"fid":"f-mwkn4bfs-0002","at":"2026-11-17T12:00:01.000Z","kind":"sync","source":"notion-sync-failure","what":"jobs-status","class":"unknown","cause":"http-5xx","alerted":false}
+{"v":1,"fid":"f-mwkn4c7k-0003","at":"2026-11-17T12:00:02.000Z","kind":"check","source":"self-model-check","what":"stale","class":"stale","cause":"none","alerted":true}
+{"v":1,"fid":"f-mwkn4czc-0004","at":"2026-11-17T12:00:03.000Z","kind":"inbox","source":"twist-inbox-retry","what":"consumer","class":"retry","cause":"connection","alerted":false,"attempt":2}
+{"v":1,"fid":"f-mwkn4dr4-0005","at":"2026-11-17T12:00:04.000Z","kind":"tool","source":"gateway","what":"apply_patch","class":"exec-failed","cause":"unknown","alerted":false,"session":"user","run":"0b1c2d3e-4f5a-4b6c-9d7e-8f9a0b1c2d3e"}
+{"v":1,"fid":"f-mwkn4eiw-0006","at":"2026-11-17T12:00:05.000Z","kind":"turn","source":"gateway","what":"cron","class":"incomplete-turn","cause":"unknown","alerted":false,"session":"cron","job_id":"3f6b2c1e-8a4d-4f0e-9b7a-1c2d3e4f5a6b","run":"7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d"}
+{"v":1,"fid":"f-mwkn4fao-0007","at":"2026-11-17T12:00:06.000Z","kind":"model","source":"gateway","what":"anthropic/claude-sonnet-5","class":"model-error","cause":"connection","alerted":false,"suppressed":3}
