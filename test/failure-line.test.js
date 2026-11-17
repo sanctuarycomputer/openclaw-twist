@@ -124,6 +124,41 @@ test("the guard: failureLine closes the line", () => {
   assert.equal(o.at, new Date(FIXED).toISOString());
 });
 
+test("the guard: only own properties are read (inherited fields never reach the line)", () => {
+  const ITEM = "conv-msg:" + 1349360 + ":" + 77;
+  const SECRET = "sk-" + "a1".repeat(12);
+  const proto = {
+    kind: "inbox",
+    source: "twist-inbox-retry",
+    what: "consumer",
+    class: "retry",
+    cause: "timeout",
+    alerted: true,
+    streak: 3,
+    session: "cron",
+    job_id: UUID,
+    run: UUID,
+    attempt: 2,
+    suppressed: 4,
+    fid: `f-${(FIXED - 1000).toString(36)}-abcd`,
+    at: new Date(FIXED - 1000).toISOString(),
+    item: ITEM,
+    error: SECRET,
+  };
+  const line = failureLine(Object.create(proto), { now: () => FIXED, rand: () => 0 });
+  const o = parse(line);
+  assert.deepEqual(o, { v: 1, fid: `f-${FIXED.toString(36)}-0000`, at: new Date(FIXED).toISOString(), kind: "?", source: "?", what: "?", class: "unknown", cause: "unknown", alerted: false });
+  for (const needle of [ITEM, SECRET, "1349360", UUID, "twist-inbox-retry", "consumer"]) assert.ok(!line.includes(needle), needle);
+});
+
+test("rate limiter: the suppressed count is capped at 999999", () => {
+  const f = { kind: "inbox", source: "twist-inbox-retry", what: "consumer", class: "retry", cause: "timeout", alerted: false };
+  const lim = createRateLimiter();
+  assert.deepEqual(lim.admit(f, 0), { write: true });
+  for (let i = 0; i < 1_000_001; i++) lim.admit(f, 0);
+  assert.deepEqual(lim.admit(f, 60_000), { write: true, suppressed: 999999 });
+});
+
 test("the guard: an over-long line drops optional fields in OPTIONAL_DROP_ORDER", () => {
   const fields = {
     fid: `f-${FIXED.toString(36)}-0000`,
