@@ -85,22 +85,22 @@ A reply that triggers a reply never stops on its own. From 2026-10-02 to 11-10 t
 
 ### Failure lines
 
-Each failure the inbox hits writes one line to the gateway's stdout, which is Render's log: `STACKSBOT_FAILURE ` and a single JSON object, in the shape of stacksbot's `docs/contracts/failure-line.md` 1.0 (`kind: "inbox"`, `fid`, `at`, `source`, `what`, `class`, `cause`, `alerted`, and sometimes `attempt` or `suppressed`). Stacksbot reads them from there; nothing is sent anywhere else. The code is `src/failure-line.js` (formatter, rate limiter, sinks) and `src/ops-alert.js`.
+The failure points below each write one line to the gateway's stdout, which is Render's log: `STACKSBOT_FAILURE ` and a single JSON object, in the shape of stacksbot's `docs/contracts/failure-line.md` 1.0 (`v`, `kind: "inbox"`, `fid`, `at`, `source`, `what`, `class`, `cause`, `alerted`, and sometimes `attempt` or `suppressed`). Stacksbot reads them from there; nothing is sent anywhere else. A permanent error (the item is skipped as `gone`), a bot drop, a mute without a loop trip and a repeat storage failure write no line. The code is `src/failure-line.js` (formatter, rate limiter, sinks) and `src/ops-alert.js`.
 
 | When | `source` | `what` |
 |---|---|---|
 | A turn failed and will be retried | `twist-inbox-retry` | `consumer` |
 | An item is given up on (dead letter) | `twist-inbox-dead-letter` | `dead-letter` |
-| The queue or cursor file can't be written | `twist-inbox-storage` | `storage` |
+| The queue file can't be written and the storage alert goes out (once per process) | `twist-inbox-storage` | `storage` |
 | The backlog alert fires | `twist-inbox-backlog` | `backlog` |
 | A hung turn is found by the watchdog | `twist-inbox-hung-turn` | `watchdog` |
-| A loop guard trips | `twist-inbox-loop-breaker` | `loop-breaker` |
+| The loop breaker trips | `twist-inbox-loop-breaker` | `loop-breaker` |
 
 A line holds only enums, numbers, times and a fixed step name: never a comment, conversation, thread or user id, a name, or error text. `cause` is a class of the error (`timeout`, `http-5xx`, `connection`, `none`, …), worked out in memory from its text, which is then dropped.
 
 - **Retries are rate-limited**: one line per key per 60 s, and the next line for that key carries `suppressed`, the count dropped in between. The limiter is in memory, so a restart resets it.
 - **Alert lines are never rate-limited.** Each Twist alert (dead letter, storage, backlog, hung turn, loop trip) finds its own line.
-- **`alerted` is `false`** when a repeat incident is held back, or no alert goes out (and always on a retry line); `true` when this pass sends the post.
+- **`alerted` is `false`** when a repeat incident is held back, or no alert goes out (and always on a retry line); `true` when this pass sends the post, and a post that is tried and then fails still counts as `true` (contract §8).
 - Lines are written with `process.stdout`, never `console` or the plugin logger, so nothing wraps them. A failure to write a line never fails a turn.
 
 ### Webhook ingress (optional, off by default)
