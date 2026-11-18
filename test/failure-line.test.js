@@ -875,3 +875,71 @@ test("pin: a real Date as at is kept", () => {
   const at = new Date(FIXED - 5_000);
   assert.equal(parse(failureLine({ ...PIN_F, at }, PIN_OPTS)).at, at.toISOString());
 });
+
+test("pin: failureCause rows are tried in contract §3's order", () => {
+  // Contract §3's table, top to bottom, with a text that only its own row matches.
+  const rows = [
+    ["billing", "billing"],
+    ["rate limit", "rate-limited"],
+    ["429", "http-429"],
+    ["timeout", "timeout"],
+    ["ECONNRESET", "connection"],
+    ["http 503", "http-5xx"],
+    ["status 404", "http-4xx"],
+  ];
+  for (const [text, cause] of rows) assert.equal(failureCause(text), cause, text);
+  for (let i = 0; i < rows.length; i++) {
+    for (let j = i + 1; j < rows.length; j++) {
+      const [a, first] = rows[i];
+      const [b] = rows[j];
+      assert.equal(failureCause(`${a} ${b}`), first, `${a} ${b}`);
+      assert.equal(failureCause(`${b} ${a}`), first, `${b} ${a}`);
+    }
+  }
+  // Any other value is String()ed.
+  assert.equal(failureCause(429), "http-429");
+  assert.equal(failureCause(402), "billing");
+  assert.equal(failureCause(new Error("ECONNRESET")), "connection");
+  assert.equal(failureCause("code404"), "unknown");
+});
+
+test("pin: the rate limiter's key is all five fields, and a new window starts a new count", () => {
+  const f = { kind: "inbox", source: "twist-inbox-retry", what: "consumer", class: "retry", cause: "timeout", alerted: false };
+  const other = { kind: "tool", source: "twist-inbox-dead-letter", what: "dead-letter", class: "dead-letter", cause: "connection" };
+  for (const key of Object.keys(other)) {
+    const lim = createRateLimiter();
+    assert.deepEqual(lim.admit(f, 0), { write: true });
+    assert.deepEqual(lim.admit({ ...f, [key]: other[key] }, 1), { write: true }, `${key} alone makes a new key`);
+    assert.deepEqual(lim.admit(f, 2), { write: false });
+  }
+  // Contract §7: suppressed counts the lines dropped since the key's last line, so it starts again at each window.
+  const lim = createRateLimiter();
+  assert.deepEqual(lim.admit(f, 0), { write: true });
+  assert.deepEqual(lim.admit(f, 1), { write: false });
+  assert.deepEqual(lim.admit(f, 60_000), { write: true, suppressed: 1 });
+  assert.deepEqual(lim.admit(f, 120_000), { write: true }, "nothing dropped since the counted line");
+  assert.deepEqual(lim.admit(f, 120_001), { write: false });
+  assert.deepEqual(lim.admit(f, 120_002), { write: false });
+  assert.deepEqual(lim.admit(f, 180_000), { write: true, suppressed: 2 });
+});
+
+test("pin: the secret-shape and session-key rules hold for every free-text kind", () => {
+  // Contract §3: "For every kind ... two more rules". inbox and turn take only fixed names, so neither rule can be reached there.
+  const mixed = "b".repeat(19) + "1";
+  const prefix = ["s", "k-"].join("");
+  const values = {
+    job: { ok: "nightly-run", secret: mixed, token: `${prefix}x`, agent: "agent:x", colons: "a:b:c" },
+    sync: { ok: "fatal", secret: mixed, token: `${prefix}x`, agent: "agent:x", colons: "a:b:c" },
+    check: { ok: "stale", secret: mixed, token: `${prefix}x`, agent: "agent:x", colons: "a:b:c" },
+    tool: { ok: "twist_search", secret: mixed, token: `${prefix}x`, agent: "agent:x", colons: "a:b:c" },
+    model: { ok: "a/b", secret: `a/${mixed}`, token: `a/${prefix}x`, colons: "a/b:c:d" },
+  };
+  for (const [kind, v] of Object.entries(values)) {
+    assert.equal(checkWhat(kind, v.ok), v.ok, `${kind} control`);
+    for (const rule of ["secret", "token", "agent", "colons"]) {
+      if (v[rule] === undefined) continue;
+      assert.equal(checkWhat(kind, v[rule]), null, `${kind} ${rule}`);
+    }
+  }
+  assert.equal(checkWhat("job", "agent-x:y"), "agent-x:y", "one colon and no agent: prefix is kept");
+});
