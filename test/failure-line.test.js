@@ -13,6 +13,7 @@ import {
   MAX_LINE_BYTES,
   SKEW_MS,
   MAX_DELAY_MS,
+  RATE_WINDOW_MS,
   FIELD_ORDER,
   OPTIONAL_DROP_ORDER,
   checkWhat,
@@ -189,6 +190,10 @@ test("the guard: what is at most 80 characters for a model too", () => {
 test("the fid's time part is the clock truncated to whole ms", () => {
   const o = parse(failureLine({ kind: "inbox" }, { now: () => FIXED + 0.5, rand: () => 0 }));
   assert.equal(o.fid, `f-${FIXED.toString(36)}-0000`);
+  for (const frac of [0.5, 0.9]) {
+    const made = parse(failureLine({ kind: "inbox" }, { now: () => FIXED + frac, rand: () => 0 }));
+    assert.equal(made.at, new Date(FIXED).toISOString(), `pin: the made at is truncated too (${frac})`);
+  }
 });
 
 test("stdoutSink writes the line to process.stdout once", () => {
@@ -694,9 +699,9 @@ test("pin: CLASSES, CAUSES and SESSIONS are the contract's", () => {
   const causes = ["http-4xx", "http-5xx", "http-429", "timeout", "connection", "billing", "rate-limited", "bot-down", "none", "unknown"];
   const sessions = ["cron", "user", "heartbeat", "subagent", "other"];
   assert.deepEqual([classes.length, causes.length, sessions.length], [27, 10, 5]);
-  assert.deepEqual([...CLASSES].sort(), [...classes].sort());
-  assert.deepEqual([...CAUSES].sort(), [...causes].sort());
-  assert.deepEqual([...SESSIONS].sort(), [...sessions].sort());
+  assert.deepEqual([...CLASSES], classes, "CLASSES in the contract's order");
+  assert.deepEqual([...CAUSES], causes, "CAUSES in the contract's order");
+  assert.deepEqual([...SESSIONS], sessions, "SESSIONS in the contract's order");
   for (const c of classes) assert.equal(parse(failureLine({ ...PIN_F, class: c }, PIN_OPTS)).class, c, c);
   for (const c of causes) assert.equal(parse(failureLine({ ...PIN_F, cause: c }, PIN_OPTS)).cause, c, c);
   for (const s of sessions) assert.equal(parse(failureLine({ ...PIN_F, session: s }, PIN_OPTS)).session, s, s);
@@ -734,8 +739,8 @@ test("pin: KINDS and INBOX_STEPS are the contract's", () => {
   const kinds = ["job", "sync", "check", "inbox", "tool", "turn", "model"];
   const steps = ["consumer", "dead-letter", "loop-breaker", "storage", "backlog", "watchdog"];
   assert.deepEqual([kinds.length, steps.length], [7, 6]);
-  assert.deepEqual([...KINDS].sort(), [...kinds].sort());
-  assert.deepEqual([...INBOX_STEPS].sort(), [...steps].sort());
+  assert.deepEqual([...KINDS], kinds, "KINDS in the contract's order");
+  assert.deepEqual([...INBOX_STEPS], steps, "INBOX_STEPS in the contract's order");
   for (const k of kinds) assert.equal(parse(failureLine({ ...PIN_F, kind: k }, PIN_OPTS)).kind, k, k);
   for (const k of ["extra", "inboxes", "Job", ""]) assert.equal(parse(failureLine({ ...PIN_F, kind: k }, PIN_OPTS)).kind, "?", k);
   for (const s of steps) assert.equal(checkWhat("inbox", s), s, s);
@@ -964,7 +969,10 @@ test("pin: v, at and alerted take only their contract §3 values", () => {
   const at = (value) => parse(failureLine({ ...PIN_F, at: value }, opts)).at;
   assert.equal(at("2026-11-16T08:30:00Z"), "2026-11-16T08:30:00.000Z");
   assert.equal(at("2026-11-16T09:30:00+01:00"), "2026-11-16T08:30:00.000Z");
-  assert.equal(at("16 Nov 2026 08:30 UTC"), "2026-11-16T08:30:00.000Z");
+  assert.equal(at("2026-11-16"), "2026-11-16T00:00:00.000Z", "a date-only form is UTC (ECMAScript Date Time String Format)");
+  for (const bad of [null, true, false, { toString: () => "2026-11-16T08:30:00Z" }, { valueOf: () => FIXED - 9_000 }]) {
+    assert.equal(at(bad), new Date(FIXED).toISOString(), `at ${JSON.stringify(bad)} gives the clock`);
+  }
   assert.equal(at(Date.parse("2026-11-16T00:00:00.000Z")), "2026-11-16T00:00:00.000Z");
   for (const bad of ["soon", "", Number.NaN, Infinity, {}, [FIXED]]) assert.equal(at(bad), new Date(FIXED).toISOString(), `at ${String(bad)}`);
 });
@@ -1023,4 +1031,48 @@ test("pin: the default limiter tracks 10000 keys", () => {
   assert.deepEqual(lim.admit(key(10_000), 1), { write: true }, "the 10001st key is written untracked");
   assert.deepEqual(lim.admit(key(9_999), 1), { write: false }, "the 10000th key is tracked");
   assert.deepEqual(lim.admit(key(0), 1), { write: false }, "the first key is tracked");
+});
+
+test("pin: list order, RATE_WINDOW_MS, and the rules' edges from final-4", () => {
+  // Contract §3's source list, in its table's order.
+  const sources = [
+    "job-failure-alert",
+    "notion-sync-failure",
+    "deploy-smoke-test",
+    "self-model-check",
+    "spend-guard-session",
+    "spend-guard-credit",
+    "fix-run-flagged",
+    "twist-inbox-dead-letter",
+    "twist-inbox-storage",
+    "twist-inbox-backlog",
+    "twist-inbox-hung-turn",
+    "twist-inbox-loop-breaker",
+    "system-cron",
+    "job-delivery",
+    "twist-inbox-retry",
+    "gateway",
+  ];
+  assert.deepEqual([...SOURCES], sources, "SOURCES in the contract's order");
+  // Contract §7.
+  assert.equal(RATE_WINDOW_MS, 60000);
+
+  // A secret-shaped run longer than 20 is refused wherever its digit or letter falls.
+  const l20 = "b".repeat(20);
+  const d20 = "1".repeat(20);
+  for (const v of [`${l20}1`, `x-${l20}1`, `${d20}b`, `x-${d20}b`, `${"b".repeat(30)}1`, `${l20}1${l20}`]) assert.equal(checkWhat("job", v), null, v);
+
+  // inbox and turn don't take each other's names.
+  for (const s of ["cron", "user", "heartbeat", "subagent", "other"]) assert.equal(checkWhat("inbox", s), null, `inbox ${s}`);
+  for (const s of ["consumer", "dead-letter", "loop-breaker", "storage", "backlog", "watchdog"]) assert.equal(checkWhat("turn", s), null, `turn ${s}`);
+
+  // The kind must be the string itself.
+  for (const kind of [["job"], { toString: () => "job" }, new String("job")]) assert.equal(checkWhat(kind, "nightly-run"), null, String(kind));
+
+  // The limiter prunes only when the map is full: a finished entry stays while there is room.
+  const lim = createRateLimiter({ maxKeys: 2 });
+  const f = { kind: "inbox", source: "twist-inbox-retry", what: "consumer", class: "retry", cause: "timeout", alerted: false };
+  assert.deepEqual(lim.admit(f, 100_000), { write: true });
+  assert.deepEqual(lim.admit({ ...f, cause: "connection" }, 200_000), { write: true });
+  assert.deepEqual(lim.admit(f, 150_000), { write: false }, "a's entry was not pruned while the map had room");
 });
