@@ -602,8 +602,9 @@ function contractFid(v) {
 // One character of each kind: letters at both ends of the alphabet, digits, uppercase, every punctuation the patterns
 // use, and some they don't.
 const PROBES = ["a", "z", "0", "9", "A", "Z", "_", ".", "-", "/", ":", " ", "+", "!", "@", "#"];
-/** Every value made by putting one probe at one position of `value`. */
-const swaps = (value) => [...value].flatMap((_, i) => PROBES.map((c) => value.slice(0, i) + c + value.slice(i + 1)));
+/** Every value made by putting one probe, or the position's own character uppercased, at one position of `value`. */
+const swaps = (value) =>
+  [...value].flatMap((own, i) => [...PROBES, own.toUpperCase()].map((c) => value.slice(0, i) + c + value.slice(i + 1)));
 
 test("pin: every position of each pattern, swapped", () => {
   // checkWhat trims and lowercases before it checks, and refuses two colons; the base values have no colon and are
