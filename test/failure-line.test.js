@@ -943,3 +943,72 @@ test("pin: the secret-shape and session-key rules hold for every free-text kind"
   }
   assert.equal(checkWhat("job", "agent-x:y"), "agent-x:y", "one colon and no agent: prefix is kept");
 });
+
+/** A random source that steps through base36 digits 0, 1, 2, ... in turn, one per call, so each fid tail is known. */
+const steppedRand = () => {
+  let i = 0;
+  return () => ((i++ % 36) + 0.5) / 36;
+};
+
+test("pin: v, at and alerted take only their contract §3 values", () => {
+  const opts = { now: () => FIXED, rand: () => 0 };
+  // `v` is always 1, whatever the caller gives.
+  for (const v of [2, 0, "1", null, true, 1.5]) assert.equal(parse(failureLine({ ...PIN_F, v }, opts)).v, 1, `v ${String(v)}`);
+  // `alerted` is true only for the boolean true.
+  assert.equal(parse(failureLine({ ...PIN_F, alerted: true }, opts)).alerted, true);
+  for (const alerted of [1, "1", "true", [1], [true], {}, { valueOf: () => true }, false, 0, null]) {
+    assert.equal(parse(failureLine({ ...PIN_F, alerted }, opts)).alerted, false, `alerted ${JSON.stringify(alerted)}`);
+  }
+  // `at` is written in toISOString() form only; a time in another form is converted, a non-time gives the clock.
+  const at = (value) => parse(failureLine({ ...PIN_F, at: value }, opts)).at;
+  assert.equal(at("2026-11-17T12:00:00Z"), "2026-11-17T12:00:00.000Z");
+  assert.equal(at("2026-11-17T13:00:00+01:00"), "2026-11-17T12:00:00.000Z");
+  assert.equal(at("17 Nov 2026 12:00 UTC"), "2026-11-17T12:00:00.000Z");
+  assert.equal(at(Date.parse("2026-11-16T00:00:00.000Z")), "2026-11-16T00:00:00.000Z");
+  for (const bad of ["soon", "", Number.NaN, Infinity, {}, [FIXED]]) assert.equal(at(bad), new Date(FIXED).toISOString(), `at ${String(bad)}`);
+});
+
+test("pin: the fid's tail is four base36 digits from the random source", () => {
+  const ms36 = FIXED.toString(36);
+  assert.equal(parse(failureLine(PIN_F, { now: () => FIXED, rand: steppedRand() })).fid, `f-${ms36}-0123`);
+  const picks = [0.5 / 36, 1.5 / 36, 10.5 / 36, 35.5 / 36];
+  let k = 0;
+  assert.equal(parse(failureLine(PIN_F, { now: () => FIXED, rand: () => picks[k++] })).fid, `f-${ms36}-01az`);
+});
+
+test("pin: emitFailure reads the caller's fields once and passes its clock and random source on", () => {
+  let reads = 0;
+  const fields = { ...PIN_F, alerted: false };
+  Object.defineProperty(fields, "what", { enumerable: true, get: () => (reads++, "consumer") });
+  const got = [];
+  const sink = (l) => got.push(l);
+  const limiter = createRateLimiter();
+  const rand = steppedRand();
+  let t = FIXED;
+  const now = () => t;
+  assert.equal(emitFailure(fields, { sink, now, rand, limiter }), true);
+  t += 1_000;
+  assert.equal(emitFailure(fields, { sink, now, rand, limiter }), false);
+  t += 60_000;
+  assert.equal(emitFailure(fields, { sink, now, rand, limiter }), true);
+  assert.equal(reads, 3, "one read of what per call");
+  assert.equal(got.length, 2);
+  const [first, counted] = got.map(parse);
+  assert.equal(first.fid, `f-${FIXED.toString(36)}-0123`);
+  assert.equal(first.at, new Date(FIXED).toISOString());
+  // The dropped call drew 4567; the counted line keeps the fid made by its own one read.
+  assert.equal(counted.fid, `f-${(FIXED + 61_000).toString(36)}-89ab`);
+  assert.equal(counted.at, new Date(FIXED + 61_000).toISOString());
+  assert.equal(counted.suppressed, 1);
+});
+
+test("pin: the name pattern holds for every name kind, and what is String()ed", () => {
+  for (const kind of ["job", "sync", "check", "tool"]) {
+    assert.equal(checkWhat(kind, "a-b_c.d/e:f"), "a-b_c.d/e:f", `${kind} control`);
+    for (const bad of ["a b", "_x", "-x", ".x", "a#b", "aé", "a,b", "a".repeat(81)]) assert.equal(checkWhat(kind, bad), null, `${kind} ${bad}`);
+    assert.equal(checkWhat(kind, 5), "5", `${kind} 5`);
+    assert.equal(checkWhat(kind, 0), "0", `${kind} 0`);
+    assert.equal(checkWhat(kind, false), "false", `${kind} false`);
+    assert.equal(checkWhat(kind, " Mixed-Case "), "mixed-case", `${kind} trimmed and lowercased`);
+  }
+});
