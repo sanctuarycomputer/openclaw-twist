@@ -599,16 +599,15 @@ function contractFid(v) {
   const parts = v.split("-");
   return parts.length === 3 && parts[0] === "f" && [8, 9].includes(parts[1].length) && parts[2].length === 4 && [...parts[1] + parts[2]].every(alnum);
 }
-// One character of each kind: letters at both ends of the alphabet, digits, uppercase, every punctuation the patterns
-// use, and some they don't.
-const PROBES = ["a", "z", "0", "9", "A", "Z", "_", ".", "-", "/", ":", " ", "+", "!", "@", "#"];
+// Every printable ASCII character, plus tab, newline and a non-ASCII letter (task-1 T1-13, T1-14).
+const PROBES = [...Array.from({ length: 95 }, (_, i) => String.fromCharCode(32 + i)), "\t", "\n", "\u00e9"];
 /** Every value made by putting one probe, or the position's own character uppercased, at one position of `value`. */
 const swaps = (value) =>
   [...value].flatMap((own, i) => [...PROBES, own.toUpperCase()].map((c) => value.slice(0, i) + c + value.slice(i + 1)));
 
 test("pin: every position of each pattern, swapped", () => {
-  // checkWhat trims and lowercases before it checks, and refuses two colons; the base values have no colon and are
-  // too short for the secret-shape rule.
+  // checkWhat trims and lowercases before it checks, and refuses two colons; the name base has no colon and the model
+  // base one, and both are too short for the secret-shape rule (a single swap makes no token prefix).
   const norm = (v) => v.trim().toLowerCase();
   for (const v of swaps("ab.c-d_e/f")) {
     const n = norm(v);
