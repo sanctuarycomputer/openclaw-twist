@@ -1012,3 +1012,14 @@ test("pin: the name pattern holds for every name kind, and what is String()ed", 
     assert.equal(checkWhat(kind, " Mixed-Case "), "mixed-case", `${kind} trimmed and lowercased`);
   }
 });
+
+test("pin: the default limiter tracks 10000 keys", () => {
+  const f = { kind: "inbox", source: "twist-inbox-retry", class: "retry", cause: "timeout", alerted: false };
+  const key = (i) => ({ ...f, what: `w${i}` });
+  const lim = createRateLimiter();
+  for (let i = 0; i < 10_000; i++) assert.deepEqual(lim.admit(key(i), 0), { write: true });
+  assert.deepEqual(lim.admit(key(10_000), 0), { write: true });
+  assert.deepEqual(lim.admit(key(10_000), 1), { write: true }, "the 10001st key is written untracked");
+  assert.deepEqual(lim.admit(key(9_999), 1), { write: false }, "the 10000th key is tracked");
+  assert.deepEqual(lim.admit(key(0), 1), { write: false }, "the first key is tracked");
+});
