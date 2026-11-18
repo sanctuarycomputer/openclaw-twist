@@ -1,13 +1,13 @@
 // The consumer's and the loop breaker's failure lines (spec What changes 3 and 4): one `inbox` line per retry (rate-limited), dead letter,
 // storage, backlog and hung-turn alert, `alerted` from the alert's result, and nothing from the item or the error
 // text but the closed `cause`.
-import test from "node:test";
+import test, { after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, existsSync, accessSync, rmSync, constants } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createQueueStore } from "../src/queue.js";
-import { createConsumer, BACKOFF_MS, MAX_ATTEMPTS, HIGH_WATER, HUNG_TURN_ALERT_MS, backlogAlertText } from "../src/consumer.js";
+import { createConsumer, BACKOFF_MS, MAX_ATTEMPTS, HIGH_WATER, HUNG_TURN_ALERT_MS, backlogAlertText, syncSkipReason } from "../src/consumer.js";
 import { PREFIX } from "../src/failure-line.js";
 import { createOpsAlert } from "../src/ops-alert.js";
 import { createMuteList, RECHECK_MS } from "../src/mutes.js";
@@ -19,6 +19,27 @@ const SEC = T0 / 1000;
 const MENTION = `[Bot](twist-mention://${BOT}) hello`;
 const iso = (ms) => new Date(ms).toISOString();
 const FID_RE = /^f-[0-9a-z]{8,9}-[0-9a-z]{4}$/;
+
+// Queue and mute files go on /dev/shm when it is there and writable: every queue write fsyncs, and on a busy
+// shared disk that wait was most of this file's time (ruling d-20261117-234552915). tmpfs is memory, so every
+// dir made here is removed after the file's tests, pass or fail.
+const TMP_ROOT = (() => {
+  try {
+    accessSync("/dev/shm", constants.W_OK);
+    return "/dev/shm";
+  } catch {
+    return tmpdir();
+  }
+})();
+const tempDirs = [];
+function tempDir(prefix) {
+  const dir = mkdtempSync(join(TMP_ROOT, prefix));
+  tempDirs.push(dir);
+  return dir;
+}
+after(() => {
+  for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
+});
 
 function baseItem(id, over = {}) {
   return {
@@ -34,7 +55,7 @@ function baseItem(id, over = {}) {
  * existing stub does. `rawAlert` replaces the alert outright.
  */
 async function harness({ items = [], clock = { t: T0 }, runTurn, probe, alert, rawAlert, failureSink, failureLimiter } = {}) {
-  const dir = mkdtempSync(join(tmpdir(), "twistfl-"));
+  const dir = tempDir("twistfl-");
   const queue = createQueueStore(join(dir, "queue.json"));
   await queue.load();
   await queue.enqueueAll(items, clock.t);
@@ -115,9 +136,17 @@ async function storageScenario({ message = "ENOSPC: no space left on device", it
   await h.consumer.idle();
   return h;
 }
+/** HIGH_WATER + 1 items on one peer, so a tick runs one turn, not one per item. */
+function backlogItems(make = (id, over) => baseItem(id, over), peerId = "conv:hw") {
+  return Array.from({ length: HIGH_WATER + 1 }, (_, i) => make(`hw-${i}`, { peerId }));
+}
 /** HIGH_WATER + 1 items waiting for a reply. */
 async function backlogScenario({ items, ...opts } = {}) {
-  const h = await harness({ items: items ?? Array.from({ length: HIGH_WATER + 1 }, (_, i) => baseItem(`hw-${i}`)), ...opts });
+  const h = await harness({ items: items ?? backlogItems(), ...opts });
+  const queued = h.queue.itemsInState("queued");
+  assert.ok(queued.length > HIGH_WATER, "the fixture is over the high-water mark");
+  assert.equal(new Set(queued.map((i) => i.peerId)).size, 1, "the backlog is on one peer");
+  for (const i of queued) assert.equal(syncSkipReason(i, T0, BOT), null, "no backlog item is sync-skippable");
   await once(h.consumer);
   return h;
 }
@@ -299,7 +328,7 @@ test("A2.6 a real ops alert holding back a 1 h old repeat of the backlog inciden
   const clock = { t: T0 };
   const posts = [];
   const opsLogs = [];
-  const items = Array.from({ length: HIGH_WATER + 1 }, (_, i) => baseItem(`hw-${i}`));
+  const items = backlogItems();
   const earlier = backlogAlertText(items.slice(0, 7), T0 - 3600_000);
   const rawAlert = createOpsAlert({
     target: () => ({ kind: "thread", id: 777 }),
@@ -340,7 +369,7 @@ test("A1.3 no item, comment, conversation or user id, sender name or error text 
   await poison.consumer.recoverOrphans();
   all.push(...poison.lines);
   all.push(...(await storageScenario({ message: `ENOSPC ${message}`, items: [marked("s")] })).lines);
-  all.push(...(await backlogScenario({ items: Array.from({ length: HIGH_WATER + 1 }, (_, i) => marked(`b${i}`)) })).lines);
+  all.push(...(await backlogScenario({ items: backlogItems((id, over) => marked(`b${id}`, over), `conv:${CONV}b`) })).lines);
   all.push(...(await hungScenario({ items: [marked("h")] })).lines);
   assert.equal(all.length, 6, all.join(""));
   for (const line of all) {
@@ -461,7 +490,7 @@ const LOOP_PEER = "conv:4242";
  * `failureSink` is given (null: none passed, so the default sink).
  */
 function loopHarness({ notify, neverMute, failureSink } = {}) {
-  const dir = mkdtempSync(join(tmpdir(), "twistlbfl-"));
+  const dir = tempDir("twistlbfl-");
   const path = join(dir, "twist-muted.json");
   const clock = { t: T0 };
   const lines = [];
