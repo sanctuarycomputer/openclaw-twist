@@ -960,10 +960,11 @@ test("pin: v, at and alerted take only their contract §3 values", () => {
     assert.equal(parse(failureLine({ ...PIN_F, alerted }, opts)).alerted, false, `alerted ${JSON.stringify(alerted)}`);
   }
   // `at` is written in toISOString() form only; a time in another form is converted, a non-time gives the clock.
+  // Every time here is away from the clock (FIXED), so a refused value can't pass for a converted one.
   const at = (value) => parse(failureLine({ ...PIN_F, at: value }, opts)).at;
-  assert.equal(at("2026-11-17T12:00:00Z"), "2026-11-17T12:00:00.000Z");
-  assert.equal(at("2026-11-17T13:00:00+01:00"), "2026-11-17T12:00:00.000Z");
-  assert.equal(at("17 Nov 2026 12:00 UTC"), "2026-11-17T12:00:00.000Z");
+  assert.equal(at("2026-11-16T08:30:00Z"), "2026-11-16T08:30:00.000Z");
+  assert.equal(at("2026-11-16T09:30:00+01:00"), "2026-11-16T08:30:00.000Z");
+  assert.equal(at("16 Nov 2026 08:30 UTC"), "2026-11-16T08:30:00.000Z");
   assert.equal(at(Date.parse("2026-11-16T00:00:00.000Z")), "2026-11-16T00:00:00.000Z");
   for (const bad of ["soon", "", Number.NaN, Infinity, {}, [FIXED]]) assert.equal(at(bad), new Date(FIXED).toISOString(), `at ${String(bad)}`);
 });
