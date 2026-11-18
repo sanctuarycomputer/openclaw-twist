@@ -575,6 +575,64 @@ test("pin: name, uuid and fid patterns", () => {
   }
 });
 
+// Contract §3's patterns written as plain checks, independent of the module's regexes (task-1 T1-10 to T1-12).
+const LOWER = "abcdefghijklmnopqrstuvwxyz";
+const DIGIT = "0123456789";
+const inSet = (set) => (c) => set.includes(c);
+const alnum = inSet(LOWER + DIGIT);
+const nameBody = inSet(LOWER + DIGIT + "_./:-");
+const providerBody = inSet(LOWER + DIGIT + "_.-");
+const hex = inSet(DIGIT + "abcdef");
+/** A job or tool name: [a-z0-9] then [a-z0-9_./:-]. */
+const contractName = (v) => v.length > 0 && alnum(v[0]) && [...v.slice(1)].every(nameBody);
+/** provider/model: each part starts with [a-z0-9]; the provider holds [a-z0-9_.-], the model [a-z0-9_./:-]. */
+function contractModel(v) {
+  const i = v.indexOf("/");
+  if (i < 0) return false;
+  const [p, m] = [v.slice(0, i), v.slice(i + 1)];
+  return p.length > 0 && alnum(p[0]) && [...p.slice(1)].every(providerBody) && m.length > 0 && alnum(m[0]) && [...m.slice(1)].every(nameBody);
+}
+/** A lowercase uuid: hex in groups of 8-4-4-4-12. */
+const contractUuid = (v) => v.length === 36 && [...v].every((c, i) => ([8, 13, 18, 23].includes(i) ? c === "-" : hex(c)));
+/** A fid: f-<8 or 9 of [0-9a-z]>-<4 of [0-9a-z]>. */
+function contractFid(v) {
+  const parts = v.split("-");
+  return parts.length === 3 && parts[0] === "f" && [8, 9].includes(parts[1].length) && parts[2].length === 4 && [...parts[1] + parts[2]].every(alnum);
+}
+// One character of each kind: letters at both ends of the alphabet, digits, uppercase, every punctuation the patterns
+// use, and some they don't.
+const PROBES = ["a", "z", "0", "9", "A", "Z", "_", ".", "-", "/", ":", " ", "+", "!", "@", "#"];
+/** Every value made by putting one probe at one position of `value`. */
+const swaps = (value) => [...value].flatMap((_, i) => PROBES.map((c) => value.slice(0, i) + c + value.slice(i + 1)));
+
+test("pin: every position of each pattern, swapped", () => {
+  // checkWhat trims and lowercases before it checks, and refuses two colons; the base values have no colon and are
+  // too short for the secret-shape rule.
+  const norm = (v) => v.trim().toLowerCase();
+  for (const v of swaps("ab.c-d_e/f")) {
+    const n = norm(v);
+    const want = contractName(n) && n.split(":").length <= 2 ? n : null;
+    assert.equal(checkWhat("job", v), want, `job ${JSON.stringify(v)}`);
+  }
+  for (const v of swaps("a1.b-c_d/e.f_g-h:9")) {
+    const n = norm(v);
+    const want = contractModel(n) && n.split(":").length <= 2 ? n : null;
+    assert.equal(checkWhat("model", v), want, `model ${JSON.stringify(v)}`);
+  }
+  const uuid = ["a1b2".repeat(2), "c3d4", "4e5f", "8a9b", "c0d1".repeat(3)].join("-");
+  for (const v of swaps(uuid)) {
+    const o = parse(failureLine({ ...PIN_F, run: v }, PIN_OPTS));
+    assert.equal(o.run, contractUuid(v) ? v : undefined, `uuid ${JSON.stringify(v)}`);
+  }
+  const generated = `f-${FIXED.toString(36)}-0000`;
+  for (const base of [`f-${"a1b2".repeat(2)}-c3d4`, `f-${"a1b2".repeat(2)}z-c3d4`]) {
+    for (const v of swaps(base)) {
+      const o = parse(failureLine({ ...PIN_F, fid: v }, PIN_OPTS));
+      assert.equal(o.fid, contractFid(v) ? v : generated, `fid ${JSON.stringify(v)}`);
+    }
+  }
+});
+
 test("pin: attempt upper bound", () => {
   assert.equal(parse(failureLine({ ...PIN_F, attempt: 99 }, PIN_OPTS)).attempt, 99);
   assert.deepEqual(failureLine({ ...PIN_F, attempt: 100 }, PIN_OPTS), failureLine(PIN_F, PIN_OPTS));
