@@ -5,6 +5,8 @@ import {
   PREFIX,
   VERSION,
   SOURCES,
+  KINDS,
+  INBOX_STEPS,
   CLASSES,
   CAUSES,
   SESSIONS,
@@ -725,4 +727,151 @@ test("pin: enum fields need a string", () => {
       assert.ok(!line.includes(SENDER), `${key}: no sender`);
     }
   }
+});
+
+test("pin: KINDS and INBOX_STEPS are the contract's", () => {
+  // Contract §3, written out.
+  const kinds = ["job", "sync", "check", "inbox", "tool", "turn", "model"];
+  const steps = ["consumer", "dead-letter", "loop-breaker", "storage", "backlog", "watchdog"];
+  assert.deepEqual([kinds.length, steps.length], [7, 6]);
+  assert.deepEqual([...KINDS].sort(), [...kinds].sort());
+  assert.deepEqual([...INBOX_STEPS].sort(), [...steps].sort());
+  for (const k of kinds) assert.equal(parse(failureLine({ ...PIN_F, kind: k }, PIN_OPTS)).kind, k, k);
+  for (const k of ["extra", "inboxes", "Job", ""]) assert.equal(parse(failureLine({ ...PIN_F, kind: k }, PIN_OPTS)).kind, "?", k);
+  for (const s of steps) assert.equal(checkWhat("inbox", s), s, s);
+  for (const s of ["queue", "retry", "consumers", "dead_letter"]) assert.equal(checkWhat("inbox", s), null, s);
+});
+
+test("pin: streak, attempt and suppressed need an integer", () => {
+  const bare = failureLine(PIN_F, PIN_OPTS);
+  for (const key of ["streak", "attempt", "suppressed"]) {
+    for (const bad of [1.5, 2.000001, "2", "1", Number.NaN, Infinity, true, 2n]) {
+      assert.deepEqual(failureLine({ ...PIN_F, [key]: bad }, PIN_OPTS), bare, `${key} ${String(bad)} dropped`);
+    }
+    assert.equal(parse(failureLine({ ...PIN_F, [key]: 2 }, PIN_OPTS))[key], 2, `${key} 2 kept`);
+  }
+});
+
+test("pin: checkWhat with no value, and the long-run rule's letter and digit", () => {
+  for (const kind of ["job", "sync", "check", "tool", "inbox", "turn", "model"]) {
+    assert.equal(checkWhat(kind, undefined), null, `${kind} undefined`);
+    assert.equal(checkWhat(kind, null), null, `${kind} null`);
+  }
+  const { what: _omit, ...noWhat } = PIN_F;
+  assert.equal(parse(failureLine({ ...noWhat, kind: "job", source: "job-failure-alert" }, PIN_OPTS)).what, "?");
+  assert.equal(parse(failureLine({ ...noWhat, kind: "job", source: "job-failure-alert", what: null }, PIN_OPTS)).what, "?");
+  // Contract §3: only a run of 20+ that holds both a letter and a digit is secret-shaped.
+  const digits = "1".repeat(20);
+  const letters = "b".repeat(20);
+  const mixed = "b".repeat(19) + "1";
+  const mixedFirst = "1" + "b".repeat(19);
+  assert.equal(checkWhat("job", digits), digits, "20 digits kept");
+  assert.equal(checkWhat("job", letters), letters, "20 letters kept");
+  assert.equal(checkWhat("job", `x-${digits}9`), `x-${digits}9`, "21 digits kept");
+  assert.equal(checkWhat("job", mixed), null, "letters then a digit refused");
+  assert.equal(checkWhat("job", mixedFirst), null, "a digit then letters refused");
+  assert.equal(checkWhat("job", `x-${mixed.slice(1)}`), `x-${mixed.slice(1)}`, "19 mixed kept");
+});
+
+test("pin: failureCause, one sample per alternative of each contract §3 row", () => {
+  // Contract §3's cause table, each alternative on its own, in both cases.
+  const cases = [
+    ["billing issue", "billing"],
+    ["BILLING", "billing"],
+    ["your credit balance is too low", "billing"],
+    ["Credit Balance", "billing"],
+    ["insufficient credit", "billing"],
+    ["insufficient_credit", "billing"],
+    ["insufficientcredit", "billing"],
+    ["payment required", "billing"],
+    ["PAYMENT REQUIRED", "billing"],
+    ["402", "billing"],
+    ["got 402 back", "billing"],
+    ["x402", "unknown"],
+    ["4021", "unknown"],
+    ["rate limit", "rate-limited"],
+    ["ratelimit", "rate-limited"],
+    ["RATE_LIMIT", "rate-limited"],
+    ["429", "http-429"],
+    ["x429", "unknown"],
+    ["4290", "unknown"],
+    ["timed out", "timeout"],
+    ["TIMED OUT", "timeout"],
+    ["timedout", "timeout"],
+    ["time out", "timeout"],
+    ["timeout", "timeout"],
+    ["Timeout", "timeout"],
+    ["aborted", "timeout"],
+    ["ABORTED", "timeout"],
+    ["ETIMEDOUT", "timeout"],
+    ["etimedout", "timeout"],
+    ["ECONNREFUSED", "connection"],
+    ["econnrefused", "connection"],
+    ["ECONNRESET", "connection"],
+    ["econnreset", "connection"],
+    ["ENOTFOUND", "connection"],
+    ["enotfound", "connection"],
+    ["EAI_AGAIN", "connection"],
+    ["eai_again", "connection"],
+    ["socket hang up", "connection"],
+    ["SOCKET HANG UP", "connection"],
+    ["http 503", "http-5xx"],
+    ["HTTP 500", "http-5xx"],
+    ["status 599", "http-5xx"],
+    ["STATUS 502", "http-5xx"],
+    ["code 503", "http-5xx"],
+    ["CODE 503", "http-5xx"],
+    ["code503", "unknown"],
+    ["code: 503", "http-5xx"],
+    ["code:::503", "http-5xx"],
+    ["code::::503", "unknown"],
+    ["xcode 503", "unknown"],
+    ["code 5030", "unknown"],
+    ["http 404", "http-4xx"],
+    ["HTTP 400", "http-4xx"],
+    ["status 499", "http-4xx"],
+    ["STATUS 403", "http-4xx"],
+    ["code 404", "http-4xx"],
+    ["CODE 404", "http-4xx"],
+    ["code: 404", "http-4xx"],
+    ["code:::404", "http-4xx"],
+    ["code::::404", "unknown"],
+    ["xcode 404", "unknown"],
+    ["code 4040", "unknown"],
+  ];
+  for (const [text, cause] of cases) assert.equal(failureCause(text), cause, text);
+});
+
+test("pin: rate limiter clock steps, pruning and maxKeys", () => {
+  const f = { kind: "inbox", source: "twist-inbox-retry", what: "consumer", class: "retry", cause: "timeout", alerted: false };
+  const a = f;
+  const b = { ...f, cause: "connection" };
+  const c = { ...f, cause: "none" };
+
+  // A clock that steps back ends the window rather than stretching it.
+  const back = createRateLimiter();
+  assert.deepEqual(back.admit(a, 100_000), { write: true });
+  assert.deepEqual(back.admit(a, 50_000), { write: true });
+  assert.deepEqual(back.admit(a, 50_001), { write: false });
+
+  // A full map prunes only finished windows with nothing pending, so a pending count is kept (contract §7).
+  const prune = createRateLimiter({ maxKeys: 2 });
+  assert.deepEqual(prune.admit(a, 0), { write: true });
+  assert.deepEqual(prune.admit(a, 1), { write: false });
+  assert.deepEqual(prune.admit(b, 0), { write: true });
+  assert.deepEqual(prune.admit(c, 60_000), { write: true });
+  assert.deepEqual(prune.admit(a, 60_000), { write: true, suppressed: 1 });
+  assert.deepEqual(prune.admit(c, 60_001), { write: false }, "c took b's finished entry");
+
+  // A window still open is not pruned; a key with no room is written untracked.
+  const full = createRateLimiter({ maxKeys: 1 });
+  assert.deepEqual(full.admit(a, 0), { write: true });
+  assert.deepEqual(full.admit(b, 0), { write: true });
+  assert.deepEqual(full.admit(b, 1), { write: true }, "b is untracked: the map holds one key");
+  assert.deepEqual(full.admit(a, 1), { write: false }, "a's open window was not pruned");
+});
+
+test("pin: a real Date as at is kept", () => {
+  const at = new Date(FIXED - 5_000);
+  assert.equal(parse(failureLine({ ...PIN_F, at }, PIN_OPTS)).at, at.toISOString());
 });
