@@ -190,10 +190,6 @@ test("the guard: what is at most 80 characters for a model too", () => {
 test("the fid's time part is the clock truncated to whole ms", () => {
   const o = parse(failureLine({ kind: "inbox" }, { now: () => FIXED + 0.5, rand: () => 0 }));
   assert.equal(o.fid, `f-${FIXED.toString(36)}-0000`);
-  for (const frac of [0.5, 0.9]) {
-    const made = parse(failureLine({ kind: "inbox" }, { now: () => FIXED + frac, rand: () => 0 }));
-    assert.equal(made.at, new Date(FIXED).toISOString(), `pin: the made at is truncated too (${frac})`);
-  }
 });
 
 test("stdoutSink writes the line to process.stdout once", () => {
@@ -1075,4 +1071,11 @@ test("pin: list order, RATE_WINDOW_MS, and the rules' edges from final-4", () =>
   assert.deepEqual(lim.admit(f, 100_000), { write: true });
   assert.deepEqual(lim.admit({ ...f, cause: "connection" }, 200_000), { write: true });
   assert.deepEqual(lim.admit(f, 150_000), { write: false }, "a's entry was not pruned while the map had room");
+});
+
+test("pin: the made at is the clock truncated to whole ms", () => {
+  for (const frac of [0.5, 0.9]) {
+    const made = parse(failureLine({ kind: "inbox" }, { now: () => FIXED + frac, rand: () => 0 }));
+    assert.equal(made.at, new Date(FIXED).toISOString(), `clock FIXED + ${frac}`);
+  }
 });
